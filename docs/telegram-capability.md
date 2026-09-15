@@ -40,9 +40,15 @@ Không chuyển sang user session khi gặp lỗi. Không quay vòng tài khoả
   probe 8 KiB lên chat thử nghiệm do chủ dự án cấp: `upload_ok=true`,
   `download_identical=true` (byte-for-byte), `delete_ok=true`. Gửi document binary
   (`application/octet-stream`, tên file = hash nội dung, không lộ key).
-- Chưa kiểm chứng live: refresh locator hết hạn, history lookup phạm vi bot,
-  `FLOOD_WAIT`/429 thực tế, channel `-100...` với quyền admin tối thiểu
-  (chat thử nghiệm hiện tại là user chat, không phải channel).
+- `implemented-and-tested` (live group, 2026-09-15): probe 8 KiB lặp lại trên basic group
+  thử nghiệm (bot đã được cấp quyền): `upload_ok=true`, `download_identical=true`,
+  `delete_ok=true`. Tin nhắn probe tự xóa sau vài giây (`disable_notification=true`).
+- Ràng buộc nền tảng (xác nhận với chủ dự án 2026-09-15): nâng group lên supergroup/`-100...`
+  gần như bất khả thi trong môi trường này. Vì vậy các kiểm tra đặc thù channel/supergroup
+  (quyền admin tối thiểu, `channels.deleteMessages` MTProto) ghi `blocked` với lý do rõ ràng,
+  không chặn M2. Thiết kế recovery (M5) giả định trường hợp xấu nhất: bot không duyệt lịch sử
+  (Bot API không có API search) → checkpoint phải có con trỏ ngoài.
+- Chưa kiểm chứng live: refresh locator hết hạn, 429/FLOOD_WAIT thực tế (error mapping mới unit-test).
 - Secrets (bot token, test chat id) chỉ nằm trong GitHub Actions Secrets + biến môi
   trường local, không bao giờ vào code/log. Job `live-telegram` tách khỏi PR checks,
   skip khi thiếu secrets (= `unverified`). An toàn khi repo chuyển public.

@@ -11,8 +11,9 @@
 |---|---|---|
 | Bot API HTTP upload document binary | implemented-and-tested | live probe 8 KiB 2026-09-15: `upload_ok=true` |
 | Download byte-identical qua `getFile` | implemented-and-tested | live probe: `download_identical=true` |
-| Delete message | implemented-and-tested | live probe: `delete_ok=true` |
-| Refresh locator hết hạn / history lookup / 429-FLOOD_WAIT thực tế / channel `-100...` admin tối thiểu | blocked | chat test hiện tại là user chat; cần channel thử nghiệm |
+| Delete message | implemented-and-tested | live probe: `delete_ok=true` (user chat + basic group) |
+| Refresh locator hết hạn / 429-FLOOD_WAIT thực tế | blocked | mới unit-test mapping; cần chạy dài ngày |
+| Channel `-100...` admin tối thiểu / `channels.deleteMessages` | blocked | ràng buộc nền tảng: nâng supergroup bất khả thi ở môi trường này — không chặn M2 |
 | Local Bot API / MTProto bot | unsupported | chờ capability test |
 
 ## Bucket
