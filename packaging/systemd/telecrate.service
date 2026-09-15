@@ -1,0 +1,24 @@
+[Unit]
+Description=TeleCrate — S3-compatible object storage on Telegram (single instance)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=telecrate
+Group=telecrate
+ExecStart=/usr/local/bin/telecrate --config /etc/telecrate/telecrate.toml serve
+Restart=on-failure
+RestartSec=5
+# Graceful shutdown: ngừng nhận ghi mới, giữ durable jobs (không chờ hết hàng đợi Telegram).
+TimeoutStopSec=30
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/telecrate
+ConfigurationDirectory=telecrate
+StateDirectory=telecrate
+
+[Install]
+WantedBy=multi-user.target

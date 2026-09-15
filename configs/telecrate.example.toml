@@ -1,0 +1,7 @@
+# TeleCrate — config mẫu (copy sang /etc/telecrate/telecrate.toml rồi sửa, quyền 0600 nếu có secrets ở milestone sau)
+db_path = "/var/lib/telecrate/index.db"
+spool_dir = "/var/lib/telecrate/spool"
+listen_port = 7070
+# Mã hóa nội dung OPTIONAL: "off" | "on". Chỉ áp dụng ghi mới; dữ liệu cũ giữ chế độ cũ.
+# "off" nghĩa là nội dung có thể đọc được tại nơi lưu nếu nguồn chưa mã hóa.
+encryption = "off"

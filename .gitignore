@@ -1,0 +1,51 @@
+# TeleCrate .gitignore — không commit secrets, runtime data, artifact tái tạo
+
+# Secrets & local config
+/etc/telecrate/
+*.secret.toml
+telecrate.local.toml
+.env
+.env.*
+*.pem
+*.key
+
+# Runtime state (DB / spool / cache / logs) — tuyệt đối không commit
+/var/lib/telecrate/
+data/
+*.db
+*.db-shm
+*.db-wal
+*.sqlite*
+spool/
+cache/
+tmp/
+logs/
+*.log
+
+# Recovery bundles chứa secrets
+*-recovery-bundle*.json
+*-recovery-bundle*.tar*
+
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Frontend build deps + output tái tạo (giữ source, bỏ output nếu build lại được)
+web/node_modules/
+web/dist/
+web/.vite/
+web/coverage/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*~
+
+# CI / release artifacts tái tạo
+dist/
+*.deb
+*.rpm
+*.tar.gz
