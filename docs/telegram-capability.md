@@ -45,6 +45,7 @@ Không chuyển sang user session khi gặp lỗi. Không quay vòng tài khoả
   tự xóa sau vài giây (`disable_notification=true`). Quyền bot xác minh qua
   `getChatAdministrators`: `administrator` với `can_post_messages=true`,
   `can_delete_messages=true` — đủ cho upload/delete của TeleCrate (bot `@Elisofa_Bot`).
+  Job `live-telegram` trên CI chạy probe vào chính group này (chat id trong Actions Secrets).
 - Ràng buộc nền tảng (xác nhận với chủ dự án 2026-09-15): nâng group lên supergroup/`-100...`
   gần như bất khả thi trong môi trường này. Vì vậy các kiểm tra đặc thù channel/supergroup
   (quyền admin tối thiểu, `channels.deleteMessages` MTProto) ghi `blocked` với lý do rõ ràng,
