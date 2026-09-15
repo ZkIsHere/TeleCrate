@@ -27,7 +27,6 @@ jobs:
   live-telegram:
     runs-on: [self-hosted, Linux, X64]
     needs: backend
-    if: ${{ secrets.TELECRATE_BOT_TOKEN != '' }}
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
@@ -37,4 +36,9 @@ jobs:
         env:
           TELECRATE_BOT_TOKEN: ${{ secrets.TELECRATE_BOT_TOKEN }}
           TELECRATE_TEST_CHAT_ID: ${{ secrets.TELECRATE_TEST_CHAT_ID }}
-        run: cargo test -- --ignored live_
+        run: |
+          if [ -z "$TELECRATE_BOT_TOKEN" ] || [ -z "$TELECRATE_TEST_CHAT_ID" ]; then
+            echo "live-telegram: UNVERIFIED (thiếu secrets) — không giả live pass"
+            exit 0
+          fi
+          cargo test -- --ignored live_
