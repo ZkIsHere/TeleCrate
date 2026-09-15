@@ -20,3 +20,21 @@ jobs:
           test -f configs/telecrate.example.toml
           test -f packaging/systemd/telecrate.service
           grep -q "ExecStart=" packaging/systemd/telecrate.service
+
+  # Live Telegram probe — job RIÊNG, tách khỏi PR checks.
+  # Chỉ chạy khi repo có secrets; thiếu secrets → skip = unverified, không giả live pass.
+  # Secrets bị GitHub mask trong log; test không in token/locator (xem telegram.rs).
+  live-telegram:
+    runs-on: [self-hosted, Linux, X64]
+    needs: backend
+    if: ${{ secrets.TELECRATE_BOT_TOKEN != '' }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: live telegram probe (ignored test)
+        env:
+          TELECRATE_BOT_TOKEN: ${{ secrets.TELECRATE_BOT_TOKEN }}
+          TELECRATE_TEST_CHAT_ID: ${{ secrets.TELECRATE_TEST_CHAT_ID }}
+        run: cargo test -- --ignored live_

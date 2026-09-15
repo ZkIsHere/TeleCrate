@@ -94,6 +94,246 @@ pub mod documented_limits {
         "bot-api-file-size-limits-apply; verify-against-live-test-before-chunk-sizing";
 }
 
+/// Client Bot API HTTP thật: upload document binary, download, delete.
+/// Token KHÔNG BAO GIỜ xuất hiện trong log/error/Debug — mọi chuỗi lỗi đều redact.
+pub struct BotApiHttpTransport {
+    base_url: String,
+    token: String,
+    bot_name: String,
+    client: reqwest::blocking::Client,
+}
+
+impl std::fmt::Debug for BotApiHttpTransport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BotApiHttpTransport")
+            .field("base_url", &self.base_url)
+            .field("bot_name", &self.bot_name)
+            .field("token", &"***")
+            .finish()
+    }
+}
+
+impl BotApiHttpTransport {
+    pub fn new(base_url: &str, token: &str, bot_name: &str) -> Result<Self, TransportError> {
+        if token.is_empty() {
+            return Err(TransportError::Permanent {
+                reason: "empty bot token".to_string(),
+            });
+        }
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(60))
+            .build()
+            .map_err(|e| TransportError::Permanent {
+                reason: format!("build http client: {e}"),
+            })?;
+        Ok(Self {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            token: token.to_string(),
+            bot_name: bot_name.to_string(),
+            client,
+        })
+    }
+
+    /// Base URL mặc định của hosted Bot API.
+    pub fn hosted(token: &str, bot_name: &str) -> Result<Self, TransportError> {
+        Self::new("https://api.telegram.org", token, bot_name)
+    }
+
+    fn redact(&self, s: &str) -> String {
+        s.replace(&self.token, "***")
+    }
+
+    fn api_url(&self, method: &str) -> String {
+        format!("{}/bot{}/{method}", self.base_url, self.token)
+    }
+
+    /// POST multipart, parse envelope `{"ok":true,"result":...}`.
+    fn post_multipart(
+        &self,
+        method: &str,
+        form: reqwest::blocking::multipart::Form,
+    ) -> Result<serde_json::Value, TransportError> {
+        let resp = self
+            .client
+            .post(self.api_url(method))
+            .multipart(form)
+            .send()
+            .map_err(|e| TransportError::Transient {
+                reason: format!("network: {}", self.redact(&e.to_string())),
+                retry_after_secs: None,
+            })?;
+        self.read_envelope(resp)
+    }
+
+    /// GET query params, parse envelope.
+    fn get(
+        &self,
+        method: &str,
+        params: &[(&str, String)],
+    ) -> Result<serde_json::Value, TransportError> {
+        let resp = self
+            .client
+            .get(self.api_url(method))
+            .query(params)
+            .send()
+            .map_err(|e| TransportError::Transient {
+                reason: format!("network: {}", self.redact(&e.to_string())),
+                retry_after_secs: None,
+            })?;
+        self.read_envelope(resp)
+    }
+
+    fn read_envelope(
+        &self,
+        resp: reqwest::blocking::Response,
+    ) -> Result<serde_json::Value, TransportError> {
+        let status = resp.status().as_u16();
+        if status == 429 || status >= 500 {
+            return Ok(serde_json::json!({"__transport_status__": status}));
+        }
+        let body = resp.text().map_err(|e| TransportError::Transient {
+            reason: format!("read body: {}", self.redact(&e.to_string())),
+            retry_after_secs: None,
+        })?;
+        let v: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| TransportError::Transient {
+                reason: format!("bad api json (http {status}): {e}"),
+                retry_after_secs: None,
+            })?;
+        if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
+            return Ok(v);
+        }
+        Err(map_api_error(&self.token, status, &v))
+    }
+}
+
+/// Map lỗi Bot API → Transient/Permanent. Token được redact khỏi mọi reason.
+fn map_api_error(token: &str, status: u16, v: &serde_json::Value) -> TransportError {
+    let redact = |s: &str| s.replace(token, "***");
+    let desc = v
+        .get("description")
+        .and_then(|x| x.as_str())
+        .unwrap_or("unknown api error");
+    let retry_after = v
+        .pointer("/parameters/retry_after")
+        .and_then(|x| x.as_u64());
+    if status == 429 {
+        return TransportError::Transient {
+            reason: redact(&format!("rate limited: {desc}")),
+            retry_after_secs: retry_after,
+        };
+    }
+    if status == 401 {
+        return TransportError::Permanent {
+            reason: "unauthorized: bot token sai hoặc đã revoke".to_string(),
+        };
+    }
+    TransportError::Permanent {
+        reason: redact(&format!("api error {status}: {desc}")),
+    }
+}
+
+impl Transport for BotApiHttpTransport {
+    fn transport_type(&self) -> TransportType {
+        TransportType::BotApiHttp
+    }
+
+    fn upload(&self, chat_id: i64, bytes: &[u8]) -> Result<RemoteLocator, TransportError> {
+        // Tên file = hash nội dung — không lộ object key (prompt §5).
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(bytes);
+        let fname = format!("chunk-{}.bin", hex::encode(h.finalize()));
+        // TODO(M2): stream chunk lớn thay vì copy toàn bộ vào multipart (RAM bounded).
+        let part = reqwest::blocking::multipart::Part::bytes(bytes.to_vec())
+            .file_name(fname)
+            .mime_str("application/octet-stream")
+            .map_err(|e| TransportError::Permanent {
+                reason: format!("mime: {e}"),
+            })?;
+        let form = reqwest::blocking::multipart::Form::new()
+            .text("chat_id", chat_id.to_string())
+            .text("disable_notification", "true")
+            .part("document", part);
+        let v = self.post_multipart("sendDocument", form)?;
+        let mid = v
+            .pointer("/result/message_id")
+            .and_then(|x| x.as_i64())
+            .ok_or_else(|| TransportError::Permanent {
+                reason: "sendDocument: thiếu message_id".to_string(),
+            })?;
+        let doc = v
+            .pointer("/result/document")
+            .ok_or_else(|| TransportError::Permanent {
+                reason: "sendDocument: thiếu document (nội dung có thể đã bị biến đổi)".to_string(),
+            })?;
+        let get_str = |k: &str| {
+            doc.get(k)
+                .and_then(|x| x.as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        let size = doc
+            .get("file_size")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(bytes.len() as u64);
+        Ok(RemoteLocator {
+            transport: TransportType::BotApiHttp,
+            bot_name: self.bot_name.clone(),
+            chat_id,
+            message_id: mid,
+            file_id: get_str("file_id"),
+            file_unique_id: get_str("file_unique_id"),
+            size,
+        })
+    }
+
+    fn download(&self, locator: &RemoteLocator) -> Result<Vec<u8>, TransportError> {
+        // getFile không tái sử dụng file_id giữa bot khác khi chưa kiểm chứng (prompt §5).
+        let v = self.get("getFile", &[("file_id", locator.file_id.clone())])?;
+        let path = v
+            .pointer("/result/file_path")
+            .and_then(|x| x.as_str())
+            .ok_or_else(|| TransportError::Permanent {
+                reason: "getFile: thiếu file_path (locator hết hạn?)".to_string(),
+            })?
+            .to_string();
+        // URL download là ephemeral — dùng ngay, không lưu làm locator (prompt §5).
+        let url = format!("{}/file/bot{}/{path}", self.base_url, self.token);
+        let resp = self
+            .client
+            .get(url)
+            .send()
+            .map_err(|e| TransportError::Transient {
+                reason: format!("download network: {}", self.redact(&e.to_string())),
+                retry_after_secs: None,
+            })?;
+        if !resp.status().is_success() {
+            return Err(TransportError::Transient {
+                reason: format!("download http {}", resp.status().as_u16()),
+                retry_after_secs: None,
+            });
+        }
+        resp.bytes()
+            .map(|b| b.to_vec())
+            .map_err(|e| TransportError::Transient {
+                reason: format!("read download body: {}", self.redact(&e.to_string())),
+                retry_after_secs: None,
+            })
+    }
+
+    fn delete(&self, locator: &RemoteLocator) -> Result<bool, TransportError> {
+        let v = self.get(
+            "deleteMessage",
+            &[
+                ("chat_id", locator.chat_id.to_string()),
+                ("message_id", locator.message_id.to_string()),
+            ],
+        )?;
+        Ok(v.get("result").and_then(|x| x.as_bool()).unwrap_or(false))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -189,18 +429,70 @@ mod tests {
         assert!(!b.is_transient());
     }
 
+    #[test]
+    fn api_error_mapping_429_401_and_redaction() {
+        let token = "SECRET-TOKEN-123";
+        let v429 = serde_json::json!({
+            "ok": false, "error_code": 429,
+            "description": "Too Many Requests: retry after 30",
+            "parameters": {"retry_after": 30}
+        });
+        match map_api_error(token, 429, &v429) {
+            TransportError::Transient {
+                retry_after_secs: Some(30),
+                ..
+            } => {}
+            other => panic!("expected transient 429, got {other:?}"),
+        }
+        match map_api_error(token, 401, &serde_json::json!({"ok":false})) {
+            TransportError::Permanent { .. } => {}
+            other => panic!("expected permanent 401, got {other:?}"),
+        }
+        // Token trong description phải bị redact.
+        let v = serde_json::json!({"ok": false, "description": format!("bad {token}")});
+        match map_api_error(token, 400, &v) {
+            TransportError::Permanent { reason } => {
+                assert!(!reason.contains(token), "token leaked: {reason}");
+                assert!(reason.contains("***"));
+            }
+            other => panic!("expected permanent 400, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn transport_debug_redacts_token() {
+        let t =
+            BotApiHttpTransport::new("https://api.telegram.org", "SECRET-TOKEN-123", "b").unwrap();
+        let dbg = format!("{t:?}");
+        assert!(!dbg.contains("SECRET-TOKEN-123"), "token leaked in Debug");
+    }
+
     /// Live test có kiểm soát — CHỈ chạy khi có secrets, tách khỏi PR checks.
-    /// Ví dụ: `TELECRATE_BOT_TOKEN=... TELECRATE_TEST_CHAT_ID=... cargo test -- --ignored`
+    /// `TELECRATE_BOT_TOKEN=... TELECRATE_TEST_CHAT_ID=... cargo test -- --ignored live_`
+    /// Không in token/chat id ra output.
     #[test]
     #[ignore]
     fn live_bot_api_capability_probe() {
         let token = std::env::var("TELECRATE_BOT_TOKEN")
             .expect("thiếu TELECRATE_BOT_TOKEN — báo unverified, không giả live pass");
-        let _ = token;
-        let _chat: i64 = std::env::var("TELECRATE_TEST_CHAT_ID")
+        let chat: i64 = std::env::var("TELECRATE_TEST_CHAT_ID")
             .expect("thiếu TELECRATE_TEST_CHAT_ID")
             .parse()
-            .unwrap();
-        // Triển khai upload/download/xóa thử nhỏ ở changeset M1 tiếp theo.
+            .expect("TELECRATE_TEST_CHAT_ID không phải số");
+        let t = BotApiHttpTransport::hosted(&token, "telecrate-probe").expect("build transport");
+        // Payload xác định 8 KiB (không cần rand).
+        let payload: Vec<u8> = (0u32..8192)
+            .map(|i| (i.wrapping_mul(2654435761) >> 16) as u8)
+            .collect();
+        let loc = t.upload(chat, &payload).expect("live upload");
+        assert_eq!(loc.transport, TransportType::BotApiHttp);
+        let back = t.download(&loc).expect("live download");
+        assert_eq!(back, payload, "download không byte-identical");
+        let delete_ok = t.delete(&loc).expect("live delete");
+        // Chỉ in trạng thái boolean + size, không in locator/token.
+        println!(
+            "live probe: upload_ok=true download_identical=true delete_ok={delete_ok} bytes={}",
+            payload.len()
+        );
     }
 }

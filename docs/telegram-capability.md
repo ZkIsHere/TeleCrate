@@ -36,4 +36,13 @@ Không chuyển sang user session khi gặp lỗi. Không quay vòng tài khoả
 ## Trạng thái
 
 - `implemented-and-tested` (local): `Transport` trait + `BotApiHttp` types + error taxonomy + mock upload/download/delete tests.
-- `blocked` (cần secrets): live probe `live_bot_api_capability_probe` (`#[ignore]`, cần `TELECRATE_BOT_TOKEN` + `TELECRATE_TEST_CHAT_ID`) — thiếu secrets báo `unverified`, không giả live pass.
+- `implemented-and-tested` (live, 2026-09-15): `BotApiHttpTransport` qua hosted Bot API —
+  probe 8 KiB lên chat thử nghiệm do chủ dự án cấp: `upload_ok=true`,
+  `download_identical=true` (byte-for-byte), `delete_ok=true`. Gửi document binary
+  (`application/octet-stream`, tên file = hash nội dung, không lộ key).
+- Chưa kiểm chứng live: refresh locator hết hạn, history lookup phạm vi bot,
+  `FLOOD_WAIT`/429 thực tế, channel `-100...` với quyền admin tối thiểu
+  (chat thử nghiệm hiện tại là user chat, không phải channel).
+- Secrets (bot token, test chat id) chỉ nằm trong GitHub Actions Secrets + biến môi
+  trường local, không bao giờ vào code/log. Job `live-telegram` tách khỏi PR checks,
+  skip khi thiếu secrets (= `unverified`). An toàn khi repo chuyển public.
