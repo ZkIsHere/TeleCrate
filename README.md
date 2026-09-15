@@ -42,4 +42,4 @@ journalctl -u telecrate -f
 - `AGENTS.md` — quy tắc làm việc
 - `docs/architecture.md`, `docs/data-model.md`, `docs/threat-model.md`
 - `docs/compatibility-matrix.md`, `docs/milestones.md`, `docs/telegram-capability.md`
-- `docs/adr/0001-stack.md`, `docs/adr/0002-telegram-http-client.md`
+- `docs/adr/0001-stack.md`, `docs/adr/0002-telegram-http-client.md`, `docs/adr/0003-m2-vertical-slice.md`

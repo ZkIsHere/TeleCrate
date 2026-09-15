@@ -15,7 +15,7 @@ S3 client → (SigV4 auth) → HTTP daemon → spool file (tmp+fsync+rename+fsyn
 → worker nền: lease job → upload Telegram (Bot API, sau này Local Bot API/MTProto) → commit remote locator + recovery checkpoint → GC spool chunk khi an toàn
 ```
 
-Hai trạng thái cam kết phân biệt rõ (xem prompt §4):
+Hai trạng thái cam kết phân biệt rõ (xem prompt §4; triển khai ở M2 theo ADR 0003):
 
 - `accepted-local`: object đầy đủ đã commit bền vững local (data + metadata), đọc lại được sau crash nếu disk còn. PUT/CompleteMultipartUpload trả thành công tại đây.
 - `telegram-committed`: mọi chunk đã có remote locator bền vững trong DB + recovery metadata đạt checkpoint an toàn. Chỉ lúc này mới được giải phóng spool.

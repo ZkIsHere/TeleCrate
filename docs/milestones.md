@@ -6,7 +6,9 @@
   (`BotApiHttpTransport` thật + live probe 8 KiB pass trên user chat và basic group 2026-09-15) đã xong,
   CI có job `live-telegram` riêng. Còn `blocked` có lý do: kiểm tra đặc thù channel/supergroup
   (nâng `-100...` bất khả thi ở môi trường này), locator refresh, FLOOD_WAIT thực tế — không chặn M2.
-- **M2 — Vertical slice durable PUT/GET/HEAD/DELETE/LIST + SigV4 + spool/index + worker thật + 2 chế độ mã hóa (on/off)** (tiếp theo). Crash injection + restart không mất acknowledged object.
+- **M2 — Vertical slice durable PUT/GET (single-part): TIẾP THEO, thiết kế ở `docs/adr/0003-m2-vertical-slice.md`**.
+  Breakdown: 2.1 (keys + SigV4 + bucket CRUD) → 2.2 (flow durable + worker tối giản) → 2.3 (multi-chunk + worker đủ)
+  → 2.4 (mã hóa on/AEAD) → 2.5 (crash injection + AWS CLI + đóng M2).
 - **M3 — Multipart, copy, Range, conditional, ETag, versioning, metadata/tags**.
 - **M4 — Auth hoàn chỉnh (presigned/POST policy), policies/ACL/BPA/CORS, SSE hành vi đúng, Object Lock gateway**.
 - **M5 — GC, recovery bundle, doctor/verify/scrub, backup/restore index**.

@@ -1,5 +1,5 @@
 //! Binary `telecrate` — CLI + daemon dùng chung logic trong lib.
-//! M0: init/serve/status/doctor/config + health endpoint. Không mock S3 200.
+//! S3 API vẫn unsupported cho tới M2 — không mock 200.
 
 use axum::{routing::get, Json, Router};
 use clap::{Parser, Subcommand};
@@ -50,7 +50,7 @@ async fn main() {
     let code = match run(cli).await {
         Ok(()) => 0,
         Err(e) => {
-            // Không in secret — error ở M0 không chứa secret.
+            // Không in secret — error không chứa secret (token luôn redact ở transport).
             eprintln!("telecrate: error: {e}");
             1
         }
@@ -106,7 +106,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             let cfg = telecrate::config::load(&cli.config)?;
             let conn = telecrate::db::open(&cfg.db_path)?;
             let v = telecrate::db::schema_version(&conn)?;
-            // Redaction: không in secret (M0 chưa có secret field nào).
+            // Redaction: config hiện chưa có secret field nào (keys/secrets vào M2/M4).
             println!(
                 "doctor ok: schema_version={v} spool={} db={}",
                 cfg.spool_dir, cfg.db_path
