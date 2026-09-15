@@ -2,7 +2,18 @@
 
 > Trạng thái: `implemented-and-tested` | `implemented-unverified` | `partial` | `blocked` | `unsupported`.
 > Semantics theo S3 API Reference chính thức (kiểm tra 2026-09-15). Không suy đoán từ tên API.
-> M0 (bootstrap, commit này): toàn bộ ở `unsupported` trừ health/config — đúng quy tắc "không mock 200".
+> M0 (bootstrap): toàn bộ S3 ở `unsupported` trừ health/config — đúng quy tắc "không mock 200".
+> Cập nhật 2026-09-15 (sau M1 changeset 2): S3 vẫn `unsupported`; Telegram transport có kết quả live đầu tiên (mục riêng bên dưới).
+
+## Telegram transport (ngoài S3 — nền tảng TeleCrate)
+
+| Capability | Trạng thái | Bằng chứng |
+|---|---|---|
+| Bot API HTTP upload document binary | implemented-and-tested | live probe 8 KiB 2026-09-15: `upload_ok=true` |
+| Download byte-identical qua `getFile` | implemented-and-tested | live probe: `download_identical=true` |
+| Delete message | implemented-and-tested | live probe: `delete_ok=true` |
+| Refresh locator hết hạn / history lookup / 429-FLOOD_WAIT thực tế / channel `-100...` admin tối thiểu | blocked | chat test hiện tại là user chat; cần channel thử nghiệm |
+| Local Bot API / MTProto bot | unsupported | chờ capability test |
 
 ## Bucket
 

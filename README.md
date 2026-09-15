@@ -2,7 +2,9 @@
 
 Object storage tương thích S3, dùng Telegram để lưu dữ liệu. Single instance, self-hosted trên Linux (systemd). Mã hóa nội dung OPTIONAL do người dùng quyết định.
 
-> Trạng thái M0 (bootstrap): khung repo + daemon/CLI skeleton + SQLite migrations v1 + config mẫu + systemd unit + CI. S3 API ở trạng thái `unsupported` có chủ đích — không mock 200. Xem `docs/compatibility-matrix.md` và `docs/milestones.md`.
+> Trạng thái (2026-09-15, sau M1 changeset 2): khung repo + daemon/CLI skeleton + SQLite migrations v1 +
+> `BotApiHttpTransport` thật (upload/download/delete đã verify live). S3 API vẫn `unsupported` có chủ đích —
+> không mock 200. Xem `docs/compatibility-matrix.md` và `docs/milestones.md`.
 
 ## Chạy local (dev)
 
@@ -13,7 +15,14 @@ cargo fmt --check
 cargo clippy -- -D warnings
 cargo build
 cargo test
+# Live probe Telegram (cần secrets, tách khỏi test thường):
+TELECRATE_BOT_TOKEN=... TELECRATE_TEST_CHAT_ID=... cargo test -- --ignored live_
 ```
+
+## Secrets (bot token, test chat id)
+
+Không bao giờ commit vào repo. Local dùng biến môi trường tạm thời; CI dùng GitHub Actions Secrets
+(`TELECRATE_BOT_TOKEN`, `TELECRATE_TEST_CHAT_ID`) cho job `live-telegram` riêng. An toàn khi repo chuyển public.
 
 ## Cài đặt native (Linux, tổng quan — chi tiết đầy đủ ở M6)
 
@@ -32,5 +41,5 @@ journalctl -u telecrate -f
 
 - `AGENTS.md` — quy tắc làm việc
 - `docs/architecture.md`, `docs/data-model.md`, `docs/threat-model.md`
-- `docs/compatibility-matrix.md`, `docs/milestones.md`
-- `docs/adr/0001-stack.md`
+- `docs/compatibility-matrix.md`, `docs/milestones.md`, `docs/telegram-capability.md`
+- `docs/adr/0001-stack.md`, `docs/adr/0002-telegram-http-client.md`

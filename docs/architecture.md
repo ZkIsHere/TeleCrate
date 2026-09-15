@@ -22,14 +22,26 @@ Hai trạng thái cam kết phân biệt rõ (xem prompt §4):
 
 GET/HEAD/LIST sau ghi thành công phải thấy ngay version vừa ghi, kể cả khi worker chưa chạy. DELETE thành công ẩn version theo S3 semantics ngay, blob Telegram dọn sau qua GC.
 
-## 2. Thành phần
+## 2. Thành phần (trạng thái triển khai kè từng mục — chi tiết ở `milestones.md`)
 
-- **daemon `telecracted`** (Rust): HTTP S3 API + admin API + serve frontend tĩnh + scheduler/worker Telegram trong cùng process (đơn giản, ít thành phần). CLI `telecrate` dùng chung service logic, gọi admin API khi daemon chạy.
-- **SQLite (WAL)**: index bucket/object/version/chunk/jobs/multipart/policies/retention/migrations/checkpoints. Backup nhất quán bằng `VACUUM INTO` / copy sau checkpoint. Xem `data-model.md`.
+- **binary duy nhất `telecrate`** (Rust): subcommands `init/serve/status/doctor/migrations` dùng chung lib.
+  `implemented-and-tested` ở M0-M1 cho config/DB/spool/transport; HTTP S3 API, admin API,
+  scheduler/worker, dashboard tĩnh là `planned` (M2/M6). Hiện tại `/health` + `/` chỉ là endpoint skeleton —
+  không mock S3 200.
+- **CLI vs daemon**: mục tiêu CLI gọi admin API khi daemon chạy. HIỆN TẠI `init/doctor/migrations`
+  mở DB trực tiếp và chưa có pid lock — `partial`, khóa single-daemon + pid lock làm ở M2 cùng worker.
+- **SQLite (WAL)**: index bucket/object/version/chunk/jobs/multipart/policies/retention/migrations/checkpoints. Xem `data-model.md`.
+  Migration `0001_init` đã có (M0); các bảng còn lại thêm dần theo milestone. Backup nhất quán
+  (`VACUUM INTO` / copy sau checkpoint) là `planned` (M5) — hiện `migrations apply` chỉ copy file DB làm backup.
 - **spool filesystem**: thư mục data riêng, file chunk đặt tên theo content-hash/job-id, KHÔNG dùng object key trực tiếp làm path (chặn path traversal). Quota + high/low watermark + reserved free space. Không LRU cho pending data.
 - **read cache (OPTIONAL, mặc định tắt/quota 0)**: chỉ chứa bản tái tải được, eviction riêng, không chiếm quota spool.
-- **Telegram transport trait**: `BotApiHttp` triển khai trước; `LocalBotApi` / `MtprotoBot` thêm sau qua capability test. DB lưu transport type + chat/channel/message/file_id + locator metadata. `file_unique_id` không thay `file_id`. URL/file_reference coi là ephemeral, refresh khi cần.
-- **Scheduler**: global/per-bot/per-chat bounded concurrency, backoff + jitter, tôn trọng Retry-After/FLOOD_WAIT, circuit breaker, phân biệt lỗi tạm thời vs vĩnh viễn (token sai, mất quyền, channel xóa).
+- **Telegram transport trait** (`src/telegram.rs`, `implemented-and-tested` M1): `BotApiHttpTransport`
+  thật (upload document binary / download qua `getFile` / delete, verify live 2026-09-15) +
+  `MockTransport` cho unit test; `LocalBotApi` / `MtprotoBot` thêm sau qua capability test.
+  DB lưu transport type + chat/channel/message/file_id + locator metadata. `file_unique_id` không thay
+  `file_id`. URL/file_reference coi là ephemeral, refresh khi cần. Lỗi phân loại Transient/Permanent
+  cho scheduler; token luôn redact trong error/Debug (có test). Chi tiết: `telegram-capability.md`.
+- **Scheduler** (`planned`, M2): global/per-bot/per-chat bounded concurrency, backoff + jitter, tôn trọng Retry-After/FLOOD_WAIT, circuit breaker, phân biệt lỗi tạm thời vs vĩnh viễn (token sai, mất quyền, channel xóa).
 - **Frontend tĩnh**: build một lần (Vite), daemon serve, không cần Node.js runtime khi vận hành.
 
 ## 3. Durability & crash recovery

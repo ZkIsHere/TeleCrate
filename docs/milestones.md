@@ -1,8 +1,11 @@
-# Milestones TeleCrate
+# Milestones TeleCrate (cập nhật 2026-09-15)
 
-- **M0 — Bootstrap (commit này)**: Git + AGENTS.md + docs + ADR stack + Rust skeleton + migrations v1 + systemd unit + config mẫu + CI workflow. Cổng: `cargo fmt --check`, clippy `-D warnings`, build, unit test, migrations test, package validate. Trạng thái: `implemented-and-tested` (local) / CI `blocked` (chưa có remote).
-- **M1 — Capability spike Telegram**: Bot API HTTP upload/download/delete/refresh trên channel thử nghiệm + đo giới hạn thật. Không chuyển user session. Kết quả vào `docs/telegram-capability.md`. Live test cần secrets → tách khỏi PR checks.
-- **M2 — Vertical slice durable PUT/GET/HEAD/DELETE/LIST + SigV4 + spool/index + worker thật + 2 chế độ mã hóa (on/off)**. Crash injection + restart không mất acknowledged object.
+- **M0 — Bootstrap: `implemented-and-tested`**. Repo private `ZkIsHere/TeleCrate`, CI self-hosted runner `ci-cd` xanh
+  (fmt/clippy/build/test/package-validate). Rust skeleton + migrations v1 + systemd unit + config mẫu.
+- **M1 — Capability spike Telegram: `partial`**. Changeset 1 (trait + skeleton + mock tests) và 2
+  (`BotApiHttpTransport` thật + live probe 8 KiB pass 2026-09-15) đã xong, CI có job `live-telegram` riêng.
+  Còn lại: channel `-100...` admin tối thiểu, locator refresh, history lookup, FLOOD_WAIT thực tế.
+- **M2 — Vertical slice durable PUT/GET/HEAD/DELETE/LIST + SigV4 + spool/index + worker thật + 2 chế độ mã hóa (on/off)** (tiếp theo). Crash injection + restart không mất acknowledged object.
 - **M3 — Multipart, copy, Range, conditional, ETag, versioning, metadata/tags**.
 - **M4 — Auth hoàn chỉnh (presigned/POST policy), policies/ACL/BPA/CORS, SSE hành vi đúng, Object Lock gateway**.
 - **M5 — GC, recovery bundle, doctor/verify/scrub, backup/restore index**.

@@ -33,6 +33,10 @@
 ## 4. Bảo mật & secrets
 
 - Không commit secrets, DB/spool/cache runtime, recovery bundle chứa secrets. Xem `.gitignore`.
+- Secrets vận hành/test thật (bot token, test chat id) CHỈ nằm trong GitHub Actions Secrets + biến môi trường
+  local tạm thời. Không in secrets ra log/test output; sau run live, grep log CI xác nhận 0 lần xuất hiện
+  secret trước khi tuyên bố pass. An toàn khi repo chuyển public.
+- Live Telegram tests ở job CI riêng, tách khỏi PR checks; thiếu secrets → `UNVERIFIED`, không giả live pass.
 - Backup DB đầy đủ có secrets phải mã hóa riêng; hoặc loại secrets ra và yêu cầu cấu hình lại khi restore. Recovery index không chứa secrets khi mã hóa nội dung tắt.
 - Dashboard: session protection, CSRF, rate-limit login, secret redaction, audit config changes. Export log có redaction + retention để không đầy ổ.
 
