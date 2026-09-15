@@ -41,8 +41,10 @@ Không chuyển sang user session khi gặp lỗi. Không quay vòng tài khoả
   `download_identical=true` (byte-for-byte), `delete_ok=true`. Gửi document binary
   (`application/octet-stream`, tên file = hash nội dung, không lộ key).
 - `implemented-and-tested` (live group, 2026-09-15): probe 8 KiB lặp lại trên basic group
-  thử nghiệm (bot đã được cấp quyền): `upload_ok=true`, `download_identical=true`,
-  `delete_ok=true`. Tin nhắn probe tự xóa sau vài giây (`disable_notification=true`).
+  thử nghiệm: `upload_ok=true`, `download_identical=true`, `delete_ok=true`. Tin nhắn probe
+  tự xóa sau vài giây (`disable_notification=true`). Quyền bot xác minh qua
+  `getChatAdministrators`: `administrator` với `can_post_messages=true`,
+  `can_delete_messages=true` — đủ cho upload/delete của TeleCrate (bot `@Elisofa_Bot`).
 - Ràng buộc nền tảng (xác nhận với chủ dự án 2026-09-15): nâng group lên supergroup/`-100...`
   gần như bất khả thi trong môi trường này. Vì vậy các kiểm tra đặc thù channel/supergroup
   (quyền admin tối thiểu, `channels.deleteMessages` MTProto) ghi `blocked` với lý do rõ ràng,
