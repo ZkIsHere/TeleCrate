@@ -3,6 +3,7 @@
 pub mod config;
 pub mod db;
 pub mod spool;
+pub mod telegram;
 
 /// Phiên bản crate, dùng cho health/version endpoint.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

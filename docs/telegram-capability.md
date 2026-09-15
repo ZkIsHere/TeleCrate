@@ -1,0 +1,39 @@
+# Telegram capability spike — M1 (đang thực hiện)
+
+> Ngày kiểm tra tài liệu: 2026-09-15. Mọi giới hạn phải được xác minh bằng test hành vi thật trên channel thử nghiệm, không suy đoán từ tên API.
+
+## Tài liệu chính thức đã đối chiếu
+
+- S3 overview & consistency: https://docs.aws.amazon.com/AmazonS3/latest/userguide/Welcome.html
+- S3 API reference: https://docs.aws.amazon.com/AmazonS3/latest/API/Welcome.html
+- Telegram Bot API: https://core.telegram.org/bots/api
+- Telegram Bot FAQ: https://core.telegram.org/bots/faq
+- MTProto bot authorization: https://core.telegram.org/api/bots
+- TDLib: https://core.telegram.org/tdlib
+- MTProto channel deletion: https://core.telegram.org/method/channels.deleteMessages
+- PBS storage/S3 backend: https://pbs.proxmox.com/docs/storage.html
+
+## Phân biệt transport (không thay thế nhau khi chưa kiểm chứng)
+
+| Đường | Identity | Khi nào dùng |
+|---|---|---|
+| HTTP Bot API | bot token | Mặc định M1 — đơn giản nhất, test trước |
+| Local Bot API | bot token, server tự host | Nếu giới hạn file/khả dụng của hosted API không đủ — test riêng |
+| MTProto bot (api_id/api_hash + bot token, vd. TDLib) | bot, KHÔNG phải user session | Chỉ khi HTTP/Local không đáp ứng manifest/GC/history — không dùng để né flood control |
+
+Không chuyển sang user session khi gặp lỗi. Không quay vòng tài khoản/bot để né rate limit.
+
+## Checklist capability (channel thử nghiệm + quyền admin tối thiểu)
+
+- [ ] upload document binary (không gửi theo đường biến đổi nội dung), tên/caption không lộ object key/khóa
+- [ ] download byte-identical
+- [ ] refresh file reference / locator hết hạn
+- [ ] message lookup / history access trong phạm vi bot cho phép
+- [ ] xóa message cũ (`deleteMessage` Bot API vs `channels.deleteMessages` MTProto — ghi quyền + lỗi thực tế)
+- [ ] flood control: 429/Retry-After/FLOOD_WAIT, backoff + jitter, circuit breaker
+- [ ] chunk size cấu hình được theo transport + đo hiệu năng (không gom file khổng lồ mặc định)
+
+## Trạng thái
+
+- `implemented-and-tested` (local): `Transport` trait + `BotApiHttp` types + error taxonomy + mock upload/download/delete tests.
+- `blocked` (cần secrets): live probe `live_bot_api_capability_probe` (`#[ignore]`, cần `TELECRATE_BOT_TOKEN` + `TELECRATE_TEST_CHAT_ID`) — thiếu secrets báo `unverified`, không giả live pass.
