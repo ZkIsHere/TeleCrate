@@ -503,6 +503,37 @@
     </div>
   </div>
 
+  <!-- Modal: View Bucket Objects -->
+  <div id="modal-view-objects" class="modal-overlay hidden">
+    <div class="modal-card modal-lg glass-panel">
+      <div class="modal-header">
+        <h3 id="view-objects-title">Danh Sách Objects Trong Bucket</h3>
+        <button class="btn-close-modal" data-modal="modal-view-objects">&times;</button>
+      </div>
+      <div class="modal-body" style="padding: 1.5rem; max-height: 60vh; overflow-y: auto;">
+        <div class="table-wrapper">
+          <table class="data-table">
+            <thead>
+              <tr>
+                <th>Key (Tên File)</th>
+                <th>Kích Thước</th>
+                <th>Trạng Thái Chốt (Storage State)</th>
+                <th>ETag / MD5</th>
+                <th>Ngày Tạo</th>
+              </tr>
+            </thead>
+            <tbody id="object-list-tbody">
+              <tr><td colspan="5" class="text-center text-muted">Đang tải objects...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button type="button" class="btn btn-secondary btn-close-modal" data-modal="modal-view-objects">Đóng</button>
+      </div>
+    </div>
+  </div>
+
   <script src="/dashboard/app.js"></script>
 </body>
 </html>

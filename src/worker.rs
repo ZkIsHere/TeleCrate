@@ -202,6 +202,76 @@ pub fn run_loop(
     }
 }
 
+/// Vòng lặp worker động cho daemon: tự nạp credentials từ config_lock để khởi tạo/cập nhật transport.
+pub fn run_loop_dynamic(
+    db_path: &str,
+    config_lock: std::sync::Arc<std::sync::RwLock<crate::config::Config>>,
+    owner: String,
+    interval: std::time::Duration,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    use std::sync::atomic::Ordering;
+    let mut cached_token = String::new();
+    let mut cached_chat_id = 0i64;
+    let mut cached_base_url = String::new();
+    let mut cached_transport: Option<crate::telegram::BotApiHttpTransport> = None;
+
+    while !shutdown.load(Ordering::Relaxed) {
+        let (bot_token, chat_id, base_url) = {
+            let cfg = config_lock.read().unwrap_or_else(|e| e.into_inner());
+            (
+                cfg.telegram_bot_token.clone(),
+                cfg.telegram_chat_id,
+                cfg.telegram_base_url.clone(),
+            )
+        };
+
+        if bot_token.is_empty() || chat_id == 0 {
+            std::thread::sleep(interval);
+            continue;
+        }
+
+        if cached_transport.is_none()
+            || cached_token != bot_token
+            || cached_chat_id != chat_id
+            || cached_base_url != base_url
+        {
+            match crate::telegram::BotApiHttpTransport::new(&base_url, &bot_token, "telecrate") {
+                Ok(t) => {
+                    cached_token = bot_token;
+                    cached_chat_id = chat_id;
+                    cached_base_url = base_url;
+                    cached_transport = Some(t);
+                }
+                Err(e) => {
+                    tracing::warn!("Worker '{owner}' khởi tạo transport thất bại: {e:?}");
+                    std::thread::sleep(interval);
+                    continue;
+                }
+            }
+        }
+
+        let transport = cached_transport.as_ref().unwrap();
+
+        let step = (|| -> Result<bool, String> {
+            let conn = crate::db::open(db_path)?;
+            let now: String = conn
+                .query_row("SELECT datetime('now')", [], |r| r.get(0))
+                .map_err(|e| format!("now: {e}"))?;
+            process_one_job(&conn, transport, cached_chat_id, true, &owner, &now)
+        })();
+
+        match step {
+            Ok(true) => continue,
+            Ok(false) => std::thread::sleep(interval),
+            Err(e) => {
+                tracing::warn!("Worker '{owner}' lỗi vòng lặp: {e} — thử lại sau");
+                std::thread::sleep(interval);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

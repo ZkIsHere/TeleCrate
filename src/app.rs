@@ -68,6 +68,10 @@ pub fn router(
                 .with_state(admin_state.clone()),
         )
         .route(
+            "/admin/api/buckets/:name/objects",
+            get(telecrate::admin::api_list_bucket_objects).with_state(admin_state.clone()),
+        )
+        .route(
             "/admin/api/access-keys",
             get(telecrate::admin::api_list_access_keys)
                 .post(telecrate::admin::api_create_access_key)

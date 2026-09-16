@@ -276,19 +276,25 @@
       if (!resp.ok) return;
       const data = await resp.json();
 
-      el.statBuckets.textContent = data.total_buckets || 0;
-      el.statObjects.textContent = data.total_objects || 0;
-      el.statSpoolSize.textContent = formatBytes(data.spool_used_bytes || 0);
-      el.statKeys.textContent = data.total_access_keys || 0;
+      const counts = data.counts || {};
+      const spool = data.spool || {};
+      const workers = data.workers || {};
 
-      const pct = Math.min(100, Math.round(((data.spool_used_bytes || 0) / (data.spool_total_bytes || 10737418240)) * 100));
+      el.statBuckets.textContent = counts.total_buckets ?? data.total_buckets ?? 0;
+      el.statObjects.textContent = counts.total_objects ?? data.total_objects ?? 0;
+      el.statSpoolSize.textContent = formatBytes(spool.used_bytes ?? data.spool_used_bytes ?? 0);
+      el.statKeys.textContent = counts.total_access_keys ?? data.total_access_keys ?? 0;
+
+      const spoolUsed = spool.used_bytes ?? data.spool_used_bytes ?? 0;
+      const spoolTotal = spool.total_bytes ?? data.spool_total_bytes ?? 10737418240;
+      const pct = Math.min(100, Math.round((spoolUsed / spoolTotal) * 100));
       el.spoolProgress.style.width = `${pct}%`;
 
-      el.infoUptime.textContent = formatUptime(data.uptime_secs || 0);
-      el.infoDbSize.textContent = formatBytes(data.db_size_bytes || 0);
-      el.infoWorkers.textContent = `${data.worker_concurrency || 0} workers`;
-      el.infoPendingJobs.textContent = `${data.pending_jobs || 0} jobs`;
-      el.infoUploadingJobs.textContent = `${data.uploading_jobs || 0} jobs`;
+      el.infoUptime.textContent = formatUptime(data.uptime_secs ?? data.uptime_seconds ?? 0);
+      el.infoDbSize.textContent = formatBytes(data.db_size_bytes ?? 0);
+      el.infoWorkers.textContent = `${workers.active_worker_count ?? data.worker_concurrency ?? 0} workers`;
+      el.infoPendingJobs.textContent = `${workers.pending_jobs_count ?? data.pending_jobs ?? 0} jobs`;
+      el.infoUploadingJobs.textContent = `${workers.uploading_jobs_count ?? data.uploading_jobs ?? 0} jobs`;
     } catch (e) {}
   }
 
@@ -297,7 +303,7 @@
     try {
       const resp = await apiFetch('/admin/api/buckets');
       const data = await resp.json();
-      state.buckets = data.buckets || [];
+      state.buckets = Array.isArray(data) ? data : (data.buckets || []);
       renderBuckets();
     } catch (e) {
       el.bucketTbody.innerHTML = `<tr><td colspan="6" class="text-center text-rose">Lỗi khi nạp danh sách buckets</td></tr>`;
@@ -317,18 +323,50 @@
       <tr>
         <td><strong>${escapeHtml(b.name)}</strong></td>
         <td><span class="badge badge-success">${escapeHtml(b.region)}</span></td>
-        <td>${escapeHtml(b.versioning_status || 'Disabled')}</td>
+        <td>${escapeHtml(b.versioning || b.versioning_status || 'Disabled')}</td>
         <td>${escapeHtml(b.encryption_override || 'Off')}</td>
         <td class="font-mono">${escapeHtml(b.created_at)}</td>
         <td>
+          <button class="btn btn-sm btn-outline btn-view-objects" data-name="${escapeHtml(b.name)}">Xem Objects</button>
           <button class="btn btn-sm btn-danger btn-delete-bucket" data-name="${escapeHtml(b.name)}">Xóa</button>
         </td>
       </tr>
     `).join('');
 
+    document.querySelectorAll('.btn-view-objects').forEach(btn => {
+      btn.addEventListener('click', () => viewBucketObjects(btn.getAttribute('data-name')));
+    });
+
     document.querySelectorAll('.btn-delete-bucket').forEach(btn => {
       btn.addEventListener('click', () => deleteBucket(btn.getAttribute('data-name')));
     });
+  }
+
+  async function viewBucketObjects(bucketName) {
+    document.getElementById('view-objects-title').textContent = `Danh Sách Objects — Bucket '${bucketName}'`;
+    const tbody = document.getElementById('object-list-tbody');
+    tbody.innerHTML = `<tr><td colspan="5" class="text-center text-muted">Đang nạp danh sách objects...</td></tr>`;
+    openModal('modal-view-objects');
+
+    try {
+      const resp = await apiFetch(`/admin/api/buckets/${bucketName}/objects`);
+      const objects = await resp.json();
+      if (!Array.isArray(objects) || objects.length === 0) {
+        tbody.innerHTML = `<tr><td colspan="5" class="text-center text-muted">Bucket rỗng (chưa có object nào)</td></tr>`;
+        return;
+      }
+      tbody.innerHTML = objects.map(o => `
+        <tr>
+          <td><strong class="font-mono">${escapeHtml(o.key)}</strong></td>
+          <td class="font-mono">${formatBytes(o.size)}</td>
+          <td><span class="badge ${o.storage_state === 'remote' ? 'badge-success' : 'badge-warning'}">${escapeHtml(o.storage_state)}</span></td>
+          <td class="font-mono">${escapeHtml(o.etag || 'N/A')}</td>
+          <td class="font-mono">${escapeHtml(o.created_at)}</td>
+        </tr>
+      `).join('');
+    } catch (err) {
+      tbody.innerHTML = `<tr><td colspan="5" class="text-center text-rose">Lỗi nạp objects: ${escapeHtml(err.message)}</td></tr>`;
+    }
   }
 
   async function deleteBucket(name) {
@@ -379,7 +417,7 @@
     try {
       const resp = await apiFetch('/admin/api/access-keys');
       const data = await resp.json();
-      state.accessKeys = data.access_keys || [];
+      state.accessKeys = Array.isArray(data) ? data : (data.access_keys || []);
       renderAccessKeys();
     } catch (e) {
       el.keyTbody.innerHTML = `<tr><td colspan="5" class="text-center text-rose">Lỗi khi nạp danh sách S3 keys</td></tr>`;

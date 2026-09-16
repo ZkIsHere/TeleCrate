@@ -382,14 +382,14 @@ pub async fn api_get_status(
             total_chunks = n;
         }
         if let Ok(n) = conn.query_row(
-            "SELECT COUNT(*) FROM telegram_upload_jobs WHERE status = 'pending'",
+            "SELECT COUNT(*) FROM upload_jobs WHERE state = 'pending'",
             [],
             |r| r.get(0),
         ) {
             pending_jobs = n;
         }
         if let Ok(n) = conn.query_row(
-            "SELECT COUNT(*) FROM telegram_upload_jobs WHERE status = 'uploading'",
+            "SELECT COUNT(*) FROM upload_jobs WHERE state = 'uploading'",
             [],
             |r| r.get(0),
         ) {
@@ -553,6 +553,64 @@ pub async fn api_delete_bucket(
         )
             .into_response(),
     }
+}
+
+/// `GET /admin/api/buckets/:name/objects`
+pub async fn api_list_bucket_objects(
+    State((config_lock, store)): State<AdminState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
+        return err_resp.into_response();
+    }
+
+    let config = read_config(&config_lock);
+    let conn = match telecrate::db::open(&config.db_path) {
+        Ok(c) => c,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("DB error: {e}") })),
+            )
+                .into_response()
+        }
+    };
+
+    let mut stmt = match conn.prepare(
+        "SELECT key, version_id, is_delete_marker, storage_state, size, etag, content_type, created_at FROM objects WHERE bucket = ? ORDER BY key ASC, created_at DESC",
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Query prepare error: {e}") })),
+            )
+                .into_response()
+        }
+    };
+
+    let object_rows = stmt.query_map([&name], |r| {
+        Ok(json!({
+            "key": r.get::<_, String>(0)?,
+            "version_id": r.get::<_, String>(1)?,
+            "is_delete_marker": r.get::<_, i64>(2)? != 0,
+            "storage_state": r.get::<_, String>(3)?,
+            "size": r.get::<_, i64>(4)?,
+            "etag": r.get::<_, String>(5)?,
+            "content_type": r.get::<_, String>(6)?,
+            "created_at": r.get::<_, String>(7)?,
+        }))
+    });
+
+    let mut list = Vec::new();
+    if let Ok(rows) = object_rows {
+        for obj in rows.flatten() {
+            list.push(obj);
+        }
+    }
+
+    Json(list).into_response()
 }
 
 /// `GET /admin/api/access-keys`

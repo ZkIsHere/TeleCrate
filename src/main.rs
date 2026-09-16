@@ -169,29 +169,25 @@ async fn run(cli: Cli) -> Result<(), String> {
             // Worker upload nền (M2.2): thread riêng + client blocking (ADR 0002).
             // Thiếu token/chat → worker idle, dữ liệu giữ ở spool (accepted-local).
             let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            if transport.is_some() {
-                let n = cfg.worker_concurrency;
-                for i in 0..n {
-                    let worker_transport = transport.clone();
-                    let db_path = cfg.db_path.clone();
-                    let chat_id = cfg.telegram_chat_id;
-                    let sd = shutdown.clone();
-                    let owner = format!("serve-worker-{i}");
-                    std::thread::spawn(move || {
-                        telecrate::worker::run_loop(
-                            &db_path,
-                            worker_transport.as_ref().expect("checked above"),
-                            chat_id,
-                            owner,
-                            std::time::Duration::from_secs(2),
-                            sd,
-                        );
-                    });
-                }
-                println!("worker: {n} luồng upload nền đang chạy");
-            } else {
-                println!("worker: idle (chưa cấu hình telegram_bot_token/chat_id)");
+            let config_lock = std::sync::Arc::new(std::sync::RwLock::new(cfg.clone()));
+            let n = cfg.worker_concurrency;
+            for i in 0..n {
+                let db_path = cfg.db_path.clone();
+                let sd = shutdown.clone();
+                let cfg_lock = config_lock.clone();
+                let owner = format!("serve-worker-{i}");
+                std::thread::spawn(move || {
+                    telecrate::worker::run_loop_dynamic(
+                        &db_path,
+                        cfg_lock,
+                        owner,
+                        std::time::Duration::from_secs(2),
+                        sd,
+                    );
+                });
             }
+            println!("worker: {n} luồng upload nền đang chạy (tự động nạp credentials)");
+
             let sd = shutdown.clone();
             axum::serve(listener, telecrate::app::router(cfg, transport, keys))
                 .with_graceful_shutdown(async move {
