@@ -45,6 +45,20 @@ pub struct Config {
     /// Base URL Bot API (mặc định hosted; Local Bot API tự host khi cần).
     #[serde(default = "default_telegram_base")]
     pub telegram_base_url: String,
+    /// Kích thước chunk upload Telegram (bytes). Mặc định 8 MiB (dưới ngưỡng download 20 MB).
+    #[serde(default = "default_chunk_size")]
+    pub chunk_size_bytes: usize,
+    /// Số worker upload đồng thời (lease atomic nên an toàn). 1..=8.
+    #[serde(default = "default_worker_concurrency")]
+    pub worker_concurrency: usize,
+}
+
+fn default_chunk_size() -> usize {
+    8 * 1024 * 1024
+}
+
+fn default_worker_concurrency() -> usize {
+    2
 }
 
 fn default_telegram_base() -> String {
@@ -67,6 +81,8 @@ impl fmt::Debug for Config {
             .field("telegram_bot_token", &"***")
             .field("telegram_chat_id", &self.telegram_chat_id)
             .field("telegram_base_url", &self.telegram_base_url)
+            .field("chunk_size_bytes", &self.chunk_size_bytes)
+            .field("worker_concurrency", &self.worker_concurrency)
             .finish()
     }
 }
@@ -83,6 +99,8 @@ impl Default for Config {
             telegram_bot_token: String::new(),
             telegram_chat_id: 0,
             telegram_base_url: default_telegram_base(),
+            chunk_size_bytes: default_chunk_size(),
+            worker_concurrency: default_worker_concurrency(),
         }
     }
 }
@@ -117,6 +135,13 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
     }
     if cfg.region.is_empty() {
         return Err("region must not be empty".to_string());
+    }
+    // Chunk vừa đủ nhỏ để getFile tải lại 1 lần (< 20 MB Bot API), vừa đủ lớn để ít message.
+    if !(256 * 1024..=16 * 1024 * 1024).contains(&cfg.chunk_size_bytes) {
+        return Err("chunk_size_bytes must be 256 KiB..16 MiB".to_string());
+    }
+    if !(1..=8).contains(&cfg.worker_concurrency) {
+        return Err("worker_concurrency must be 1..=8".to_string());
     }
     let mut seen = std::collections::HashSet::new();
     for k in &cfg.access_keys {

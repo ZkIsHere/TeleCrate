@@ -16,3 +16,6 @@ secret_key = "thay-secret-that-o-day"
 telegram_bot_token = ""
 telegram_chat_id = 0
 # telegram_base_url = "https://api.telegram.org"
+# Chunk upload Telegram (256 KiB..16 MiB, mặc định 8 MiB) + số worker đồng thời (1..8).
+# chunk_size_bytes = 8388608
+# worker_concurrency = 2

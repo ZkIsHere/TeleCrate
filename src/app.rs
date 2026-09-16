@@ -721,10 +721,10 @@ async fn head_bucket(
     }
 }
 
-// --- Objects M2.2: single-chunk durable, ETag MD5, Range đơn (multi-chunk → 2.3) ---
+// --- Objects M2.2-M2.3: durable, ETag MD5, Range đơn. M2.3 split multi-chunk. ---
 
-/// Giới hạn PUT đơn chunk M2.2 (1 chunk = 1 message Telegram, phải tải lại được trong 1 getFile).
-pub const MAX_SINGLE_PUT_BYTES: usize = 16 * 1024 * 1024;
+/// Giới hạn object M2.3 (buffer trong RAM khi PUT — streaming ở milestone sau).
+pub const MAX_OBJECT_BYTES: usize = 128 * 1024 * 1024;
 
 /// Build transport Telegram — CHỈ gọi ngoài async context.
 /// reqwest blocking Client tạo runtime nội bộ; dựng/drop trong async context sẽ panic
@@ -1027,12 +1027,12 @@ async fn put_object(
         )
         .into_response();
     }
-    if body.len() > MAX_SINGLE_PUT_BYTES {
+    if body.len() > MAX_OBJECT_BYTES {
         return S3Error::new(
             "EntityTooLarge",
             format!(
-                "Single PUT M2.2 giới hạn {} bytes; multipart ở M3.",
-                MAX_SINGLE_PUT_BYTES
+                "Object M2.3 giới hạn {} bytes (buffer RAM khi PUT; streaming ở milestone sau).",
+                MAX_OBJECT_BYTES
             ),
             StatusCode::BAD_REQUEST,
             &resource,
@@ -1048,20 +1048,35 @@ async fn put_object(
     let version_id = uuid::Uuid::new_v4().simple().to_string();
     let job_id = uuid::Uuid::new_v4().simple().to_string();
     let etag = md5_hex(&body);
-    let ph = sha256_hex(&body);
-    // 1) Spool durable trước (tmp+fsync+rename+fsync dir).
-    let spool_path = telecrate::spool::chunk_path(&state.config.spool_dir, &version_id, 0);
-    if let Err(e) = telecrate::spool::write_durable(&spool_path, &body) {
-        return S3Error::new(
-            "InternalError",
-            format!("spool write: {e}"),
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &resource,
-            &request_id,
-        )
-        .into_response();
+    // 1) Split multi-chunk + spool durable từng chunk (tmp+fsync+rename+fsync dir).
+    let piece = state.config.chunk_size_bytes.max(1);
+    let mut specs = Vec::new();
+    let mut written = Vec::new();
+    // Object rỗng vẫn có 0 chunk — hợp lệ (GET trả rỗng).
+    for (idx, part) in body.chunks(piece).enumerate() {
+        let path = telecrate::spool::chunk_path(&state.config.spool_dir, &version_id, idx as u64);
+        if let Err(e) = telecrate::spool::write_durable(&path, part) {
+            for p in written {
+                let _ = std::fs::remove_file(p);
+            }
+            return S3Error::new(
+                "InternalError",
+                format!("spool write: {e}"),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &resource,
+                &request_id,
+            )
+            .into_response();
+        }
+        written.push(path.clone());
+        specs.push(telecrate::db::NewChunk {
+            offset: (idx * piece) as i64,
+            length: part.len() as i64,
+            sha256: sha256_hex(part),
+            spool_path: path.to_str().unwrap_or("").to_string(),
+        });
     }
-    // 2) Một txn duy nhất: object + chunk + job. Từ đây GET đã thấy version mới.
+    // 2) Một txn duy nhất: object + chunks + job. Từ đây GET đã thấy version mới.
     let old_spools = match telecrate::db::put_object(
         &mut conn,
         &bucket,
@@ -1070,13 +1085,14 @@ async fn put_object(
         body.len() as i64,
         &etag,
         &content_type,
-        &ph,
-        spool_path.to_str().unwrap_or(""),
+        &specs,
         &job_id,
     ) {
         Ok(v) => v,
         Err(e) => {
-            let _ = std::fs::remove_file(&spool_path);
+            for p in written {
+                let _ = std::fs::remove_file(p);
+            }
             return S3Error::new(
                 "InternalError",
                 e,

@@ -110,6 +110,9 @@ fn live_s3_worker_telegram_e2e() {
         }],
         telegram_bot_token: token.clone(),
         telegram_chat_id: chat,
+        // Chunk 1 MiB + payload 2.5 MiB → 3 messages thật, tự xóa cuối test.
+        chunk_size_bytes: 1024 * 1024,
+        worker_concurrency: 2,
         ..Default::default()
     };
     std::fs::create_dir_all(&cfg.spool_dir).unwrap();
@@ -155,16 +158,18 @@ fn live_s3_worker_telegram_e2e() {
             &dbp,
             &transport,
             chat,
-            "live-e2e",
+            "live-e2e".to_string(),
             Duration::from_secs(1),
             sd,
         );
     });
 
-    // PUT bucket + object.
+    // PUT bucket + object 2.5 MiB (3 chunks với chunk 1 MiB).
     let (s, _) = signed(&client, "PUT", &base, "/live-bkt", b"", &[]);
     assert_eq!(s, 200);
-    let data = b"live-e2e-payload-telecrate".to_vec();
+    let data: Vec<u8> = (0u32..2_621_440)
+        .map(|i| (i.wrapping_mul(2654435761) >> 16) as u8)
+        .collect();
     let (s, _) = signed(&client, "PUT", &base, "/live-bkt/e2e.bin", &data, &[]);
     assert_eq!(s, 200);
     // GET ngay (spool, worker chưa chạy xong cũng được).
@@ -202,5 +207,5 @@ fn live_s3_worker_telegram_e2e() {
 
     shutdown.store(true, Ordering::Relaxed);
     // Chỉ in trạng thái, không in locator/token.
-    println!("live s3 e2e: put/get/worker-remote/get-after-gc/delete ok=true");
+    println!("live s3 e2e multi-chunk: put/get/worker-remote/get-after-gc/delete ok=true");
 }

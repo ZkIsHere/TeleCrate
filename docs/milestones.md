@@ -16,6 +16,13 @@
   Live e2e pass trên group thật: PUT → GET (spool) → worker remote → GET (Telegram, byte-identical) → DELETE.
   Sửa 2 lỗi thật: ETag thiếu quote đóng; reqwest blocking cấm dựng/gọi trong async (transport build 1 lần ở
   startup + `spawn_blocking` cho download/delete trong handler). Tiếp theo: 2.3 multi-chunk.
+- **2.3: `implemented-and-tested` (2026-09-16)** — PUT split multi-chunk (`chunk_size_bytes`, mặc định 8 MiB,
+  giới hạn object 128 MiB), GET/Range ráp nhiều chunk, worker reclaim lease hết hạn + concurrency N luồng
+  (`worker_concurrency`, mặc định 2), `busy_timeout=5000` cho multi-connection.
+  Live e2e multi-chunk pass (2.5 MiB → 3 messages thật → GC → GET remote → DELETE).
+  Sửa 2 lỗi thật: cursor đọc mở + ghi cùng connection gây lock (thu gọn Vec trước khi ghi; thêm regression test
+  pragma); claim lease khớp cả `uploading` còn hạn gây double-upload (siết điều kiện reclaim, test 4 workers
+  25/25 pass).
 - **M3 — Multipart, copy, Range, conditional, ETag, versioning, metadata/tags**.
 - **M4 — Auth hoàn chỉnh (presigned/POST policy), policies/ACL/BPA/CORS, SSE hành vi đúng, Object Lock gateway**.
 - **M5 — GC, recovery bundle, doctor/verify/scrub, backup/restore index**.

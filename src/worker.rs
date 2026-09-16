@@ -8,7 +8,8 @@ use rusqlite::Connection;
 
 use crate::telegram::{RemoteLocator, Transport, TransportError};
 
-/// Claim 1 job sẵn sàng (pending + tới hạn) bằng lease. Trả None nếu không có việc.
+/// Claim 1 job sẵn sàng bằng lease. Lấy job `pending` tới hạn, hoặc job `uploading`
+/// mà lease đã hết (worker cũ chết giữa chừng — reclaim, chống kẹt hàng đợi).
 fn claim_job(
     conn: &Connection,
     owner: &str,
@@ -16,9 +17,11 @@ fn claim_job(
     now: &str,
 ) -> Result<Option<Claimed>, String> {
     let mut stmt = conn
-        .prepare("SELECT job_id, version_id, retry_count FROM upload_jobs WHERE state = 'pending' AND next_attempt <= ? ORDER BY next_attempt LIMIT 1")
+        .prepare("SELECT job_id, version_id, retry_count FROM upload_jobs WHERE next_attempt <= ? AND ((state = 'pending') OR (state = 'uploading' AND lease_expires IS NOT NULL AND lease_expires <= ?)) ORDER BY next_attempt LIMIT 1")
         .map_err(|e| format!("poll prepare: {e}"))?;
-    let mut rows = stmt.query([now]).map_err(|e| format!("poll: {e}"))?;
+    let mut rows = stmt
+        .query(rusqlite::params![now, now])
+        .map_err(|e| format!("poll: {e}"))?;
     let Some(row) = rows.next().map_err(|e| format!("poll row: {e}"))? else {
         return Ok(None);
     };
@@ -27,10 +30,15 @@ fn claim_job(
         row.get(1).map_err(|e| format!("row: {e}"))?,
         row.get(2).map_err(|e| format!("row: {e}"))?,
     );
+    // Đóng cursor đọc trước khi ghi trên cùng connection (tránh giữ snapshot khi upgrade lock).
+    drop(rows);
+    drop(stmt);
+    // Claim atomic: chỉ thắng khi job pending, hoặc uploading mà lease đã hết.
+    // (Nếu khớp cả uploading còn lease, 2 worker sẽ xử lý trùng job.)
     let n = conn
         .execute(
-            "UPDATE upload_jobs SET state = 'uploading', lease_owner = ?, lease_expires = datetime(?, ?) WHERE job_id = ? AND state = 'pending'",
-            rusqlite::params![owner, now, format!("+{lease_secs} seconds"), job_id],
+            "UPDATE upload_jobs SET state = 'uploading', lease_owner = ?, lease_expires = datetime(?, ?) WHERE job_id = ? AND (state = 'pending' OR (state = 'uploading' AND (lease_expires IS NULL OR lease_expires <= ?)))",
+            rusqlite::params![owner, now, format!("+{lease_secs} seconds"), job_id, now],
         )
         .map_err(|e| format!("claim: {e}"))?;
     if n == 0 {
@@ -166,7 +174,7 @@ pub fn run_loop(
     db_path: &str,
     transport: &dyn Transport,
     chat_id: i64,
-    owner: &str,
+    owner: String,
     interval: std::time::Duration,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -177,7 +185,7 @@ pub fn run_loop(
             let now: String = conn
                 .query_row("SELECT datetime('now')", [], |r| r.get(0))
                 .map_err(|e| format!("now: {e}"))?;
-            process_one_job(&conn, transport, chat_id, true, owner, &now)
+            process_one_job(&conn, transport, chat_id, true, &owner, &now)
         })();
         match step {
             Ok(true) => continue, // còn việc → xử lý ngay.
@@ -275,8 +283,12 @@ mod tests {
             12,
             "etag",
             "text/plain",
-            "ph",
-            spool.to_str().unwrap(),
+            &[crate::db::NewChunk {
+                offset: 0,
+                length: 12,
+                sha256: "ph".to_string(),
+                spool_path: spool.to_str().unwrap().to_string(),
+            }],
             "job1",
         )
         .unwrap();
@@ -355,8 +367,12 @@ mod tests {
             1,
             "e",
             "text/plain",
-            "ph",
-            spool.to_str().unwrap(),
+            &[crate::db::NewChunk {
+                offset: 0,
+                length: 1,
+                sha256: "ph".to_string(),
+                spool_path: spool.to_str().unwrap().to_string(),
+            }],
             "job2",
         )
         .unwrap();
@@ -372,5 +388,117 @@ mod tests {
         assert_eq!(retry, 1);
         // Spool KHÔNG bị GC khi upload lỗi.
         assert!(spool.exists());
+    }
+
+    #[test]
+    fn worker_reclaims_expired_uploading_lease() {
+        let (_dir, mut conn) = job_db();
+        let dir2 = tempfile::tempdir().unwrap();
+        let spool = dir2.path().join("r.chunk");
+        crate::spool::write_durable(&spool, b"reclaim").unwrap();
+        crate::db::put_object(
+            &mut conn,
+            "bkt",
+            "rk",
+            "rv",
+            7,
+            "e",
+            "text/plain",
+            &[crate::db::NewChunk {
+                offset: 0,
+                length: 7,
+                sha256: "ph".to_string(),
+                spool_path: spool.to_str().unwrap().to_string(),
+            }],
+            "jobreclaim",
+        )
+        .unwrap();
+        // Giả lập worker cũ chết: uploading + lease hết từ lâu.
+        conn.execute(
+            "UPDATE upload_jobs SET state = 'uploading', lease_owner = 'dead', lease_expires = '2000-01-01 00:00:00', next_attempt = '2000-01-01 00:00:00' WHERE job_id = 'jobreclaim'",
+            [],
+        )
+        .unwrap();
+        let t = MockOk::new();
+        assert!(process_one_job(&conn, &t, -99, true, "w2", &db_now(&conn)).unwrap());
+        assert_eq!(*t.uploads.lock().unwrap(), 1);
+        let st: String = conn
+            .query_row(
+                "SELECT state FROM upload_jobs WHERE job_id = 'jobreclaim'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(st, "done");
+    }
+
+    #[test]
+    fn concurrent_workers_never_double_upload() {
+        use std::thread;
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("c.db");
+        {
+            let mut conn = crate::db::open(db_path.to_str().unwrap()).unwrap();
+            crate::db::apply_migration(&mut conn, 1, crate::db::MIGRATION_001).unwrap();
+            crate::db::create_bucket(&conn, "bkt", "r").unwrap();
+            // 4 jobs, mỗi job 2 chunks.
+            for i in 0..4 {
+                let mut chunks = Vec::new();
+                for j in 0..2 {
+                    let p = dir.path().join(format!("c{i}-{j}.chunk"));
+                    crate::spool::write_durable(&p, b"data").unwrap();
+                    chunks.push(crate::db::NewChunk {
+                        offset: j,
+                        length: 4,
+                        sha256: "ph".to_string(),
+                        spool_path: p.to_str().unwrap().to_string(),
+                    });
+                }
+                crate::db::put_object(
+                    &mut conn,
+                    "bkt",
+                    &format!("k{i}"),
+                    &format!("v{i}"),
+                    8,
+                    "e",
+                    "text/plain",
+                    &chunks,
+                    &format!("job{i}"),
+                )
+                .unwrap();
+            }
+        }
+        let t = Arc::new(MockOk::new());
+        let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let mut handles = Vec::new();
+        for w in 0..4 {
+            let dbp = db_path.to_str().unwrap().to_string();
+            let tt = t.clone();
+            let errs = errors.clone();
+            handles.push(thread::spawn(move || {
+                let conn = crate::db::open(&dbp).unwrap();
+                let now: String = conn
+                    .query_row("SELECT datetime('now')", [], |r| r.get(0))
+                    .unwrap();
+                // Mỗi worker xử lý tới khi hết việc.
+                let mut n = 0;
+                loop {
+                    match process_one_job(&conn, &*tt, -99, true, &format!("w{w}"), &now) {
+                        Ok(true) => n += 1,
+                        Ok(false) => break,
+                        Err(e) => {
+                            errs.lock().unwrap().push(format!("worker {w}: {e}"));
+                            break;
+                        }
+                    }
+                }
+                n
+            }));
+        }
+        let total: i32 = handles.into_iter().map(|h| h.join().unwrap()).sum();
+        let errs = errors.lock().unwrap();
+        assert!(errs.is_empty(), "worker errors: {errs:?}");
+        assert_eq!(total, 4, "mỗi job xử lý đúng 1 lần");
+        assert_eq!(*t.uploads.lock().unwrap(), 8, "8 chunks upload đúng 1 lần");
     }
 }

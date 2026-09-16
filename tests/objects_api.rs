@@ -50,6 +50,8 @@ fn spawn_server() -> (tempfile::TempDir, String) {
             access_key_id: KEY.to_string(),
             secret_key: SECRET.to_string(),
         }],
+        // Chunk nhỏ để kiểm multi-chunk trong integration (mặc định production 8 MiB).
+        chunk_size_bytes: 1024 * 1024,
         ..Default::default()
     };
     std::fs::create_dir_all(&cfg.spool_dir).unwrap();
@@ -296,11 +298,45 @@ fn object_edge_cases_empty_unicode_special() {
     assert_eq!(r.status, 200);
     assert_eq!(r.body, b"uni");
 
-    // Quá giới hạn single PUT → EntityTooLarge.
-    let big = vec![0u8; 17 * 1024 * 1024];
+    // Quá giới hạn object (128 MiB) → EntityTooLarge trước khi ghi spool.
+    let big = vec![0u8; 129 * 1024 * 1024];
     let r = req(&client, "PUT", &base, "/edge/big", &big, &[]);
     assert_eq!(r.status, 400);
     assert!(text(&r).contains("EntityTooLarge"));
+}
+
+#[test]
+fn multichunk_roundtrip_and_range_spanning_boundary() {
+    let (_dir, base) = spawn_server();
+    let client = reqwest::blocking::Client::new();
+    mkbucket(&client, &base, "multi-chunk");
+
+    // 2.5 MiB với chunk 1 MiB → 3 chunks.
+    let data: Vec<u8> = (0u32..2_621_440)
+        .map(|i| (i.wrapping_mul(2654435761) >> 16) as u8)
+        .collect();
+    let r = req(&client, "PUT", &base, "/multi-chunk/big.bin", &data, &[]);
+    assert_eq!(r.status, 200, "{}", text(&r));
+
+    // GET ráp đủ 3 chunks, byte-identical.
+    let r = req(&client, "GET", &base, "/multi-chunk/big.bin", b"", &[]);
+    assert_eq!(r.status, 200);
+    assert_eq!(r.body, data);
+
+    // Range cắt ngang biên chunk (1 MiB - 5 .. 1 MiB + 5).
+    let a = 1024 * 1024 - 5;
+    let b = 1024 * 1024 + 5;
+    let range = format!("bytes={a}-{b}");
+    let r = req(
+        &client,
+        "GET",
+        &base,
+        "/multi-chunk/big.bin",
+        b"",
+        &[("range", range.as_str())],
+    );
+    assert_eq!(r.status, 206);
+    assert_eq!(r.body, data[a..=b]);
 }
 
 #[test]

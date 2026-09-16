@@ -89,21 +89,25 @@ async fn run(cli: Cli) -> Result<(), String> {
             // Thiếu token/chat → worker idle, dữ liệu giữ ở spool (accepted-local).
             let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             if transport.is_some() {
-                let worker_transport = transport.clone();
-                let db_path = cfg.db_path.clone();
-                let chat_id = cfg.telegram_chat_id;
-                let sd = shutdown.clone();
-                std::thread::spawn(move || {
-                    telecrate::worker::run_loop(
-                        &db_path,
-                        worker_transport.as_ref().expect("checked above"),
-                        chat_id,
-                        "serve-worker",
-                        std::time::Duration::from_secs(2),
-                        sd,
-                    );
-                });
-                println!("worker: telegram upload nền đang chạy");
+                let n = cfg.worker_concurrency;
+                for i in 0..n {
+                    let worker_transport = transport.clone();
+                    let db_path = cfg.db_path.clone();
+                    let chat_id = cfg.telegram_chat_id;
+                    let sd = shutdown.clone();
+                    let owner = format!("serve-worker-{i}");
+                    std::thread::spawn(move || {
+                        telecrate::worker::run_loop(
+                            &db_path,
+                            worker_transport.as_ref().expect("checked above"),
+                            chat_id,
+                            owner,
+                            std::time::Duration::from_secs(2),
+                            sd,
+                        );
+                    });
+                }
+                println!("worker: {n} luồng upload nền đang chạy");
             } else {
                 println!("worker: idle (chưa cấu hình telegram_bot_token/chat_id)");
             }

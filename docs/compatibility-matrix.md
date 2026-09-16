@@ -25,16 +25,16 @@
 | Bucket naming rules | implemented-and-tested | rút gọn M2 (3-63, lowercase/số/`.-`); full rules + virtual-hosted → M3-M4 |
 | Bucket config (versioning, policy, CORS, BPA) | unsupported | M3-M4 |
 
-## Object (cập nhật 2026-09-16 — M2.2, single-chunk, chưa mã hóa)
+## Object (cập nhật 2026-09-16 — M2.3 multi-chunk, chưa mã hóa)
 
 | Operation | Trạng thái | Ghi chú |
 |---|---|---|
-| PutObject / GetObject / HeadObject / DeleteObject | implemented-and-tested | spool durable + 1 txn → 200; ETag=MD5 plaintext; worker upload Telegram + GC; live e2e pass 2026-09-16 |
+| PutObject / GetObject / HeadObject / DeleteObject | implemented-and-tested | split `chunk_size_bytes` (mặc định 8 MiB), 1 txn → 200; ETag=MD5 plaintext; worker N luồng + GC; live e2e multi-chunk pass |
 | DeleteObjects (≤100 keys, chưa VersionId) | implemented-and-tested | integration test |
-| Range đơn (`bytes=a-b/a-/-suffix`, 206/416) | implemented-and-tested | multi-range → 416 trung thực |
+| Range đơn (`bytes=a-b/a-/-suffix`, 206/416, cắt ngang biên chunk) | implemented-and-tested | multi-range → 416 trung thực |
 | Object rỗng / Unicode & ký tự đặc biệt / prefix-folder | implemented-and-tested | integration test |
 | CopyObject / metadata / Content-Type-Disposition-Encoding / tags | unsupported | M3 |
-| PUT > 16 MiB (single) | rejected-rõ-ràng | `EntityTooLarge`; multi-chunk 2.3, multipart M3 |
+| Object > 128 MiB | rejected-rõ-ràng | `EntityTooLarge` (buffer RAM khi PUT; streaming sau); multipart M3 |
 
 ## Listing / Multipart / HTTP / Auth (M2-M4)
 

@@ -11,8 +11,12 @@ pub fn open(db_path: &str) -> Result<Connection, String> {
         }
     }
     let conn = Connection::open(db_path).map_err(|e| format!("open db: {e}"))?;
-    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-        .map_err(|e| format!("pragma: {e}"))?;
+    // WAL + FK + busy timeout 5s: daemon (HTTP + N worker) và CLI dùng chung DB,
+    // writer chờ nhau thay vì SQLITE_BUSY ngay.
+    conn.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+    )
+    .map_err(|e| format!("pragma: {e}"))?;
     Ok(conn)
 }
 
@@ -171,7 +175,16 @@ pub struct ChunkRow {
     pub state: String,
 }
 
-/// Ghi object: thay hàng cũ cùng (bucket,key) + chèn version/chunk/job mới — MỘT txn.
+/// Chunk mới để ghi trong `put_object`.
+#[derive(Debug, Clone)]
+pub struct NewChunk {
+    pub offset: i64,
+    pub length: i64,
+    pub sha256: String,
+    pub spool_path: String,
+}
+
+/// Ghi object: thay hàng cũ cùng (bucket,key) + chèn version/chunks/job mới — MỘT txn.
 #[allow(clippy::too_many_arguments)]
 pub fn put_object(
     conn: &mut Connection,
@@ -181,8 +194,7 @@ pub fn put_object(
     size: i64,
     etag: &str,
     content_type: &str,
-    plaintext_sha256: &str,
-    spool_path: &str,
+    chunks: &[NewChunk],
     job_id: &str,
 ) -> Result<Vec<String>, String> {
     let tx = conn.transaction().map_err(|e| format!("begin: {e}"))?;
@@ -217,11 +229,13 @@ pub fn put_object(
         rusqlite::params![bucket, key, version_id, size, etag, content_type],
     )
     .map_err(|e| format!("insert object: {e}"))?;
-    tx.execute(
-        "INSERT INTO chunks(version_id, idx, offset, length, plaintext_sha256, ciphertext_sha256, encryption_mode, spool_path, state) VALUES (?, 0, 0, ?, ?, ?, 'none', ?, 'pending')",
-        rusqlite::params![version_id, size, plaintext_sha256, plaintext_sha256, spool_path],
-    )
-    .map_err(|e| format!("insert chunk: {e}"))?;
+    for (idx, c) in chunks.iter().enumerate() {
+        tx.execute(
+            "INSERT INTO chunks(version_id, idx, offset, length, plaintext_sha256, ciphertext_sha256, encryption_mode, spool_path, state) VALUES (?, ?, ?, ?, ?, ?, 'none', ?, 'pending')",
+            rusqlite::params![version_id, idx as i64, c.offset, c.length, c.sha256, c.sha256, c.spool_path],
+        )
+        .map_err(|e| format!("insert chunk: {e}"))?;
+    }
     tx.execute(
         "INSERT INTO upload_jobs(job_id, version_id, state) VALUES (?, ?, 'pending')",
         rusqlite::params![job_id, version_id],
@@ -307,12 +321,12 @@ pub fn delete_object(
     let mut spool_paths = Vec::new();
     let mut remote_locators = Vec::new();
     for v in &versions {
-        let mut stmt = tx
+        // Thu gọn rows về Vec rồi mới ghi (không giữ cursor đọc mở khi DELETE cùng txn).
+        let chunk_rows: Vec<(Option<String>, String, Option<String>)> = tx
             .prepare(
                 "SELECT spool_path, state, remote_locator_json FROM chunks WHERE version_id = ?",
             )
-            .map_err(|e| format!("prepare: {e}"))?;
-        let rows = stmt
+            .map_err(|e| format!("prepare: {e}"))?
             .query_map([v], |r| {
                 Ok((
                     r.get::<_, Option<String>>(0)?,
@@ -320,10 +334,10 @@ pub fn delete_object(
                     r.get::<_, Option<String>>(2)?,
                 ))
             })
-            .map_err(|e| format!("query: {e}"))?;
-        for row in rows {
-            let (spool, state, locator): (Option<String>, String, Option<String>) =
-                row.map_err(|e| format!("row: {e}"))?;
+            .map_err(|e| format!("query: {e}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| format!("rows: {e}"))?;
+        for (spool, state, locator) in chunk_rows {
             if let Some(p) = spool {
                 spool_paths.push(p);
             }
@@ -415,6 +429,19 @@ mod tests {
     }
 
     #[test]
+    fn pragmas_wal_fk_busy_timeout() {
+        let (_d, conn) = test_db();
+        let journal: String = conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(journal.to_lowercase(), "wal");
+        let busy: i64 = conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(busy, 5000);
+    }
+
+    #[test]
     fn bucket_crud_and_naming() {
         let (_d, conn) = test_db();
         assert!(!valid_bucket_name("AB"));
@@ -466,6 +493,14 @@ mod tests {
     fn object_put_get_delete_and_list() {
         let (_d, mut conn) = test_db();
         create_bucket(&conn, "bkt", "r").unwrap();
+        let one = |spool: &str, sha: &str, len: i64| {
+            vec![NewChunk {
+                offset: 0,
+                length: len,
+                sha256: sha.to_string(),
+                spool_path: spool.to_string(),
+            }]
+        };
         // PUT 2 keys (1 key có % _ để kiểm LIKE escape).
         let old = put_object(
             &mut conn,
@@ -475,8 +510,7 @@ mod tests {
             3,
             "etag1",
             "text/plain",
-            "ph1",
-            "/spool/x1",
+            &one("/spool/x1", "ph1", 3),
             "job1",
         )
         .unwrap();
@@ -489,8 +523,7 @@ mod tests {
             4,
             "etag2",
             "text/plain",
-            "ph2",
-            "/spool/x2",
+            &one("/spool/x2", "ph2", 4),
             "job2",
         )
         .unwrap();
@@ -503,8 +536,7 @@ mod tests {
             5,
             "etag3",
             "text/plain",
-            "ph3",
-            "/spool/x3",
+            &one("/spool/x3", "ph3", 5),
             "job3",
         )
         .unwrap();
@@ -513,6 +545,42 @@ mod tests {
         assert_eq!(v.version_id, "v3");
         assert_eq!(v.etag, "etag3");
         assert!(latest_version(&conn, "bkt", "ghost").unwrap().is_none());
+        // PUT multi-chunk: chunks giữ đúng thứ tự offset.
+        put_object(
+            &mut conn,
+            "bkt",
+            "multi",
+            "vm",
+            30,
+            "etagm",
+            "bin",
+            &[
+                NewChunk {
+                    offset: 0,
+                    length: 10,
+                    sha256: "s0".into(),
+                    spool_path: "/s/m0".into(),
+                },
+                NewChunk {
+                    offset: 10,
+                    length: 10,
+                    sha256: "s1".into(),
+                    spool_path: "/s/m1".into(),
+                },
+                NewChunk {
+                    offset: 20,
+                    length: 10,
+                    sha256: "s2".into(),
+                    spool_path: "/s/m2".into(),
+                },
+            ],
+            "jobm",
+        )
+        .unwrap();
+        let chunks = chunks_of(&conn, "vm").unwrap();
+        assert_eq!(chunks.len(), 3);
+        assert_eq!(chunks[2].length, 10);
+        assert_eq!(chunks[1].spool_path.as_deref(), Some("/s/m1"));
         // LIST prefix + LIKE escape.
         let keys = list_keys(&conn, "bkt", "a/", "", 10).unwrap();
         assert_eq!(keys.len(), 1);
@@ -520,12 +588,13 @@ mod tests {
         let keys = list_keys(&conn, "bkt", "a%", "", 10).unwrap();
         assert_eq!(keys.len(), 1);
         assert_eq!(keys[0].0, "a%b_c");
-        // Pagination (thứ tự byte: "a%b_c" < "a/b" vì '%' < '/').
+        // Pagination (thứ tự byte: "a%b_c" < "a/b" < "multi").
         let keys = list_keys(&conn, "bkt", "", "", 2).unwrap();
         assert_eq!(keys.len(), 2);
         let keys = list_keys(&conn, "bkt", "", "a%b_c", 10).unwrap();
-        assert_eq!(keys.len(), 1);
+        assert_eq!(keys.len(), 2);
         assert_eq!(keys[0].0, "a/b");
+        assert_eq!(keys[1].0, "multi");
         // DELETE trả spool + existed; xóa lại → !existed.
         let r = delete_object(&mut conn, "bkt", "a/b").unwrap();
         assert!(r.existed);
@@ -537,6 +606,7 @@ mod tests {
             DeleteBucketOutcome::NotEmpty
         );
         delete_object(&mut conn, "bkt", "a%b_c").unwrap();
+        delete_object(&mut conn, "bkt", "multi").unwrap();
         assert_eq!(
             delete_bucket(&conn, "bkt").unwrap(),
             DeleteBucketOutcome::Deleted
