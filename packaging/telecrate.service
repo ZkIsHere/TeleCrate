@@ -14,6 +14,11 @@ Restart=on-failure
 RestartSec=5s
 LimitNOFILE=65536
 
+# Directory management
+RuntimeDirectory=telecrate
+StateDirectory=telecrate
+LogsDirectory=telecrate
+
 # Security & Isolation Hardening (Systemd Native)
 ProtectSystem=strict
 ProtectHome=true
