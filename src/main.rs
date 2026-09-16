@@ -120,7 +120,21 @@ async fn main() {
     std::process::exit(code);
 }
 
-async fn run(cli: Cli) -> Result<(), String> {
+fn resolve_config_path(cli_config: &str) -> String {
+    let args: Vec<String> = std::env::args().collect();
+    for i in 0..args.len() {
+        if args[i] == "--config" && i + 1 < args.len() {
+            return args[i + 1].clone();
+        }
+        if let Some(val) = args[i].strip_prefix("--config=") {
+            return val.to_string();
+        }
+    }
+    cli_config.to_string()
+}
+
+async fn run(mut cli: Cli) -> Result<(), String> {
+    cli.config = resolve_config_path(&cli.config);
     match cli.cmd {
         Commands::Init => {
             println!("init: state dirs từ {}", cli.config);
