@@ -89,16 +89,46 @@ fn signed(
 #[test]
 #[ignore]
 fn live_s3_worker_telegram_e2e() {
+    let (token, chat) = live_secrets();
+    let dir = tempfile::tempdir().unwrap();
+    let mut cfg = live_config(&dir, &token, chat);
+    // Chunk 1 MiB + payload 2.5 MiB → 3 messages thật, tự xóa cuối test.
+    cfg.chunk_size_bytes = 1024 * 1024;
+    run_e2e(cfg, &token, chat, 2_621_440, "live s3 e2e multi-chunk");
+}
+
+#[test]
+#[ignore]
+fn live_encrypted_e2e() {
+    let (token, chat) = live_secrets();
+    let dir = tempfile::tempdir().unwrap();
+    // Key mã hóa thật (file tạm, 0600 mặc định của tempfile trên unix).
+    let key_path = dir.path().join("live.key");
+    std::fs::write(&key_path, [0xA5u8; 32]).unwrap();
+    let mut cfg = live_config(&dir, &token, chat);
+    cfg.encryption = "on".to_string();
+    cfg.content_keys = vec![telecrate::config::ContentKeyRef {
+        id: "live-k1".to_string(),
+        file: key_path.to_str().unwrap().to_string(),
+    }];
+    cfg.chunk_size_bytes = 1024 * 1024;
+    // 1.5 MiB → 2 chunks mã hóa thật trên Telegram, tự xóa cuối test.
+    run_e2e(cfg, &token, chat, 1_572_864, "live encrypted e2e");
+}
+
+fn live_secrets() -> (String, i64) {
     let token =
         std::env::var("TELECRATE_BOT_TOKEN").expect("thiếu TELECRATE_BOT_TOKEN — unverified");
     let chat: i64 = std::env::var("TELECRATE_TEST_CHAT_ID")
         .expect("thiếu TELECRATE_TEST_CHAT_ID")
         .parse()
         .unwrap();
+    (token, chat)
+}
 
-    let dir = tempfile::tempdir().unwrap();
+fn live_config(dir: &tempfile::TempDir, token: &str, chat: i64) -> Config {
     let db_path = dir.path().join("index.db");
-    let cfg = Config {
+    Config {
         db_path: db_path.to_str().unwrap().to_string(),
         spool_dir: dir.path().join("spool").to_str().unwrap().to_string(),
         listen_port: 1,
@@ -108,13 +138,14 @@ fn live_s3_worker_telegram_e2e() {
             access_key_id: KEY.to_string(),
             secret_key: SECRET.to_string(),
         }],
-        telegram_bot_token: token.clone(),
+        telegram_bot_token: token.to_string(),
         telegram_chat_id: chat,
-        // Chunk 1 MiB + payload 2.5 MiB → 3 messages thật, tự xóa cuối test.
-        chunk_size_bytes: 1024 * 1024,
         worker_concurrency: 2,
         ..Default::default()
-    };
+    }
+}
+
+fn run_e2e(cfg: Config, token: &str, chat: i64, payload_len: u32, label: &str) {
     std::fs::create_dir_all(&cfg.spool_dir).unwrap();
     let mut conn = telecrate::db::open(&cfg.db_path).unwrap();
     telecrate::db::apply_migration(&mut conn, 1, telecrate::db::MIGRATION_001).unwrap();
@@ -122,6 +153,7 @@ fn live_s3_worker_telegram_e2e() {
 
     // Server HTTP — router dựng NGOÀI async context (transport blocking).
     let transport = telecrate::app::build_transport(&cfg);
+    let keys = cfg.load_keystore().unwrap_or_default();
     let (tx, rx) = mpsc::channel();
     let cfg2 = cfg.clone();
     thread::spawn(move || {
@@ -129,7 +161,7 @@ fn live_s3_worker_telegram_e2e() {
             .enable_all()
             .build()
             .unwrap();
-        let app = telecrate::app::router(cfg2, transport);
+        let app = telecrate::app::router(cfg2, transport, keys);
         rt.block_on(async move {
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             tx.send(l.local_addr().unwrap().port()).unwrap();
@@ -149,7 +181,7 @@ fn live_s3_worker_telegram_e2e() {
     }
 
     // Worker thật với transport thật.
-    let transport = telecrate::telegram::BotApiHttpTransport::hosted(&token, "live-e2e").unwrap();
+    let transport = telecrate::telegram::BotApiHttpTransport::hosted(token, "live-e2e").unwrap();
     let shutdown = Arc::new(AtomicBool::new(false));
     let sd = shutdown.clone();
     let dbp = cfg.db_path.clone();
@@ -164,10 +196,10 @@ fn live_s3_worker_telegram_e2e() {
         );
     });
 
-    // PUT bucket + object 2.5 MiB (3 chunks với chunk 1 MiB).
+    // PUT bucket + object.
     let (s, _) = signed(&client, "PUT", &base, "/live-bkt", b"", &[]);
     assert_eq!(s, 200);
-    let data: Vec<u8> = (0u32..2_621_440)
+    let data: Vec<u8> = (0u32..payload_len)
         .map(|i| (i.wrapping_mul(2654435761) >> 16) as u8)
         .collect();
     let (s, _) = signed(&client, "PUT", &base, "/live-bkt/e2e.bin", &data, &[]);
@@ -207,5 +239,5 @@ fn live_s3_worker_telegram_e2e() {
 
     shutdown.store(true, Ordering::Relaxed);
     // Chỉ in trạng thái, không in locator/token.
-    println!("live s3 e2e multi-chunk: put/get/worker-remote/get-after-gc/delete ok=true");
+    println!("{label}: put/get/worker-remote/get-after-gc/delete ok=true");
 }

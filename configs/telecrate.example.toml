@@ -19,3 +19,9 @@ telegram_chat_id = 0
 # Chunk upload Telegram (256 KiB..16 MiB, mặc định 8 MiB) + số worker đồng thời (1..8).
 # chunk_size_bytes = 8388608
 # worker_concurrency = 2
+# Mã hóa nội dung: đặt encryption = "on" + ít nhất một key (file 32 bytes thô, 0600).
+# Đổi content_key_id = rotation cho ghi mới; giữ key cũ trong list để đọc dữ liệu cũ.
+# encryption = "on"
+# [[content_keys]]
+# id = "k1"
+# file = "/etc/telecrate/content-k1.key"

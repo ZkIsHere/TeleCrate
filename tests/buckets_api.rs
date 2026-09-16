@@ -62,7 +62,7 @@ fn spawn_server() -> (tempfile::TempDir, String) {
 
     let (tx, rx) = mpsc::channel();
     // Router dựng ngoài async context; test này không cấu hình telegram → transport None.
-    let app = telecrate::app::router(cfg, None);
+    let app = telecrate::app::router(cfg, None, telecrate::crypto::KeyStore::default());
     thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

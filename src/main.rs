@@ -78,13 +78,18 @@ async fn run(cli: Cli) -> Result<(), String> {
                 .await
                 .map_err(|e| format!("bind {addr}: {e}"))?;
             println!("telecrate serving on {addr}");
-            // Transport/blocking client dựng ngoài async context (spawn_blocking) —
+            // Transport/keys dựng ngoài async context (spawn_blocking) —
             // dựng trực tiếp ở đây sẽ panic khi drop runtime nội bộ của reqwest.
             let cfg_route = cfg.clone();
-            let transport =
-                tokio::task::spawn_blocking(move || telecrate::app::build_transport(&cfg_route))
-                    .await
-                    .map_err(|e| format!("build transport: {e}"))?;
+            let (transport, keys) = tokio::task::spawn_blocking(move || {
+                (
+                    telecrate::app::build_transport(&cfg_route),
+                    cfg_route.load_keystore(),
+                )
+            })
+            .await
+            .map_err(|e| format!("build transport/keys: {e}"))?;
+            let keys = keys.map_err(|e| format!("content keys: {e}"))?;
             // Worker upload nền (M2.2): thread riêng + client blocking (ADR 0002).
             // Thiếu token/chat → worker idle, dữ liệu giữ ở spool (accepted-local).
             let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -112,7 +117,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 println!("worker: idle (chưa cấu hình telegram_bot_token/chat_id)");
             }
             let sd = shutdown.clone();
-            axum::serve(listener, telecrate::app::router(cfg, transport))
+            axum::serve(listener, telecrate::app::router(cfg, transport, keys))
                 .with_graceful_shutdown(async move {
                     let _ = tokio::signal::ctrl_c().await;
                     sd.store(true, std::sync::atomic::Ordering::Relaxed);

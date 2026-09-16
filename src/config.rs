@@ -51,6 +51,19 @@ pub struct Config {
     /// Số worker upload đồng thời (lease atomic nên an toàn). 1..=8.
     #[serde(default = "default_worker_concurrency")]
     pub worker_concurrency: usize,
+    /// Danh sách khóa mã hóa nội dung (file 32 bytes thô, quyền 0600). Chỉ đường dẫn vào config.
+    #[serde(default)]
+    pub content_keys: Vec<ContentKeyRef>,
+    /// Key id dùng cho ghi mới (rỗng = key đầu tiên). Đổi id = rotation cho ghi mới.
+    #[serde(default)]
+    pub content_key_id: String,
+}
+
+/// Một khóa mã hóa: chỉ id + đường dẫn file (không bao giờ chứa key material).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ContentKeyRef {
+    pub id: String,
+    pub file: String,
 }
 
 fn default_chunk_size() -> usize {
@@ -83,6 +96,9 @@ impl fmt::Debug for Config {
             .field("telegram_base_url", &self.telegram_base_url)
             .field("chunk_size_bytes", &self.chunk_size_bytes)
             .field("worker_concurrency", &self.worker_concurrency)
+            // content_keys chỉ chứa id + đường dẫn file (không có key material).
+            .field("content_keys", &self.content_keys)
+            .field("content_key_id", &self.content_key_id)
             .finish()
     }
 }
@@ -101,6 +117,8 @@ impl Default for Config {
             telegram_base_url: default_telegram_base(),
             chunk_size_bytes: default_chunk_size(),
             worker_concurrency: default_worker_concurrency(),
+            content_keys: Vec::new(),
+            content_key_id: String::new(),
         }
     }
 }
@@ -112,6 +130,24 @@ impl Config {
             .iter()
             .find(|k| k.access_key_id == access_key_id)
             .map(|k| k.secret_key.as_str())
+    }
+
+    /// Key id dùng cho ghi mới: cấu hình hoặc key đầu tiên.
+    pub fn write_key_id(&self) -> Option<&str> {
+        if !self.content_key_id.is_empty() {
+            return Some(&self.content_key_id);
+        }
+        self.content_keys.first().map(|k| k.id.as_str())
+    }
+
+    /// Nạp KeyStore từ file (gọi ngoài async context, 1 lần ở startup).
+    pub fn load_keystore(&self) -> Result<crate::crypto::KeyStore, String> {
+        let pairs: Vec<(String, String)> = self
+            .content_keys
+            .iter()
+            .map(|k| (k.id.clone(), k.file.clone()))
+            .collect();
+        crate::crypto::KeyStore::load(&pairs).map_err(|e| format!("content keys: {e}"))
     }
 }
 
@@ -142,6 +178,33 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
     }
     if !(1..=8).contains(&cfg.worker_concurrency) {
         return Err("worker_concurrency must be 1..=8".to_string());
+    }
+    // Content keys: id duy nhất, file phải có path; nội dung file kiểm khi load KeyStore.
+    {
+        let mut seen_keys = std::collections::HashSet::new();
+        for k in &cfg.content_keys {
+            if k.id.is_empty() || k.file.is_empty() {
+                return Err("content_keys entries must have non-empty id and file".to_string());
+            }
+            if !seen_keys.insert(k.id.as_str()) {
+                return Err(format!("duplicate content key id: {}", k.id));
+            }
+        }
+        if cfg.encryption == "on" {
+            if cfg.content_keys.is_empty() {
+                return Err(
+                    "encryption=on cần ít nhất một [[content_keys]] (file 32 bytes)".to_string(),
+                );
+            }
+            if !cfg.content_key_id.is_empty()
+                && !cfg.content_keys.iter().any(|k| k.id == cfg.content_key_id)
+            {
+                return Err(format!(
+                    "content_key_id '{}' không có trong content_keys",
+                    cfg.content_key_id
+                ));
+            }
+        }
     }
     let mut seen = std::collections::HashSet::new();
     for k in &cfg.access_keys {
@@ -227,6 +290,25 @@ mod tests {
         let cfg: Config = toml::from_str(&text).unwrap();
         validate(&cfg).unwrap();
         assert!(!cfg.region.is_empty());
+    }
+
+    #[test]
+    fn encryption_on_requires_keys() {
+        let c = Config {
+            encryption: "on".to_string(),
+            ..Config::default()
+        };
+        assert!(validate(&c).is_err());
+        let c = Config {
+            encryption: "on".to_string(),
+            content_keys: vec![ContentKeyRef {
+                id: "k1".into(),
+                file: "/tmp/k1.key".into(),
+            }],
+            content_key_id: "ghost".into(),
+            ..Config::default()
+        };
+        assert!(validate(&c).is_err());
     }
 }
 

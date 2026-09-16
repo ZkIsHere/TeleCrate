@@ -16,12 +16,17 @@ use serde_json::json;
 use std::sync::Arc;
 
 /// Dựng router S3 + health (daemon và test dùng chung).
-/// `transport` phải được build NGOÀI async context (xem [`build_transport`]).
+/// `transport`/`keys` phải được build NGOÀI async context (xem [`build_transport`]).
 pub fn router(
     config: telecrate::config::Config,
     transport: Option<telecrate::telegram::BotApiHttpTransport>,
+    keys: telecrate::crypto::KeyStore,
 ) -> Router {
-    let state = Arc::new(AppState { config, transport });
+    let state = Arc::new(AppState {
+        config,
+        transport,
+        keys,
+    });
     Router::new()
         .route("/health", get(health))
         // GET / vừa là dashboard index (không auth) vừa là S3 ListBuckets (có auth) —
@@ -58,6 +63,8 @@ async fn health() -> Json<serde_json::Value> {
 struct AppState {
     config: telecrate::config::Config,
     transport: Option<telecrate::telegram::BotApiHttpTransport>,
+    /// KeyStore chỉ chứa key material trong RAM — không Debug/log.
+    keys: telecrate::crypto::KeyStore,
 }
 
 fn now_secs() -> u64 {
@@ -1048,14 +1055,76 @@ async fn put_object(
     let version_id = uuid::Uuid::new_v4().simple().to_string();
     let job_id = uuid::Uuid::new_v4().simple().to_string();
     let etag = md5_hex(&body);
-    // 1) Split multi-chunk + spool durable từng chunk (tmp+fsync+rename+fsync dir).
+    // Chế độ mã hóa của lần ghi này (toggle chỉ áp dụng ghi mới).
+    let encrypting = state.config.encryption == "on";
+    let write_key = if encrypting {
+        match state.config.write_key_id() {
+            Some(id) if state.keys.get(id).is_some() => Some(id.to_string()),
+            _ => {
+                return S3Error::new(
+                    "InternalError",
+                    "encryption=on nhưng content key ghi mới không nạp được",
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &resource,
+                    &request_id,
+                )
+                .into_response()
+            }
+        }
+    } else {
+        None
+    };
+    // 1) Split multi-chunk + (mã hóa nếu bật) + spool durable từng chunk.
+    // Khi bật: spool giữ ciphertext (nonce||ct), plaintext không chạm đĩa.
     let piece = state.config.chunk_size_bytes.max(1);
     let mut specs = Vec::new();
     let mut written = Vec::new();
     // Object rỗng vẫn có 0 chunk — hợp lệ (GET trả rỗng).
     for (idx, part) in body.chunks(piece).enumerate() {
+        let stored: Vec<u8>;
+        let (mode, key_ref, csha) = match write_key.as_deref() {
+            Some(kid) => {
+                let enc = match telecrate::crypto::encrypt_chunk(
+                    &state.keys,
+                    kid,
+                    &version_id,
+                    idx as u64,
+                    part,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        for p in written {
+                            let _ = std::fs::remove_file(p);
+                        }
+                        return S3Error::new(
+                            "InternalError",
+                            format!("encrypt: {e}"),
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            &resource,
+                            &request_id,
+                        )
+                        .into_response();
+                    }
+                };
+                let h = sha256_hex(&enc);
+                stored = enc;
+                (
+                    telecrate::crypto::MODE_AEAD_V1.to_string(),
+                    Some(kid.to_string()),
+                    h,
+                )
+            }
+            None => {
+                stored = part.to_vec();
+                (
+                    telecrate::crypto::MODE_NONE.to_string(),
+                    None,
+                    sha256_hex(part),
+                )
+            }
+        };
         let path = telecrate::spool::chunk_path(&state.config.spool_dir, &version_id, idx as u64);
-        if let Err(e) = telecrate::spool::write_durable(&path, part) {
+        if let Err(e) = telecrate::spool::write_durable(&path, &stored) {
             for p in written {
                 let _ = std::fs::remove_file(p);
             }
@@ -1072,8 +1141,11 @@ async fn put_object(
         specs.push(telecrate::db::NewChunk {
             offset: (idx * piece) as i64,
             length: part.len() as i64,
-            sha256: sha256_hex(part),
+            plaintext_sha256: sha256_hex(part),
+            ciphertext_sha256: csha,
             spool_path: path.to_str().unwrap_or("").to_string(),
+            mode,
+            key_ref,
         });
     }
     // 2) Một txn duy nhất: object + chunks + job. Từ đây GET đã thấy version mới.
@@ -1193,7 +1265,64 @@ async fn get_object(
         }
     }
     parts.sort_by_key(|(order, _)| *order);
-    let bytes: Vec<u8> = parts.into_iter().flat_map(|(_, b)| b).collect();
+    // Giải mã từng chunk theo mode lưu trong DB (dữ liệu cũ giữ chế độ cũ).
+    // Chunk mã hóa phải verify TOÀN đơn vị AEAD trước khi cắt Range (đúng secure).
+    let metas = match telecrate::db::chunks_of(&conn, &version.version_id) {
+        Ok(m) => m,
+        Err(e) => {
+            return S3Error::new(
+                "InternalError",
+                e,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &resource,
+                &request_id,
+            )
+            .into_response()
+        }
+    };
+    let mut plain: Vec<u8> = Vec::with_capacity(version.size.max(0) as usize);
+    for (order, stored) in parts {
+        let meta = metas.iter().find(|c| c.idx as usize == order);
+        let (mode, key_ref) = match meta {
+            Some(m) => (m.encryption_mode.as_str(), m.key_ref.as_deref()),
+            None => {
+                return S3Error::new(
+                    "InternalError",
+                    "thiếu metadata chunk",
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &resource,
+                    &request_id,
+                )
+                .into_response()
+            }
+        };
+        if mode == telecrate::crypto::MODE_AEAD_V1 {
+            let kid = key_ref.unwrap_or("");
+            match telecrate::crypto::decrypt_chunk(
+                &state.keys,
+                kid,
+                &version.version_id,
+                order as u64,
+                &stored,
+            ) {
+                Ok(p) => plain.extend_from_slice(&p),
+                Err(_) => {
+                    // Fail đóng, không lộ key id/key material trong message.
+                    return S3Error::new(
+                        "InternalError",
+                        "cannot decrypt chunk (wrong key or tampered data)",
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        &resource,
+                        &request_id,
+                    )
+                    .into_response();
+                }
+            }
+        } else {
+            plain.extend_from_slice(&stored);
+        }
+    }
+    let bytes = plain;
     let size = bytes.len() as u64;
     let mut h = HeaderMap::new();
     match headers.get("range").and_then(|v| v.to_str().ok()) {

@@ -25,11 +25,14 @@
 | Bucket naming rules | implemented-and-tested | rút gọn M2 (3-63, lowercase/số/`.-`); full rules + virtual-hosted → M3-M4 |
 | Bucket config (versioning, policy, CORS, BPA) | unsupported | M3-M4 |
 
-## Object (cập nhật 2026-09-16 — M2.3 multi-chunk, chưa mã hóa)
+## Object (cập nhật 2026-09-16 — M2.4 mã hóa OPTIONAL)
 
 | Operation | Trạng thái | Ghi chú |
 |---|---|---|
-| PutObject / GetObject / HeadObject / DeleteObject | implemented-and-tested | split `chunk_size_bytes` (mặc định 8 MiB), 1 txn → 200; ETag=MD5 plaintext; worker N luồng + GC; live e2e multi-chunk pass |
+| PutObject / GetObject / HeadObject / DeleteObject | implemented-and-tested | `encryption=off`: plaintext + checksum; `on`: ChaCha20-Poly1305/chunk, spool ciphertext, ETag vẫn MD5 plaintext; live e2e cả 2 chế độ pass |
+| Đổi toggle / bucket override | `partial` | đổi toggle chỉ áp dụng ghi mới, dữ liệu cũ đọc được (đã test); bucket override → M4 |
+| Key rotation (đổi id, giữ key cũ) | implemented-and-tested | ghi mới dùng key mới, cũ vẫn đọc (integration); migration re-encrypt toàn kho → job riêng M5+ |
+| Wrong key / tamper / reorder / truncate | fail-đóng-đã-test | 500 `cannot decrypt`, không lộ key; unit + integration |
 | DeleteObjects (≤100 keys, chưa VersionId) | implemented-and-tested | integration test |
 | Range đơn (`bytes=a-b/a-/-suffix`, 206/416, cắt ngang biên chunk) | implemented-and-tested | multi-range → 416 trung thực |
 | Object rỗng / Unicode & ký tự đặc biệt / prefix-folder | implemented-and-tested | integration test |

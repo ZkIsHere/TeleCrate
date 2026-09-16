@@ -166,22 +166,30 @@ pub struct ObjectVersion {
     pub created_at: String,
 }
 
-/// Metadata chunk để worker/GC dùng (không SELECT * bừa bãi).
+/// Metadata chunk để worker/GC/GET dùng (không SELECT * bừa bãi).
 #[derive(Debug, Clone)]
 pub struct ChunkRow {
     pub idx: i64,
     pub length: i64,
     pub spool_path: Option<String>,
     pub state: String,
+    pub encryption_mode: String,
+    pub key_ref: Option<String>,
 }
 
-/// Chunk mới để ghi trong `put_object`.
+/// Chunk mới để ghi trong `put_object`. Tách bạch plaintext checksum / ciphertext
+/// checksum / ETag S3 (ETag nằm ở object, = MD5 plaintext).
 #[derive(Debug, Clone)]
 pub struct NewChunk {
     pub offset: i64,
     pub length: i64,
-    pub sha256: String,
+    pub plaintext_sha256: String,
+    pub ciphertext_sha256: String,
     pub spool_path: String,
+    /// `none` | `aead-v1`.
+    pub mode: String,
+    /// Key id (chỉ khi mã hóa) — tra KeyStore khi đọc.
+    pub key_ref: Option<String>,
 }
 
 /// Ghi object: thay hàng cũ cùng (bucket,key) + chèn version/chunks/job mới — MỘT txn.
@@ -231,8 +239,8 @@ pub fn put_object(
     .map_err(|e| format!("insert object: {e}"))?;
     for (idx, c) in chunks.iter().enumerate() {
         tx.execute(
-            "INSERT INTO chunks(version_id, idx, offset, length, plaintext_sha256, ciphertext_sha256, encryption_mode, spool_path, state) VALUES (?, ?, ?, ?, ?, ?, 'none', ?, 'pending')",
-            rusqlite::params![version_id, idx as i64, c.offset, c.length, c.sha256, c.sha256, c.spool_path],
+            "INSERT INTO chunks(version_id, idx, offset, length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref, spool_path, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
+            rusqlite::params![version_id, idx as i64, c.offset, c.length, c.plaintext_sha256, c.ciphertext_sha256, c.mode, c.key_ref, c.spool_path],
         )
         .map_err(|e| format!("insert chunk: {e}"))?;
     }
@@ -274,7 +282,7 @@ pub fn latest_version(
 pub fn chunks_of(conn: &Connection, version_id: &str) -> Result<Vec<ChunkRow>, String> {
     let mut stmt = conn
         .prepare(
-            "SELECT idx, length, spool_path, state FROM chunks WHERE version_id = ? ORDER BY idx",
+            "SELECT idx, length, spool_path, state, encryption_mode, key_ref FROM chunks WHERE version_id = ? ORDER BY idx",
         )
         .map_err(|e| format!("prepare: {e}"))?;
     let rows = stmt
@@ -284,6 +292,8 @@ pub fn chunks_of(conn: &Connection, version_id: &str) -> Result<Vec<ChunkRow>, S
                 length: r.get(1)?,
                 spool_path: r.get(2)?,
                 state: r.get(3)?,
+                encryption_mode: r.get(4)?,
+                key_ref: r.get(5)?,
             })
         })
         .map_err(|e| format!("query: {e}"))?;
@@ -497,8 +507,11 @@ mod tests {
             vec![NewChunk {
                 offset: 0,
                 length: len,
-                sha256: sha.to_string(),
+                plaintext_sha256: sha.to_string(),
+                ciphertext_sha256: sha.to_string(),
                 spool_path: spool.to_string(),
+                mode: crate::crypto::MODE_NONE.to_string(),
+                key_ref: None,
             }]
         };
         // PUT 2 keys (1 key có % _ để kiểm LIKE escape).
@@ -558,20 +571,29 @@ mod tests {
                 NewChunk {
                     offset: 0,
                     length: 10,
-                    sha256: "s0".into(),
+                    plaintext_sha256: "s0".into(),
+                    ciphertext_sha256: "c0".into(),
                     spool_path: "/s/m0".into(),
+                    mode: crate::crypto::MODE_AEAD_V1.into(),
+                    key_ref: Some("k1".into()),
                 },
                 NewChunk {
                     offset: 10,
                     length: 10,
-                    sha256: "s1".into(),
+                    plaintext_sha256: "s1".into(),
+                    ciphertext_sha256: "c1".into(),
                     spool_path: "/s/m1".into(),
+                    mode: crate::crypto::MODE_AEAD_V1.into(),
+                    key_ref: Some("k1".into()),
                 },
                 NewChunk {
                     offset: 20,
                     length: 10,
-                    sha256: "s2".into(),
+                    plaintext_sha256: "s2".into(),
+                    ciphertext_sha256: "c2".into(),
                     spool_path: "/s/m2".into(),
+                    mode: crate::crypto::MODE_AEAD_V1.into(),
+                    key_ref: Some("k1".into()),
                 },
             ],
             "jobm",
@@ -581,6 +603,8 @@ mod tests {
         assert_eq!(chunks.len(), 3);
         assert_eq!(chunks[2].length, 10);
         assert_eq!(chunks[1].spool_path.as_deref(), Some("/s/m1"));
+        assert_eq!(chunks[0].encryption_mode, crate::crypto::MODE_AEAD_V1);
+        assert_eq!(chunks[0].key_ref.as_deref(), Some("k1"));
         // LIST prefix + LIKE escape.
         let keys = list_keys(&conn, "bkt", "a/", "", 10).unwrap();
         assert_eq!(keys.len(), 1);

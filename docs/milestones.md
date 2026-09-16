@@ -23,6 +23,10 @@
   Sửa 2 lỗi thật: cursor đọc mở + ghi cùng connection gây lock (thu gọn Vec trước khi ghi; thêm regression test
   pragma); claim lease khớp cả `uploading` còn hạn gây double-upload (siết điều kiện reclaim, test 4 workers
   25/25 pass).
+- **2.4: `implemented-and-tested` (2026-09-16)** — mã hóa ChaCha20-Poly1305/chunk (nonce duy nhất, AAD=version/idx),
+  spool ciphertext khi bật, ETag MD5 plaintext, key file 32 bytes + key_id/chunk, rotation giữ key cũ,
+  toggle chỉ áp dụng ghi mới. Fail đóng khi sai key/tamper/reorder. Live e2e mã hóa pass (1.5 MiB → 2 chunks thật).
+  Tiếp theo: 2.5 crash injection + AWS CLI + đóng M2.
 - **M3 — Multipart, copy, Range, conditional, ETag, versioning, metadata/tags**.
 - **M4 — Auth hoàn chỉnh (presigned/POST policy), policies/ACL/BPA/CORS, SSE hành vi đúng, Object Lock gateway**.
 - **M5 — GC, recovery bundle, doctor/verify/scrub, backup/restore index**.

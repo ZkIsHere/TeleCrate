@@ -286,7 +286,10 @@ mod tests {
             &[crate::db::NewChunk {
                 offset: 0,
                 length: 12,
-                sha256: "ph".to_string(),
+                plaintext_sha256: "ph".to_string(),
+                ciphertext_sha256: "ph".to_string(),
+                mode: crate::crypto::MODE_NONE.to_string(),
+                key_ref: None,
                 spool_path: spool.to_str().unwrap().to_string(),
             }],
             "job1",
@@ -370,7 +373,10 @@ mod tests {
             &[crate::db::NewChunk {
                 offset: 0,
                 length: 1,
-                sha256: "ph".to_string(),
+                plaintext_sha256: "ph".to_string(),
+                ciphertext_sha256: "ph".to_string(),
+                mode: crate::crypto::MODE_NONE.to_string(),
+                key_ref: None,
                 spool_path: spool.to_str().unwrap().to_string(),
             }],
             "job2",
@@ -407,7 +413,10 @@ mod tests {
             &[crate::db::NewChunk {
                 offset: 0,
                 length: 7,
-                sha256: "ph".to_string(),
+                plaintext_sha256: "ph".to_string(),
+                ciphertext_sha256: "ph".to_string(),
+                mode: crate::crypto::MODE_NONE.to_string(),
+                key_ref: None,
                 spool_path: spool.to_str().unwrap().to_string(),
             }],
             "jobreclaim",
@@ -450,7 +459,10 @@ mod tests {
                     chunks.push(crate::db::NewChunk {
                         offset: j,
                         length: 4,
-                        sha256: "ph".to_string(),
+                        plaintext_sha256: "ph".to_string(),
+                        ciphertext_sha256: "ph".to_string(),
+                        mode: crate::crypto::MODE_NONE.to_string(),
+                        key_ref: None,
                         spool_path: p.to_str().unwrap().to_string(),
                     });
                 }
