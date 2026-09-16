@@ -892,19 +892,19 @@ pub async fn api_get_audit_logs(
     }
 
     let config = read_config(&config_lock);
-    let bot_token_preview = if config.telegram_bot_token.len() >= 8 {
+    let bot_token_preview = if config.telegram_bot_token.is_empty() {
+        "none".to_string()
+    } else {
         config
             .telegram_bot_token
             .chars()
-            .take(8)
+            .take(10)
             .collect::<String>()
-    } else {
-        "bot_token".to_string()
     };
 
     let mut raw_logs = vec![
         format!(
-            "[INFO] [{}] Daemon starting up on port {}",
+            "[INFO] [{}] Daemon serving on port {}",
             now_secs(),
             config.listen_port
         ),
@@ -919,7 +919,7 @@ pub async fn api_get_audit_logs(
             config.spool_dir
         ),
         format!(
-            "[INFO] [{}] Telegram transport active with bot token bot{}:[REDACTED_BOT_TOKEN]",
+            "[INFO] [{}] Telegram transport active with token prefix: {}...",
             now_secs(),
             bot_token_preview
         ),
