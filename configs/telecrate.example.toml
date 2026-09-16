@@ -11,3 +11,8 @@ region = "telecrate-1"
 [[access_keys]]
 access_key_id = "TELECRATE-EXAMPLE-KEY"
 secret_key = "thay-secret-that-o-day"
+# Telegram worker (M2.2+): bot token + chat id nhận blob. Để trống/0 = worker idle.
+# Token chỉ nằm ở file này (0600) và Actions Secrets khi test — không commit secret thật.
+telegram_bot_token = ""
+telegram_chat_id = 0
+# telegram_base_url = "https://api.telegram.org"

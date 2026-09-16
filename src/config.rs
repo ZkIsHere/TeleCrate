@@ -36,6 +36,19 @@ pub struct Config {
     /// Access keys tĩnh (M2). Thay đổi cần restart/reload.
     #[serde(default)]
     pub access_keys: Vec<AccessKey>,
+    /// Bot token Telegram cho worker upload (M2.2+). Rỗng = worker idle.
+    #[serde(default)]
+    pub telegram_bot_token: String,
+    /// Chat id nhận blob (group/channel test). 0 = worker idle.
+    #[serde(default)]
+    pub telegram_chat_id: i64,
+    /// Base URL Bot API (mặc định hosted; Local Bot API tự host khi cần).
+    #[serde(default = "default_telegram_base")]
+    pub telegram_base_url: String,
+}
+
+fn default_telegram_base() -> String {
+    "https://api.telegram.org".to_string()
 }
 
 fn default_region() -> String {
@@ -51,6 +64,9 @@ impl fmt::Debug for Config {
             .field("encryption", &self.encryption)
             .field("region", &self.region)
             .field("access_keys", &self.access_keys)
+            .field("telegram_bot_token", &"***")
+            .field("telegram_chat_id", &self.telegram_chat_id)
+            .field("telegram_base_url", &self.telegram_base_url)
             .finish()
     }
 }
@@ -64,6 +80,9 @@ impl Default for Config {
             encryption: "off".to_string(),
             region: default_region(),
             access_keys: Vec::new(),
+            telegram_bot_token: String::new(),
+            telegram_chat_id: 0,
+            telegram_base_url: default_telegram_base(),
         }
     }
 }
@@ -168,11 +187,13 @@ mod tests {
                 access_key_id: "AKID".to_string(),
                 secret_key: "SUPER-SECRET".to_string(),
             }],
+            telegram_bot_token: "BOT-TOKEN-XYZ".to_string(),
             ..Config::default()
         };
         let dbg = format!("{c:?}");
         assert!(dbg.contains("AKID"));
         assert!(!dbg.contains("SUPER-SECRET"), "secret leaked: {dbg}");
+        assert!(!dbg.contains("BOT-TOKEN-XYZ"), "token leaked: {dbg}");
     }
 
     #[test]

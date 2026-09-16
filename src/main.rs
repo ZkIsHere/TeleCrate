@@ -78,7 +78,41 @@ async fn run(cli: Cli) -> Result<(), String> {
                 .await
                 .map_err(|e| format!("bind {addr}: {e}"))?;
             println!("telecrate serving on {addr}");
-            axum::serve(listener, telecrate::app::router(cfg))
+            // Transport/blocking client dựng ngoài async context (spawn_blocking) —
+            // dựng trực tiếp ở đây sẽ panic khi drop runtime nội bộ của reqwest.
+            let cfg_route = cfg.clone();
+            let transport =
+                tokio::task::spawn_blocking(move || telecrate::app::build_transport(&cfg_route))
+                    .await
+                    .map_err(|e| format!("build transport: {e}"))?;
+            // Worker upload nền (M2.2): thread riêng + client blocking (ADR 0002).
+            // Thiếu token/chat → worker idle, dữ liệu giữ ở spool (accepted-local).
+            let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            if transport.is_some() {
+                let worker_transport = transport.clone();
+                let db_path = cfg.db_path.clone();
+                let chat_id = cfg.telegram_chat_id;
+                let sd = shutdown.clone();
+                std::thread::spawn(move || {
+                    telecrate::worker::run_loop(
+                        &db_path,
+                        worker_transport.as_ref().expect("checked above"),
+                        chat_id,
+                        "serve-worker",
+                        std::time::Duration::from_secs(2),
+                        sd,
+                    );
+                });
+                println!("worker: telegram upload nền đang chạy");
+            } else {
+                println!("worker: idle (chưa cấu hình telegram_bot_token/chat_id)");
+            }
+            let sd = shutdown.clone();
+            axum::serve(listener, telecrate::app::router(cfg, transport))
+                .with_graceful_shutdown(async move {
+                    let _ = tokio::signal::ctrl_c().await;
+                    sd.store(true, std::sync::atomic::Ordering::Relaxed);
+                })
                 .await
                 .map_err(|e| format!("serve: {e}"))?;
             Ok(())

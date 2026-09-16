@@ -7,6 +7,7 @@ pub mod s3;
 pub mod sigv4;
 pub mod spool;
 pub mod telegram;
+pub mod worker;
 
 /// Phiên bản crate, dùng cho health/version endpoint.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

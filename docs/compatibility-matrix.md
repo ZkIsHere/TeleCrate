@@ -25,18 +25,23 @@
 | Bucket naming rules | implemented-and-tested | rút gọn M2 (3-63, lowercase/số/`.-`); full rules + virtual-hosted → M3-M4 |
 | Bucket config (versioning, policy, CORS, BPA) | unsupported | M3-M4 |
 
-## Object (M2-M3)
+## Object (cập nhật 2026-09-16 — M2.2, single-chunk, chưa mã hóa)
 
-| Operation | Trạng thái |
-|---|---|
-| PutObject / GetObject / HeadObject / DeleteObject / DeleteObjects | unsupported |
-| CopyObject / metadata / Content-Type-Disposition-Encoding / tags | unsupported |
-| Object rỗng / Unicode & ký tự đặc biệt / prefix-folder | unsupported |
+| Operation | Trạng thái | Ghi chú |
+|---|---|---|
+| PutObject / GetObject / HeadObject / DeleteObject | implemented-and-tested | spool durable + 1 txn → 200; ETag=MD5 plaintext; worker upload Telegram + GC; live e2e pass 2026-09-16 |
+| DeleteObjects (≤100 keys, chưa VersionId) | implemented-and-tested | integration test |
+| Range đơn (`bytes=a-b/a-/-suffix`, 206/416) | implemented-and-tested | multi-range → 416 trung thực |
+| Object rỗng / Unicode & ký tự đặc biệt / prefix-folder | implemented-and-tested | integration test |
+| CopyObject / metadata / Content-Type-Disposition-Encoding / tags | unsupported | M3 |
+| PUT > 16 MiB (single) | rejected-rõ-ràng | `EntityTooLarge`; multi-chunk 2.3, multipart M3 |
 
 ## Listing / Multipart / HTTP / Auth (M2-M4)
 
-ListObjects v1/v2, ListObjectVersions, pagination + concurrent change: unsupported.
-Multipart toàn bộ (initiate/upload/list/complete/abort/list-uploads, part-copy, checksum, cleanup): unsupported.
+ListObjects v1: unsupported (chỉ v2 ở M2.2). ListObjectsV2 (prefix/delimiter/max-keys/continuation/encoding-type=url):
+`implemented-and-tested` (M2.2). ListObjectVersions: unsupported (M3, cùng versioning).
+Pagination đúng khi concurrent change: `partial` (token = last key; concurrent overwrite ghi đè hàng — M2 chưa versioning).
+Multipart toàn bộ (initiate/upload/list/complete/abort/list-uploads, part-copy, checksum, cleanup): unsupported (M3).
 Range, conditional, ETag theo loại upload, request ID, lỗi chuẩn: unsupported.
 SigV4 header/query, presigned, POST policy, streaming checksum: header-auth `implemented-and-tested` (M2.1);
 presigned query + POST policy + streaming → M4.

@@ -96,6 +96,8 @@ pub mod documented_limits {
 
 /// Client Bot API HTTP thật: upload document binary, download, delete.
 /// Token KHÔNG BAO GIỜ xuất hiện trong log/error/Debug — mọi chuỗi lỗi đều redact.
+/// Clone rẻ (reqwest Client share bên trong) để dùng chung qua AppState.
+#[derive(Clone)]
 pub struct BotApiHttpTransport {
     base_url: String,
     token: String,

@@ -11,7 +11,11 @@
   → 2.4 (mã hóa on/AEAD) → 2.5 (crash injection + AWS CLI + đóng M2).
 - **2.1: `implemented-and-tested` (2026-09-16)** — config keys + region, SigV4 verify (vector AWS get-vanilla +
   roundtrip/tamper/skew), bucket CRUD + GetBucketLocation + error XML/request-id, integration HTTP ký thật.
-  Op chưa tới milestone trả 501 `NotImplemented` (GET /bucket = ListObjects → 2.2).
+- **2.2: `implemented-and-tested` (2026-09-16)** — PUT/GET/HEAD/DELETE durable single-chunk + ETag MD5,
+  ListObjectsV2 + DeleteObjects (≤100), Range đơn, worker lease/backoff + GC spool.
+  Live e2e pass trên group thật: PUT → GET (spool) → worker remote → GET (Telegram, byte-identical) → DELETE.
+  Sửa 2 lỗi thật: ETag thiếu quote đóng; reqwest blocking cấm dựng/gọi trong async (transport build 1 lần ở
+  startup + `spawn_blocking` cho download/delete trong handler). Tiếp theo: 2.3 multi-chunk.
 - **M3 — Multipart, copy, Range, conditional, ETag, versioning, metadata/tags**.
 - **M4 — Auth hoàn chỉnh (presigned/POST policy), policies/ACL/BPA/CORS, SSE hành vi đúng, Object Lock gateway**.
 - **M5 — GC, recovery bundle, doctor/verify/scrub, backup/restore index**.

@@ -52,6 +52,7 @@ fn spawn_server() -> (tempfile::TempDir, String) {
             access_key_id: KEY.to_string(),
             secret_key: SECRET.to_string(),
         }],
+        ..Default::default()
     };
     // init DB như CLI init.
     std::fs::create_dir_all(&cfg.spool_dir).unwrap();
@@ -60,6 +61,8 @@ fn spawn_server() -> (tempfile::TempDir, String) {
     drop(conn);
 
     let (tx, rx) = mpsc::channel();
+    // Router dựng ngoài async context; test này không cấu hình telegram → transport None.
+    let app = telecrate::app::router(cfg, None);
     thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -69,7 +72,7 @@ fn spawn_server() -> (tempfile::TempDir, String) {
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = l.local_addr().unwrap().port();
             tx.send(port).unwrap();
-            axum::serve(l, telecrate::app::router(cfg)).await.unwrap();
+            axum::serve(l, app).await.unwrap();
         });
     });
     let port: u16 = rx.recv_timeout(Duration::from_secs(10)).unwrap();
@@ -226,8 +229,10 @@ fn bucket_lifecycle_signed() {
         SECRET,
         &now,
     );
-    assert_eq!(s, 501);
-    assert!(body.contains("NotImplemented"), "{body}");
+    // GET bucket không ?location = ListObjectsV2 (bucket rỗng).
+    assert_eq!(s, 200);
+    assert!(body.contains("<ListBucketResult"), "{body}");
+    assert!(body.contains("<IsTruncated>false</IsTruncated>"), "{body}");
     // DELETE ghost → 404; DELETE thật → 204; HEAD sau xóa → 404.
     let (s, _, _) = signed(&client, "DELETE", &base, "/ghost", b"", KEY, SECRET, &now);
     assert_eq!(s, 404);

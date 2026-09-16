@@ -46,6 +46,9 @@ Không chuyển sang user session khi gặp lỗi. Không quay vòng tài khoả
   `getChatAdministrators`: `administrator` với `can_post_messages=true`,
   `can_delete_messages=true` — đủ cho upload/delete của TeleCrate (bot `@Elisofa_Bot`).
   Job `live-telegram` trên CI chạy probe vào chính group này (chat id trong Actions Secrets).
+- `implemented-and-tested` (live S3 e2e, 2026-09-16): `tests/live_e2e.rs` chạy trong CI job
+  `live-telegram` — PUT object qua S3 → worker upload lên group → spool GC → GET đọc từ Telegram
+  byte-identical → DELETE dọn DB/spool/remote. Vòng đời durable đầy đủ đầu-cuối trên Telegram thật.
 - Ràng buộc nền tảng (xác nhận với chủ dự án 2026-09-15): nâng group lên supergroup/`-100...`
   gần như bất khả thi trong môi trường này. Vì vậy các kiểm tra đặc thù channel/supergroup
   (quyền admin tối thiểu, `channels.deleteMessages` MTProto) ghi `blocked` với lý do rõ ràng,

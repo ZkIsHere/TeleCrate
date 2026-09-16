@@ -149,6 +149,249 @@ pub fn list_buckets(conn: &Connection) -> Result<Vec<Bucket>, String> {
         .map_err(|e| format!("rows: {e}"))
 }
 
+// --- Objects M2.2 (chưa versioning: PUT thay thế hàng cũ cùng key trong cùng txn) ---
+
+/// Một object version (M2.2: mỗi key một hàng hiện hành).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectVersion {
+    pub version_id: String,
+    pub size: i64,
+    pub etag: String,
+    pub content_type: String,
+    pub storage_state: String,
+    pub created_at: String,
+}
+
+/// Metadata chunk để worker/GC dùng (không SELECT * bừa bãi).
+#[derive(Debug, Clone)]
+pub struct ChunkRow {
+    pub idx: i64,
+    pub length: i64,
+    pub spool_path: Option<String>,
+    pub state: String,
+}
+
+/// Ghi object: thay hàng cũ cùng (bucket,key) + chèn version/chunk/job mới — MỘT txn.
+#[allow(clippy::too_many_arguments)]
+pub fn put_object(
+    conn: &mut Connection,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    size: i64,
+    etag: &str,
+    content_type: &str,
+    plaintext_sha256: &str,
+    spool_path: &str,
+    job_id: &str,
+) -> Result<Vec<String>, String> {
+    let tx = conn.transaction().map_err(|e| format!("begin: {e}"))?;
+    // Spool cũ mồ côi nếu PUT đè — thu gom để caller xóa sau commit.
+    let old: Vec<String> = tx
+        .prepare("SELECT spool_path FROM chunks WHERE version_id IN (SELECT version_id FROM objects WHERE bucket = ? AND key = ?)")
+        .map_err(|e| format!("prepare: {e}"))?
+        .query_map(rusqlite::params![bucket, key], |r| r.get(0))
+        .map_err(|e| format!("query: {e}"))?
+        .collect::<Result<Vec<Option<String>>, _>>()
+        .map_err(|e| format!("rows: {e}"))?
+        .into_iter()
+        .flatten()
+        .collect();
+    tx.execute(
+        "DELETE FROM upload_jobs WHERE version_id IN (SELECT version_id FROM objects WHERE bucket = ? AND key = ?)",
+        rusqlite::params![bucket, key],
+    )
+    .map_err(|e| format!("delete jobs: {e}"))?;
+    tx.execute(
+        "DELETE FROM chunks WHERE version_id IN (SELECT version_id FROM objects WHERE bucket = ? AND key = ?)",
+        rusqlite::params![bucket, key],
+    )
+    .map_err(|e| format!("delete chunks: {e}"))?;
+    tx.execute(
+        "DELETE FROM objects WHERE bucket = ? AND key = ?",
+        rusqlite::params![bucket, key],
+    )
+    .map_err(|e| format!("delete objects: {e}"))?;
+    tx.execute(
+        "INSERT INTO objects(bucket, key, version_id, storage_state, size, etag, content_type) VALUES (?, ?, ?, 'accepted-local', ?, ?, ?)",
+        rusqlite::params![bucket, key, version_id, size, etag, content_type],
+    )
+    .map_err(|e| format!("insert object: {e}"))?;
+    tx.execute(
+        "INSERT INTO chunks(version_id, idx, offset, length, plaintext_sha256, ciphertext_sha256, encryption_mode, spool_path, state) VALUES (?, 0, 0, ?, ?, ?, 'none', ?, 'pending')",
+        rusqlite::params![version_id, size, plaintext_sha256, plaintext_sha256, spool_path],
+    )
+    .map_err(|e| format!("insert chunk: {e}"))?;
+    tx.execute(
+        "INSERT INTO upload_jobs(job_id, version_id, state) VALUES (?, ?, 'pending')",
+        rusqlite::params![job_id, version_id],
+    )
+    .map_err(|e| format!("insert job: {e}"))?;
+    tx.commit().map_err(|e| format!("commit: {e}"))?;
+    Ok(old)
+}
+
+pub fn latest_version(
+    conn: &Connection,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<ObjectVersion>, String> {
+    let mut stmt = conn
+        .prepare("SELECT version_id, size, etag, content_type, storage_state, created_at FROM objects WHERE bucket = ? AND key = ? ORDER BY created_at DESC LIMIT 1")
+        .map_err(|e| format!("prepare: {e}"))?;
+    let mut rows = stmt
+        .query_map(rusqlite::params![bucket, key], |r| {
+            Ok(ObjectVersion {
+                version_id: r.get(0)?,
+                size: r.get(1)?,
+                etag: r.get(2)?,
+                content_type: r.get(3)?,
+                storage_state: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })
+        .map_err(|e| format!("query: {e}"))?;
+    match rows.next() {
+        Some(r) => r.map(Some).map_err(|e| format!("row: {e}")),
+        None => Ok(None),
+    }
+}
+
+pub fn chunks_of(conn: &Connection, version_id: &str) -> Result<Vec<ChunkRow>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT idx, length, spool_path, state FROM chunks WHERE version_id = ? ORDER BY idx",
+        )
+        .map_err(|e| format!("prepare: {e}"))?;
+    let rows = stmt
+        .query_map([version_id], |r| {
+            Ok(ChunkRow {
+                idx: r.get(0)?,
+                length: r.get(1)?,
+                spool_path: r.get(2)?,
+                state: r.get(3)?,
+            })
+        })
+        .map_err(|e| format!("query: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("rows: {e}"))
+}
+
+/// Xóa object: trả spool paths để caller dọn + locators đã remote (caller best-effort xóa remote).
+pub struct DeleteObjectResult {
+    pub existed: bool,
+    pub spool_paths: Vec<String>,
+    pub remote_locators: Vec<crate::telegram::RemoteLocator>,
+}
+
+pub fn delete_object(
+    conn: &mut Connection,
+    bucket: &str,
+    key: &str,
+) -> Result<DeleteObjectResult, String> {
+    let tx = conn.transaction().map_err(|e| format!("begin: {e}"))?;
+    let versions: Vec<String> = tx
+        .prepare("SELECT version_id FROM objects WHERE bucket = ? AND key = ?")
+        .map_err(|e| format!("prepare: {e}"))?
+        .query_map(rusqlite::params![bucket, key], |r| r.get(0))
+        .map_err(|e| format!("query: {e}"))?
+        .collect::<Result<Vec<String>, _>>()
+        .map_err(|e| format!("rows: {e}"))?;
+    if versions.is_empty() {
+        return Ok(DeleteObjectResult {
+            existed: false,
+            spool_paths: Vec::new(),
+            remote_locators: Vec::new(),
+        });
+    }
+    let mut spool_paths = Vec::new();
+    let mut remote_locators = Vec::new();
+    for v in &versions {
+        let mut stmt = tx
+            .prepare(
+                "SELECT spool_path, state, remote_locator_json FROM chunks WHERE version_id = ?",
+            )
+            .map_err(|e| format!("prepare: {e}"))?;
+        let rows = stmt
+            .query_map([v], |r| {
+                Ok((
+                    r.get::<_, Option<String>>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, Option<String>>(2)?,
+                ))
+            })
+            .map_err(|e| format!("query: {e}"))?;
+        for row in rows {
+            let (spool, state, locator): (Option<String>, String, Option<String>) =
+                row.map_err(|e| format!("row: {e}"))?;
+            if let Some(p) = spool {
+                spool_paths.push(p);
+            }
+            // Remote cleanup best-effort ở tầng route (M2.2); orphan dọn ở M5 GC.
+            if state == "remote" {
+                if let Some(loc) = locator {
+                    if let Ok(parsed) = serde_json::from_str(&loc) {
+                        remote_locators.push(parsed);
+                    }
+                }
+            }
+        }
+        tx.execute("DELETE FROM upload_jobs WHERE version_id = ?", [v])
+            .map_err(|e| format!("delete jobs: {e}"))?;
+        tx.execute("DELETE FROM chunks WHERE version_id = ?", [v])
+            .map_err(|e| format!("delete chunks: {e}"))?;
+    }
+    tx.execute(
+        "DELETE FROM objects WHERE bucket = ? AND key = ?",
+        rusqlite::params![bucket, key],
+    )
+    .map_err(|e| format!("delete objects: {e}"))?;
+    tx.commit().map_err(|e| format!("commit: {e}"))?;
+    Ok(DeleteObjectResult {
+        existed: true,
+        spool_paths,
+        remote_locators,
+    })
+}
+
+/// List keys phục vụ ListObjectsV2: lọc prefix, sắp xếp, cắt max-keys+1 để biết truncated.
+pub fn list_keys(
+    conn: &Connection,
+    bucket: &str,
+    prefix: &str,
+    start_after: &str,
+    limit_plus_one: i64,
+) -> Result<Vec<(String, ObjectVersion)>, String> {
+    // Escape LIKE wildcards trong prefix (key có thể chứa % _ \).
+    let esc = prefix
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let mut stmt = conn
+        .prepare("SELECT key, version_id, size, etag, content_type, storage_state, created_at FROM objects WHERE bucket = ? AND key LIKE ? || '%' ESCAPE '\\' AND key > ? ORDER BY key LIMIT ?")
+        .map_err(|e| format!("prepare: {e}"))?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![bucket, esc, start_after, limit_plus_one],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    ObjectVersion {
+                        version_id: r.get(1)?,
+                        size: r.get(2)?,
+                        etag: r.get(3)?,
+                        content_type: r.get(4)?,
+                        storage_state: r.get(5)?,
+                        created_at: r.get(6)?,
+                    },
+                ))
+            },
+        )
+        .map_err(|e| format!("query: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("rows: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +459,87 @@ mod tests {
         assert_eq!(
             delete_bucket(&conn, "bucket-2").unwrap(),
             DeleteBucketOutcome::NotEmpty
+        );
+    }
+
+    #[test]
+    fn object_put_get_delete_and_list() {
+        let (_d, mut conn) = test_db();
+        create_bucket(&conn, "bkt", "r").unwrap();
+        // PUT 2 keys (1 key có % _ để kiểm LIKE escape).
+        let old = put_object(
+            &mut conn,
+            "bkt",
+            "a/b",
+            "v1",
+            3,
+            "etag1",
+            "text/plain",
+            "ph1",
+            "/spool/x1",
+            "job1",
+        )
+        .unwrap();
+        assert!(old.is_empty());
+        put_object(
+            &mut conn,
+            "bkt",
+            "a%b_c",
+            "v2",
+            4,
+            "etag2",
+            "text/plain",
+            "ph2",
+            "/spool/x2",
+            "job2",
+        )
+        .unwrap();
+        // PUT đè: thu spool cũ + version mới thấy ngay.
+        let old = put_object(
+            &mut conn,
+            "bkt",
+            "a/b",
+            "v3",
+            5,
+            "etag3",
+            "text/plain",
+            "ph3",
+            "/spool/x3",
+            "job3",
+        )
+        .unwrap();
+        assert_eq!(old, vec!["/spool/x1".to_string()]);
+        let v = latest_version(&conn, "bkt", "a/b").unwrap().unwrap();
+        assert_eq!(v.version_id, "v3");
+        assert_eq!(v.etag, "etag3");
+        assert!(latest_version(&conn, "bkt", "ghost").unwrap().is_none());
+        // LIST prefix + LIKE escape.
+        let keys = list_keys(&conn, "bkt", "a/", "", 10).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].0, "a/b");
+        let keys = list_keys(&conn, "bkt", "a%", "", 10).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].0, "a%b_c");
+        // Pagination (thứ tự byte: "a%b_c" < "a/b" vì '%' < '/').
+        let keys = list_keys(&conn, "bkt", "", "", 2).unwrap();
+        assert_eq!(keys.len(), 2);
+        let keys = list_keys(&conn, "bkt", "", "a%b_c", 10).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].0, "a/b");
+        // DELETE trả spool + existed; xóa lại → !existed.
+        let r = delete_object(&mut conn, "bkt", "a/b").unwrap();
+        assert!(r.existed);
+        assert_eq!(r.spool_paths, vec!["/spool/x3".to_string()]);
+        assert!(!delete_object(&mut conn, "bkt", "a/b").unwrap().existed);
+        // Bucket còn object → vẫn NotEmpty; xóa hết → Deleted.
+        assert_eq!(
+            delete_bucket(&conn, "bkt").unwrap(),
+            DeleteBucketOutcome::NotEmpty
+        );
+        delete_object(&mut conn, "bkt", "a%b_c").unwrap();
+        assert_eq!(
+            delete_bucket(&conn, "bkt").unwrap(),
+            DeleteBucketOutcome::Deleted
         );
     }
 }
