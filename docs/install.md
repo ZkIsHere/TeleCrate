@@ -7,6 +7,7 @@
 ## 1. Yêu cầu Hệ thống
 
 - **Hệ điều hành**: Linux (Debian 11/12, Ubuntu 22.04/24.04 LTS, RHEL/Rocky Linux 9).
+- **Môi trường Rust**: `rustc ≥ 1.88` (Cập nhật lên bản stable mới nhất bằng `rustup update stable` hoặc `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`).
 - **Phần cứng khuyến nghị**: 1-2 vCPU, ≥ 1 GB RAM, Ổ cứng SSD (cho SQLite WAL + Spool).
 - **Quyền hạn**: Root hoặc `sudo` để tạo service systemd và user hệ thống `telecrate`.
 
@@ -20,12 +21,15 @@ Khi bạn tải mã nguồn `TeleCrate-0.1.0.zip` hoặc `Source code (tar.gz)` 
 
 ### Phương án A: Biên dịch & Cài đặt bằng Cargo (Khuyên dùng cho mọi Distro Linux)
 
-#### Bước 1: Giải nén Mã nguồn
+#### Bước 1: Chuẩn bị Môi trường & Giải nén Mã nguồn
 ```bash
-# Cài đặt unzip nếu chưa có (trên Debian/Ubuntu)
-sudo apt update && sudo apt install -y unzip build-essential
+# 1. Cập nhật Rustc lên bản stable mới nhất (yêu cầu rustc >= 1.88+)
+rustup update stable
 
-# Giải nén mã nguồn
+# 2. Cài đặt unzip & công cụ build hệ thống (trên Debian/Ubuntu)
+sudo apt update && sudo apt install -y unzip build-essential pkg-config libssl-dev
+
+# 3. Giải nén mã nguồn
 unzip TeleCrate-0.1.0.zip
 cd TeleCrate-0.1.0
 ```
