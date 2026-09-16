@@ -12,53 +12,69 @@
 
 ---
 
-## 2. Cài đặt từ Gói Đóng gói sẵn (`.deb` / Tarball)
+## 2. Cài đặt từ Mã nguồn (Source Code ZIP / GitHub Repo)
 
-> **Lưu ý**: Đường dẫn `wget` bên dưới là URL chuẩn khi tag release (ví dụ `v0.1.0`) đã được publish trên GitHub Releases. Nếu bạn đang chạy trực tiếp từ mã nguồn local, bạn có thể tự đóng gói bằng script `packaging/build-deb.sh` hoặc tự biên dịch bằng Cargo (xem Phần 2.3).
+Khi bạn tải mã nguồn `TeleCrate-0.1.0.zip` hoặc `Source code (tar.gz)` từ GitHub Releases, chọn 1 trong 2 phương án bên dưới để triển khai trên Linux:
 
-### Cách 1: Cài đặt gói `.deb` (Debian / Ubuntu)
+---
 
+### Phương án A: Biên dịch & Cài đặt bằng Cargo (Khuyên dùng cho mọi Distro Linux)
+
+#### Bước 1: Giải nén Mã nguồn
 ```bash
-# Tải gói cài đặt .deb (khi đã publish release trên GitHub)
-wget https://github.com/ZkIsHere/TeleCrate/releases/download/v0.1.0/telecrate_0.1.0_amd64.deb
+# Cài đặt unzip nếu chưa có (trên Debian/Ubuntu)
+sudo apt update && sudo apt install -y unzip build-essential
 
-# Hoặc tự tạo gói .deb tại local từ repo mã nguồn:
-./packaging/build-deb.sh
-
-# Cài đặt gói .deb vừa tạo hoặc tải về
-sudo dpkg -i telecrate_0.1.0_amd64.deb
-
-# Đóng gói tự động khởi tạo user hệ thống telecrate, thư mục /var/lib/telecrate và service systemd.
-```
-
-### Cách 2: Cài đặt từ Mã nguồn Archive / Zip / Tarball
-
-```bash
-# Nếu tải file .zip (Source code zip từ GitHub Releases):
-sudo apt install -y unzip # (Nếu chưa có unzip)
+# Giải nén mã nguồn
 unzip TeleCrate-0.1.0.zip
 cd TeleCrate-0.1.0
+```
 
-# Nếu tải file .tar.gz:
-tar -xzvf TeleCrate-0.1.0.tar.gz
-cd TeleCrate-0.1.0
+#### Bước 2: Biên dịch Binary Release
+```bash
+# Biên dịch phiên bản release tối ưu hóa
+cargo build --release
 
-# Copy binary vào /usr/bin
-sudo cp bin/telecrate /usr/bin/
+# Copy binary vừa biên dịch vào /usr/bin/
+sudo cp target/release/telecrate /usr/bin/
 sudo chmod +x /usr/bin/telecrate
+```
 
+#### Bước 3: Tạo User Hệ thống & Cấu hình Systemd
+```bash
 # Tạo user hệ thống telecrate
 sudo useradd --system --user-group --no-create-home --shell /bin/false telecrate || true
 
-# Tạo thư mục dữ liệu & cấu hình
+# Tạo thư mục cấu hình, spool và log
 sudo mkdir -p /etc/telecrate /var/lib/telecrate/spool /var/log/telecrate
-sudo cp etc/telecrate/telecrate.toml /etc/telecrate/telecrate.toml
-sudo cp systemd/telecrate.service /etc/systemd/system/
 
-# Giao quyền sở hữu cho user telecrate
+# Copy file cấu hình mẫu và service systemd từ folder packaging/
+sudo cp packaging/telecrate.sample.toml /etc/telecrate/telecrate.toml
+sudo cp packaging/telecrate.service /etc/systemd/system/
+
+# Phân quyền cho user telecrate
 sudo chown -R telecrate:telecrate /var/lib/telecrate /var/log/telecrate /etc/telecrate
 sudo chmod 750 /var/lib/telecrate /var/log/telecrate
 sudo chmod 600 /etc/telecrate/telecrate.toml
+```
+
+---
+
+### Phương án B: Tự Đóng gói `.deb` & Cài đặt (Khuyên dùng cho Debian / Ubuntu)
+
+```bash
+# Giải nén mã nguồn
+unzip TeleCrate-0.1.0.zip
+cd TeleCrate-0.1.0
+
+# Chạy script đóng gói .deb tự động
+chmod +x packaging/build-deb.sh
+./packaging/build-deb.sh
+
+# Cài đặt gói .deb vừa được tạo ra tại target/debian/
+sudo dpkg -i target/debian/telecrate_0.1.0_amd64.deb
+
+# Gói .deb sẽ tự động thiết lập user `telecrate`, thư mục dữ liệu và service systemd.
 ```
 
 ---
