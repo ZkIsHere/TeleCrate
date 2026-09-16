@@ -422,9 +422,10 @@ body {
 /* Content Body */
 .content-body {
   margin-left: 260px;
+  width: calc(100% - 260px);
+  min-width: 0;
   flex: 1;
-  padding: 30px;
-  max-width: 1400px;
+  padding: 30px 40px;
 }
 
 .top-bar {
