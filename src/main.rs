@@ -136,7 +136,8 @@ async fn run(cli: Cli) -> Result<(), String> {
         }
         Commands::Serve => {
             let cfg = telecrate::config::load(&cli.config)?;
-            let conn = telecrate::db::open(&cfg.db_path)?;
+            let mut conn = telecrate::db::open(&cfg.db_path)?;
+            telecrate::db::apply_all_migrations(&mut conn)?;
             let active_spools = telecrate::db::active_spool_paths(&conn).unwrap_or_default();
             let spool_dir = std::path::Path::new(&cfg.spool_dir);
             if let Ok((tmps, chunks)) = telecrate::spool::reconcile_spool(spool_dir, &active_spools)
