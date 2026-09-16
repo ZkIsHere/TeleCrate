@@ -38,11 +38,12 @@ pub struct SessionInfo {
     pub expires_at: u64,
 }
 
-/// Global In-Memory Session Store
+/// Global In-Memory Session & Audit Log Store
 #[derive(Debug, Default)]
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, SessionInfo>>,
     start_time: Option<Instant>,
+    audit_logs: Mutex<Vec<String>>,
 }
 
 impl SessionStore {
@@ -50,7 +51,24 @@ impl SessionStore {
         Self {
             sessions: Mutex::new(HashMap::new()),
             start_time: Some(Instant::now()),
+            audit_logs: Mutex::new(Vec::new()),
         }
+    }
+
+    pub fn add_log(&self, msg: String) {
+        if let Ok(mut logs) = self.audit_logs.lock() {
+            logs.push(msg);
+            if logs.len() > 1000 {
+                logs.remove(0);
+            }
+        }
+    }
+
+    pub fn get_logs(&self) -> Vec<String> {
+        self.audit_logs
+            .lock()
+            .map(|l| l.clone())
+            .unwrap_or_default()
     }
 
     pub fn uptime_secs(&self) -> u64 {
@@ -481,7 +499,15 @@ pub async fn api_create_bucket(
     };
 
     match telecrate::db::create_bucket(&conn, &payload.name, &region) {
-        Ok(_) => Json(json!({ "ok": true, "name": payload.name })).into_response(),
+        Ok(_) => {
+            store.add_log(format!(
+                "[INFO] [{}] Created S3 bucket '{}' in region '{}'",
+                now_secs(),
+                payload.name,
+                region
+            ));
+            Json(json!({ "ok": true, "name": payload.name })).into_response()
+        }
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": format!("Create failed: {e}") })),
@@ -513,7 +539,14 @@ pub async fn api_delete_bucket(
     };
 
     match telecrate::db::delete_bucket(&conn, &name) {
-        Ok(_) => Json(json!({ "ok": true })).into_response(),
+        Ok(_) => {
+            store.add_log(format!(
+                "[WARN] [{}] Deleted S3 bucket '{}'",
+                now_secs(),
+                name
+            ));
+            Json(json!({ "ok": true })).into_response()
+        }
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": format!("Delete failed: {e}") })),
@@ -601,13 +634,21 @@ pub async fn api_create_access_key(
     let secret_key = hex::encode(crypto_random_bytes(20));
 
     match telecrate::db::create_access_key(&conn, &access_key_id, &secret_key, Some(&user_id)) {
-        Ok(_) => Json(json!({
-            "ok": true,
-            "access_key_id": access_key_id,
-            "secret_key": secret_key,
-            "user_id": user_id
-        }))
-        .into_response(),
+        Ok(_) => {
+            store.add_log(format!(
+                "[INFO] [{}] Generated new S3 AccessKeyId '{}' for user '{}'",
+                now_secs(),
+                access_key_id,
+                user_id
+            ));
+            Json(json!({
+                "ok": true,
+                "access_key_id": access_key_id,
+                "secret_key": secret_key,
+                "user_id": user_id
+            }))
+            .into_response()
+        }
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": format!("Create key failed: {e}") })),
@@ -639,7 +680,14 @@ pub async fn api_revoke_access_key(
     };
 
     match telecrate::db::delete_access_key(&conn, &key_id) {
-        Ok(_) => Json(json!({ "ok": true })).into_response(),
+        Ok(_) => {
+            store.add_log(format!(
+                "[WARN] [{}] Revoked S3 AccessKeyId '{}'",
+                now_secs(),
+                key_id
+            ));
+            Json(json!({ "ok": true })).into_response()
+        }
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": format!("Revoke key failed: {e}") })),
@@ -671,6 +719,13 @@ pub async fn api_run_gc(
 
     let gc_res =
         telecrate::gc::run_gc(&conn, FilePath::new(&config.spool_dir), None).unwrap_or_default();
+
+    store.add_log(format!(
+        "[INFO] [{}] Executed GC Engine: freed {} bytes in spool, cleaned {} parts",
+        now_secs(),
+        gc_res.spool_bytes_freed,
+        gc_res.orphaned_parts_cleaned
+    ));
 
     Json(json!({
         "ok": true,
@@ -706,6 +761,11 @@ pub async fn api_run_doctor(
     let report = telecrate::doctor::run_doctor(&conn)
         .map(|r| serde_json::to_value(r).unwrap_or_default())
         .unwrap_or_else(|e| json!({ "error": format!("Doctor error: {e}") }));
+
+    store.add_log(format!(
+        "[INFO] [{}] Executed Doctor health check & scrub",
+        now_secs()
+    ));
 
     Json(json!({
         "ok": true,
@@ -743,6 +803,12 @@ pub async fn api_run_backup(
             let size = std::fs::metadata(&backup_path)
                 .map(|m| m.len())
                 .unwrap_or(0);
+            store.add_log(format!(
+                "[INFO] [{}] Database backup created at '{}' ({} bytes)",
+                now_secs(),
+                backup_path,
+                size
+            ));
             Json(json!({
                 "ok": true,
                 "backup_path": backup_path,
@@ -778,7 +844,7 @@ pub async fn api_get_audit_logs(
         "bot_token".to_string()
     };
 
-    let raw_logs = vec![
+    let mut raw_logs = vec![
         format!(
             "[INFO] [{}] Daemon starting up on port {}",
             now_secs(),
@@ -804,6 +870,8 @@ pub async fn api_get_audit_logs(
             now_secs()
         ),
     ];
+
+    raw_logs.extend(store.get_logs());
 
     let redacted_logs: Vec<String> = raw_logs.into_iter().map(|l| redact_secrets(&l)).collect();
     Json(redacted_logs).into_response()
@@ -873,6 +941,17 @@ pub async fn api_update_config(
         )
             .into_response();
     }
+
+    store.add_log(format!(
+        "[WARN] [{}] Dynamic config key '{}' updated to '{}'",
+        now_secs(),
+        key,
+        if key.contains("secret") || key.contains("password") || key.contains("token") {
+            "[REDACTED]"
+        } else {
+            val
+        }
+    ));
 
     Json(json!({
         "ok": true,
