@@ -11,7 +11,7 @@ use tracing_subscriber::EnvFilter;
     about = "TeleCrate — S3-compatible storage on Telegram (single instance)"
 )]
 struct Cli {
-    #[arg(long, default_value = "/etc/telecrate/telecrate.toml")]
+    #[arg(long, global = true, default_value = "/etc/telecrate/telecrate.toml")]
     config: String,
     #[command(subcommand)]
     cmd: Commands,
