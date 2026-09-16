@@ -1,0 +1,44 @@
+name: cd
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  release-package:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Build Release Binary & Dev Binary
+        run: |
+          cargo build --release
+          cargo build
+
+      - name: Build Debian (.deb) & RPM (.rpm) Packages
+        run: |
+          chmod +x packaging/build-deb.sh packaging/build-rpm.sh
+          ./packaging/build-deb.sh || true
+          ./packaging/build-rpm.sh || true
+
+      - name: Create Release Tarballs
+        run: |
+          mkdir -p dist
+          if [ -d "target/release" ]; then
+            tar -czvf dist/telecrate-linux-amd64.tar.gz -C target/release telecrate
+          fi
+          if [ -d "target/debug" ]; then
+            tar -czvf dist/telecrate-dev-linux-amd64.tar.gz -C target/debug telecrate
+          fi
+          find target/debian -name "*.deb" -exec cp {} dist/ \; || true
+          find target/rpm -name "*.rpm" -exec cp {} dist/ \; || true
+
+      - name: Upload Assets to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME:-v0.1.0}"
+          echo "Uploading release assets for tag $TAG..."
+          gh release upload "$TAG" dist/* --clobber || gh release create "$TAG" dist/* --title "TeleCrate $TAG" --notes "Automated CD Build for TeleCrate $TAG"

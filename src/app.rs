@@ -93,6 +93,12 @@ pub fn router(
             "/admin/api/audit-logs",
             get(telecrate::admin::api_get_audit_logs).with_state(admin_state.clone()),
         )
+        .route(
+            "/admin/api/config",
+            get(telecrate::admin::api_get_config)
+                .post(telecrate::admin::api_update_config)
+                .with_state(admin_state.clone()),
+        )
         // GET / vừa là dashboard index (không auth) vừa là S3 ListBuckets (có auth) —
         // phân biệt bằng Authorization header, ghi rõ ở docs (M2.1).
         .route("/", get(root_get))

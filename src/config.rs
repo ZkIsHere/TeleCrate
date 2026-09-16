@@ -82,7 +82,7 @@ fn default_telegram_base() -> String {
 }
 
 fn default_region() -> String {
-    "telecrate-1".to_string()
+    "*".to_string()
 }
 
 impl fmt::Debug for Config {
@@ -128,6 +128,75 @@ impl Default for Config {
 }
 
 impl Config {
+    /// Cập nhật giá trị cấu hình theo key string từ CLI hoặc Admin API.
+    pub fn update_key(&mut self, key: &str, val: &str) -> Result<(), String> {
+        match key {
+            "listen_port" => {
+                self.listen_port = val
+                    .parse::<u16>()
+                    .map_err(|_| "invalid listen_port".to_string())?;
+            }
+            "encryption" => {
+                if val != "off" && val != "on" {
+                    return Err("encryption must be 'off' or 'on'".to_string());
+                }
+                self.encryption = val.to_string();
+            }
+            "region" => {
+                self.region = if val.is_empty() {
+                    "*".to_string()
+                } else {
+                    val.to_string()
+                };
+            }
+            "admin_password" => {
+                self.admin_password = if val.is_empty() {
+                    None
+                } else {
+                    Some(val.to_string())
+                };
+            }
+            "telegram_bot_token" => {
+                self.telegram_bot_token = val.to_string();
+            }
+            "telegram_chat_id" => {
+                self.telegram_chat_id = val
+                    .parse::<i64>()
+                    .map_err(|_| "invalid telegram_chat_id".to_string())?;
+            }
+            "telegram_base_url" => {
+                self.telegram_base_url = val.to_string();
+            }
+            "chunk_size_bytes" => {
+                self.chunk_size_bytes = val
+                    .parse::<usize>()
+                    .map_err(|_| "invalid chunk_size_bytes".to_string())?;
+            }
+            "worker_concurrency" => {
+                self.worker_concurrency = val
+                    .parse::<usize>()
+                    .map_err(|_| "invalid worker_concurrency".to_string())?;
+            }
+            "db_path" => {
+                self.db_path = val.to_string();
+            }
+            "spool_dir" => {
+                self.spool_dir = val.to_string();
+            }
+            _ => return Err(format!("unknown config key: '{key}'")),
+        }
+        validate(self)?;
+        Ok(())
+    }
+
+    /// Lưu cấu hình hiện tại trở lại file TOML mà không cần rebuild binary.
+    pub fn save_to_file(&self, path: &str) -> Result<(), String> {
+        let toml_str =
+            toml::to_string_pretty(self).map_err(|e| format!("serialize config: {e}"))?;
+        std::fs::write(path, toml_str).map_err(|e| format!("write config {path}: {e}"))?;
+        Ok(())
+    }
+
     /// Tìm secret theo access key id (so sánh hằng thời gian ở tầng SigV4).
     pub fn find_secret(&self, access_key_id: &str) -> Option<&str> {
         self.access_keys
@@ -172,9 +241,6 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
     }
     if cfg.encryption != "off" && cfg.encryption != "on" {
         return Err("encryption must be 'off' or 'on'".to_string());
-    }
-    if cfg.region.is_empty() {
-        return Err("region must not be empty".to_string());
     }
     // Chunk vừa đủ nhỏ để getFile tải lại 1 lần (< 20 MB Bot API), vừa đủ lớn để ít message.
     if !(256 * 1024..=16 * 1024 * 1024).contains(&cfg.chunk_size_bytes) {

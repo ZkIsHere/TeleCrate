@@ -273,7 +273,14 @@ pub fn verify(
     now_secs: u64,
 ) -> Result<Verified, SigError> {
     let p = parse_auth(req.authorization)?;
-    if p.service != "s3" || p.region != expected_region {
+    let effective_region = if expected_region == "*" || expected_region.is_empty() {
+        p.region
+    } else {
+        expected_region
+    };
+    if p.service != "s3"
+        || (expected_region != "*" && !expected_region.is_empty() && p.region != expected_region)
+    {
         return Err(SigError::BadScope);
     }
     if p.date.len() != 8 || p.date.parse::<u32>().is_err() {
@@ -287,9 +294,9 @@ pub fn verify(
     if t.abs_diff(now_secs) > MAX_SKEW_SECS {
         return Err(SigError::Expired);
     }
-    let scope = format!("{}/{expected_region}/s3/aws4_request", p.date);
+    let scope = format!("{}/{effective_region}/s3/aws4_request", p.date);
     let sts = string_to_sign(&canon, &amzdate, &scope);
-    let key = derive_signing_key(secret, p.date, expected_region, "s3");
+    let key = derive_signing_key(secret, p.date, effective_region, "s3");
     let expect = hex::encode(hmac_sha256(&key, sts.as_bytes()));
     // So sánh hằng thời gian thủ công (tránh thêm dep subtle ở M2).
     if expect.len() != p.signature.len()
@@ -402,7 +409,14 @@ pub fn verify_presigned(
         return Err(SigError::MalformedAuth);
     }
     let (access_key_id, date_stamp, region, service) = (c[0], c[1], c[2], c[3]);
-    if service != "s3" || region != expected_region {
+    let effective_region = if expected_region == "*" || expected_region.is_empty() {
+        region
+    } else {
+        expected_region
+    };
+    if service != "s3"
+        || (expected_region != "*" && !expected_region.is_empty() && region != expected_region)
+    {
         return Err(SigError::BadScope);
     }
 
@@ -426,9 +440,9 @@ pub fn verify_presigned(
         signed_list
     );
 
-    let scope = format!("{date_stamp}/{expected_region}/s3/aws4_request");
+    let scope = format!("{date_stamp}/{effective_region}/s3/aws4_request");
     let sts = string_to_sign(&canon, &amzdate, &scope);
-    let key = derive_signing_key(secret, date_stamp, expected_region, "s3");
+    let key = derive_signing_key(secret, date_stamp, effective_region, "s3");
     let expect = hex::encode(hmac_sha256(&key, sts.as_bytes()));
 
     if expect.len() != signature.len()
@@ -458,11 +472,18 @@ pub fn verify_post_policy(
         return Err(SigError::MalformedAuth);
     }
     let (access_key_id, date, region, service) = (c[0], c[1], c[2], c[3]);
-    if service != "s3" || region != expected_region {
+    let effective_region = if expected_region == "*" || expected_region.is_empty() {
+        region
+    } else {
+        expected_region
+    };
+    if service != "s3"
+        || (expected_region != "*" && !expected_region.is_empty() && region != expected_region)
+    {
         return Err(SigError::BadScope);
     }
 
-    let key = derive_signing_key(secret, date, expected_region, "s3");
+    let key = derive_signing_key(secret, date, effective_region, "s3");
     let expect = hex::encode(hmac_sha256(&key, policy_b64.as_bytes()));
 
     if expect.len() != signature.len()

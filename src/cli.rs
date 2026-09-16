@@ -135,3 +135,79 @@ pub async fn run_gc_cli(config_path: &str) -> Result<(), String> {
     println!("{}", serde_json::to_string_pretty(&stats).unwrap());
     Ok(())
 }
+
+pub async fn run_config_show_cli(config_path: &str) -> Result<(), String> {
+    let cfg = telecrate::config::load(config_path)?;
+    println!("{}", serde_json::to_string_pretty(&cfg).unwrap_or_default());
+    Ok(())
+}
+
+pub async fn run_config_get_cli(config_path: &str, key: &str) -> Result<(), String> {
+    let cfg = telecrate::config::load(config_path)?;
+    let val = serde_json::to_value(&cfg).map_err(|e| e.to_string())?;
+    if let Some(v) = val.get(key) {
+        println!("{key} = {v}");
+        Ok(())
+    } else {
+        Err(format!("Key '{key}' không tồn tại trong cấu hình"))
+    }
+}
+
+pub async fn run_config_set_cli(config_path: &str, key: &str, val: &str) -> Result<(), String> {
+    let mut cfg = telecrate::config::load(config_path)?;
+    if is_daemon_running(&cfg).await {
+        println!("--> Daemon đang chạy: Cập nhật config qua Admin REST API...");
+        let client = reqwest::Client::new();
+        let pwd = cfg.admin_password.as_deref().unwrap_or("telecrate-admin");
+
+        let login_res = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/api/login",
+                cfg.listen_port
+            ))
+            .json(&json!({ "password": pwd }))
+            .send()
+            .await
+            .map_err(|e| format!("Login failed: {e}"))?;
+
+        let cookie = login_res
+            .headers()
+            .get("set-cookie")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|s| s.split(';').next())
+            .unwrap_or("")
+            .to_string();
+
+        let json_body: serde_json::Value = login_res.json().await.map_err(|e| e.to_string())?;
+        let csrf = json_body
+            .get("csrf_token")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        let resp = client
+            .post(format!(
+                "http://127.0.0.1:{}/admin/api/config",
+                cfg.listen_port
+            ))
+            .header("cookie", &cookie)
+            .header("x-csrf-token", csrf)
+            .json(&json!({ "key": key, "value": val, "config_path": config_path }))
+            .send()
+            .await
+            .map_err(|e| format!("API config update failed: {e}"))?;
+
+        if resp.status().is_success() {
+            println!("✅ Đã cập nhật '{key}' thành công trên Daemon và lưu vào {config_path}!");
+            Ok(())
+        } else {
+            let err_body = resp.text().await.unwrap_or_default();
+            Err(format!("API trả về lỗi: {err_body}"))
+        }
+    } else {
+        println!("--> Daemon dừng: Cập nhật config trực tiếp file TOML...");
+        cfg.update_key(key, val)?;
+        cfg.save_to_file(config_path)?;
+        println!("✅ Đã cập nhật '{key}' = '{val}' và lưu vào {config_path}!");
+        Ok(())
+    }
+}

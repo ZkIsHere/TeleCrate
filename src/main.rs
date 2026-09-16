@@ -48,6 +48,26 @@ enum Commands {
         #[command(subcommand)]
         op: MigOp,
     },
+    /// Quản lý cấu hình động (show, get, set).
+    Config {
+        #[command(subcommand)]
+        op: ConfigOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum MigOp {
+    Apply,
+}
+
+#[derive(Subcommand)]
+enum ConfigOp {
+    /// Hiển thị toàn bộ cấu hình hiện tại.
+    Show,
+    /// Lấy giá trị của một key cấu hình.
+    Get { key: String },
+    /// Cập nhật giá trị một key cấu hình (lưu file TOML, cập nhật live nếu daemon đang chạy).
+    Set { key: String, value: String },
 }
 
 #[derive(Subcommand)]
@@ -80,11 +100,6 @@ enum RecoveryOp {
         #[arg(short, long)]
         passphrase: Option<String>,
     },
-}
-
-#[derive(Subcommand)]
-enum MigOp {
-    Apply,
 }
 
 #[tokio::main]
@@ -287,6 +302,13 @@ async fn run(cli: Cli) -> Result<(), String> {
                     telecrate::db::schema_version(&conn)?
                 );
                 Ok(())
+            }
+        },
+        Commands::Config { op } => match op {
+            ConfigOp::Show => telecrate::cli::run_config_show_cli(&cli.config).await,
+            ConfigOp::Get { key } => telecrate::cli::run_config_get_cli(&cli.config, &key).await,
+            ConfigOp::Set { key, value } => {
+                telecrate::cli::run_config_set_cli(&cli.config, &key, &value).await
             }
         },
     }

@@ -790,6 +790,76 @@ pub async fn api_get_audit_logs(
     Json(redacted_logs).into_response()
 }
 
+#[derive(Deserialize)]
+pub struct ConfigUpdatePayload {
+    pub key: String,
+    pub value: String,
+    pub config_path: Option<String>,
+}
+
+/// `GET /admin/api/config`
+pub async fn api_get_config(
+    State((config, store)): State<(telecrate::config::Config, Arc<SessionStore>)>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
+        return err_resp.into_response();
+    }
+
+    let mut cfg_val = serde_json::to_value(&config).unwrap_or_default();
+    if let Some(obj) = cfg_val.as_object_mut() {
+        if obj.contains_key("telegram_bot_token") {
+            obj.insert("telegram_bot_token".to_string(), json!("[REDACTED]"));
+        }
+        if obj.contains_key("admin_password") {
+            obj.insert("admin_password".to_string(), json!("[REDACTED]"));
+        }
+    }
+
+    Json(json!({ "ok": true, "config": cfg_val })).into_response()
+}
+
+/// `POST /admin/api/config`
+pub async fn api_update_config(
+    State((mut config, store)): State<(telecrate::config::Config, Arc<SessionStore>)>,
+    headers: HeaderMap,
+    Json(payload): Json<ConfigUpdatePayload>,
+) -> Response {
+    if let Err(err_resp) = authenticate_admin_request(&headers, &store, true) {
+        return err_resp.into_response();
+    }
+
+    let key = payload.key.trim();
+    let val = payload.value.trim();
+
+    if let Err(e) = config.update_key(key, val) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": e })),
+        )
+            .into_response();
+    }
+
+    let save_path = payload
+        .config_path
+        .unwrap_or_else(|| "/etc/telecrate/telecrate.toml".to_string());
+
+    if let Err(e) = config.save_to_file(&save_path) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": format!("Lưu file config thất bại: {e}") })),
+        )
+            .into_response();
+    }
+
+    Json(json!({
+        "ok": true,
+        "message": format!("Đã cập nhật key '{key}' thành công"),
+        "key": key
+    }))
+    .into_response()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -17,9 +17,9 @@ jobs:
       - run: cargo test
       - name: validate sample config + systemd unit
         run: |
-          test -f configs/telecrate.example.toml
-          test -f packaging/systemd/telecrate.service
-          grep -q "ExecStart=" packaging/systemd/telecrate.service
+          test -f packaging/telecrate.sample.toml
+          test -f packaging/telecrate.service
+          grep -q "ExecStart=" packaging/telecrate.service
 
   # Live Telegram probe — job RIÊNG, tách khỏi PR checks.
   # Chỉ chạy khi repo có secrets; thiếu secrets → skip = unverified, không giả live pass.
