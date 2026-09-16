@@ -101,11 +101,15 @@ pub fn process_one_job(
         }
     }
     finish_job(conn, &job.job_id, true)?;
-    // GC spool: mọi chunk đã remote → xóa file local (best-effort từng file).
+    // GC spool: mọi chunk đã remote → xóa file local (best-effort từng file) + set spool_path = NULL trong DB.
     if spool_cleanup {
         for c in &chunks {
             if let Some(p) = &c.spool_path {
                 let _ = std::fs::remove_file(p);
+                let _ = conn.execute(
+                    "UPDATE chunks SET spool_path = NULL WHERE version_id = ? AND idx = ?",
+                    rusqlite::params![job.version_id, c.idx],
+                );
             }
         }
     }

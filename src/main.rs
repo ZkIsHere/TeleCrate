@@ -73,6 +73,17 @@ async fn run(cli: Cli) -> Result<(), String> {
         }
         Commands::Serve => {
             let cfg = telecrate::config::load(&cli.config)?;
+            let conn = telecrate::db::open(&cfg.db_path)?;
+            let active_spools = telecrate::db::active_spool_paths(&conn).unwrap_or_default();
+            let spool_dir = std::path::Path::new(&cfg.spool_dir);
+            if let Ok((tmps, chunks)) = telecrate::spool::reconcile_spool(spool_dir, &active_spools)
+            {
+                if tmps > 0 || chunks > 0 {
+                    println!("reconcile: đã dọn dẹp {tmps} tmp mồ côi, {chunks} chunk mồ côi");
+                }
+            }
+            drop(conn);
+
             let addr = format!("0.0.0.0:{}", cfg.listen_port);
             let listener = tokio::net::TcpListener::bind(&addr)
                 .await

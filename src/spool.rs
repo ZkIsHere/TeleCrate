@@ -36,6 +36,50 @@ pub fn write_durable(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Dọn dẹp spool khi khởi động daemon:
+/// - Xóa tất cả file `.tmp` mồ côi (dở dang giữa chừng).
+/// - Xóa tất cả file `.chunk` mồ côi không nằm trong `active_paths` của DB (crash trước khi DB commit).
+///
+/// Trả về `(số_tmp_đã_xóa, số_chunk_mồ_côi_đã_xóa)`.
+pub fn reconcile_spool(
+    spool_dir: &Path,
+    active_paths: &std::collections::HashSet<PathBuf>,
+) -> std::io::Result<(usize, usize)> {
+    if !spool_dir.exists() {
+        return Ok((0, 0));
+    }
+    let mut tmp_count = 0;
+    let mut chunk_count = 0;
+    for entry in std::fs::read_dir(spool_dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            if let Some(ext) = path.extension() {
+                if ext == "tmp" {
+                    if std::fs::remove_file(&path).is_ok() {
+                        tmp_count += 1;
+                    }
+                } else if ext == "chunk" {
+                    let normalized = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+                    let is_active = active_paths.contains(&path)
+                        || active_paths.contains(&normalized)
+                        || active_paths.iter().any(|p| {
+                            p == &path
+                                || p == &normalized
+                                || std::fs::canonicalize(p)
+                                    .map(|c| c == normalized)
+                                    .unwrap_or(false)
+                        });
+                    if !is_active && std::fs::remove_file(&path).is_ok() {
+                        chunk_count += 1;
+                    }
+                }
+            }
+        }
+    }
+    Ok((tmp_count, chunk_count))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,5 +98,32 @@ mod tests {
         let p = dir.path().join("a.chunk");
         write_durable(&p, b"hello").unwrap();
         assert_eq!(std::fs::read(&p).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn reconcile_spool_cleans_tmp_and_orphan_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path();
+        let tmp_file = spool.join("incomplete.tmp");
+        let orphan_chunk = spool.join("orphan.chunk");
+        let active_chunk = spool.join("active.chunk");
+
+        std::fs::write(&tmp_file, b"tmp data").unwrap();
+        write_durable(&orphan_chunk, b"orphan chunk data").unwrap();
+        write_durable(&active_chunk, b"active chunk data").unwrap();
+
+        let mut active = std::collections::HashSet::new();
+        active.insert(active_chunk.clone());
+        if let Ok(canon) = std::fs::canonicalize(&active_chunk) {
+            active.insert(canon);
+        }
+
+        let (tmps, chunks) = reconcile_spool(spool, &active).unwrap();
+        assert_eq!(tmps, 1);
+        assert_eq!(chunks, 1);
+
+        assert!(!tmp_file.exists());
+        assert!(!orphan_chunk.exists());
+        assert!(active_chunk.exists());
     }
 }

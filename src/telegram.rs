@@ -336,68 +336,63 @@ impl Transport for BotApiHttpTransport {
     }
 }
 
+/// Mock transport cho test — không chạm mạng.
+#[derive(Default, Clone)]
+pub struct MockTransport {
+    pub store: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<i64, Vec<u8>>>>,
+    pub next_message: std::sync::Arc<std::sync::Mutex<i64>>,
+}
+
+impl MockTransport {
+    pub fn new() -> Self {
+        Self {
+            store: std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            next_message: std::sync::Arc::new(std::sync::Mutex::new(1)),
+        }
+    }
+}
+
+impl Transport for MockTransport {
+    fn transport_type(&self) -> TransportType {
+        TransportType::BotApiHttp
+    }
+
+    fn upload(&self, chat_id: i64, bytes: &[u8]) -> Result<RemoteLocator, TransportError> {
+        let mut msg_guard = self.next_message.lock().unwrap();
+        let msg_id = *msg_guard;
+        *msg_guard += 1;
+        self.store.lock().unwrap().insert(msg_id, bytes.to_vec());
+        Ok(RemoteLocator {
+            transport: TransportType::BotApiHttp,
+            bot_name: "mock-bot".to_string(),
+            chat_id,
+            message_id: msg_id,
+            file_id: format!("mock_file_{msg_id}"),
+            file_unique_id: format!("uniq_{msg_id}"),
+            size: bytes.len() as u64,
+        })
+    }
+
+    fn download(&self, loc: &RemoteLocator) -> Result<Vec<u8>, TransportError> {
+        self.store
+            .lock()
+            .unwrap()
+            .get(&loc.message_id)
+            .cloned()
+            .ok_or_else(|| TransportError::Permanent {
+                reason: format!("mock file {} not found", loc.message_id),
+            })
+    }
+
+    fn delete(&self, loc: &RemoteLocator) -> Result<bool, TransportError> {
+        let mut map = self.store.lock().unwrap();
+        Ok(map.remove(&loc.message_id).is_some())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
-
-    /// Mock transport cho unit test — không chạm mạng.
-    struct MockTransport {
-        store: Arc<Mutex<HashMap<i64, Vec<u8>>>>,
-        next_message: Mutex<i64>,
-    }
-
-    impl MockTransport {
-        fn new() -> Self {
-            Self {
-                store: Arc::new(Mutex::new(HashMap::new())),
-                next_message: Mutex::new(1),
-            }
-        }
-    }
-
-    impl Transport for MockTransport {
-        fn transport_type(&self) -> TransportType {
-            TransportType::BotApiHttp
-        }
-
-        fn upload(&self, chat_id: i64, bytes: &[u8]) -> Result<RemoteLocator, TransportError> {
-            let mut n = self.next_message.lock().unwrap();
-            let mid = *n;
-            *n += 1;
-            self.store.lock().unwrap().insert(mid, bytes.to_vec());
-            Ok(RemoteLocator {
-                transport: TransportType::BotApiHttp,
-                bot_name: "mock-bot".to_string(),
-                chat_id,
-                message_id: mid,
-                file_id: format!("mock-file-{mid}"),
-                file_unique_id: format!("mock-unique-{mid}"),
-                size: bytes.len() as u64,
-            })
-        }
-
-        fn download(&self, locator: &RemoteLocator) -> Result<Vec<u8>, TransportError> {
-            self.store
-                .lock()
-                .unwrap()
-                .get(&locator.message_id)
-                .cloned()
-                .ok_or_else(|| TransportError::Permanent {
-                    reason: "message not found".to_string(),
-                })
-        }
-
-        fn delete(&self, locator: &RemoteLocator) -> Result<bool, TransportError> {
-            Ok(self
-                .store
-                .lock()
-                .unwrap()
-                .remove(&locator.message_id)
-                .is_some())
-        }
-    }
 
     #[test]
     fn mock_upload_download_byte_identical() {

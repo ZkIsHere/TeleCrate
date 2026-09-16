@@ -3,7 +3,7 @@
 > Trạng thái: `implemented-and-tested` | `implemented-unverified` | `partial` | `blocked` | `unsupported`.
 > Semantics theo S3 API Reference chính thức (kiểm tra 2026-09-15). Không suy đoán từ tên API.
 > M0 (bootstrap): toàn bộ S3 ở `unsupported` trừ health/config — đúng quy tắc "không mock 200".
-> Cập nhật 2026-09-15 (sau M1 changeset 2): S3 vẫn `unsupported`; Telegram transport có kết quả live đầu tiên (mục riêng bên dưới).
+> Cập nhật 2026-09-16 (sau M2.5): Milestone M2 đã hoàn tất (`implemented-and-tested`) đầy đủ Bucket CRUD, Single-part PUT/GET/HEAD/DELETE, ListObjectsV2, Range, Mã hóa AEAD OPTIONAL, Spool Reconciliation & Crash Injection Test Suite (6 điểm crash).
 
 ## Telegram transport (ngoài S3 — nền tảng TeleCrate)
 

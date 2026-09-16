@@ -416,6 +416,27 @@ pub fn list_keys(
         .map_err(|e| format!("rows: {e}"))
 }
 
+/// Lấy tất cả đường dẫn spool_path đang active (không NULL) trong bảng chunks.
+pub fn active_spool_paths(
+    conn: &Connection,
+) -> Result<std::collections::HashSet<std::path::PathBuf>, String> {
+    let mut stmt = conn
+        .prepare("SELECT spool_path FROM chunks WHERE spool_path IS NOT NULL")
+        .map_err(|e| format!("prepare active spool query: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| r.get::<_, String>(0))
+        .map_err(|e| format!("query active spool: {e}"))?;
+    let mut set = std::collections::HashSet::new();
+    for p in rows.flatten() {
+        let pb = std::path::PathBuf::from(p);
+        set.insert(pb.clone());
+        if let Ok(canon) = std::fs::canonicalize(&pb) {
+            set.insert(canon);
+        }
+    }
+    Ok(set)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

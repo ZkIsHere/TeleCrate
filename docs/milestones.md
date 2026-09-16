@@ -6,7 +6,7 @@
   (`BotApiHttpTransport` thật + live probe 8 KiB pass trên user chat và basic group 2026-09-15) đã xong,
   CI có job `live-telegram` riêng. Còn `blocked` có lý do: kiểm tra đặc thù channel/supergroup
   (nâng `-100...` bất khả thi ở môi trường này), locator refresh, FLOOD_WAIT thực tế — không chặn M2.
-- **M2 — Vertical slice durable PUT/GET (single-part): TIẾP THEO, thiết kế ở `docs/adr/0003-m2-vertical-slice.md`**.
+- **M2 — Vertical slice durable PUT/GET (single-part): `implemented-and-tested` (cập nhật 2026-09-16)**.
   Breakdown: 2.1 (keys + SigV4 + bucket CRUD) → 2.2 (flow durable + worker tối giản) → 2.3 (multi-chunk + worker đủ)
   → 2.4 (mã hóa on/AEAD) → 2.5 (crash injection + AWS CLI + đóng M2).
 - **2.1: `implemented-and-tested` (2026-09-16)** — config keys + region, SigV4 verify (vector AWS get-vanilla +
@@ -26,8 +26,11 @@
 - **2.4: `implemented-and-tested` (2026-09-16)** — mã hóa ChaCha20-Poly1305/chunk (nonce duy nhất, AAD=version/idx),
   spool ciphertext khi bật, ETag MD5 plaintext, key file 32 bytes + key_id/chunk, rotation giữ key cũ,
   toggle chỉ áp dụng ghi mới. Fail đóng khi sai key/tamper/reorder. Live e2e mã hóa pass (1.5 MiB → 2 chunks thật).
-  Tiếp theo: 2.5 crash injection + AWS CLI + đóng M2.
-- **M3 — Multipart, copy, Range, conditional, ETag, versioning, metadata/tags**.
+- **2.5: `implemented-and-tested` (2026-09-16)** — Startup spool reconciliation (`reconcile_spool` dọn `.tmp` + `.chunk` mồ côi),
+  integration test suite `tests/crash_injection.rs` kiểm chứng 6 ranh giới bền vững (interrupted tmp write, uncommitted chunk,
+  client retry idempotency, accepted-local read fallback & worker resume, worker crash lease reclaim, remote commit before GC),
+  chính thức đóng M2. TIẾP THEO: M3 (Multipart, Copy, Versioning).
+- **M3 — Multipart, copy, Range, conditional, ETag, versioning, metadata/tags: TIẾP THEO**.
 - **M4 — Auth hoàn chỉnh (presigned/POST policy), policies/ACL/BPA/CORS, SSE hành vi đúng, Object Lock gateway**.
 - **M5 — GC, recovery bundle, doctor/verify/scrub, backup/restore index**.
 - **M6 — CLI + dashboard đầy đủ, packaging Linux, docs install/admin/recovery**.
