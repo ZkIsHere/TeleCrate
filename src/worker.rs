@@ -137,6 +137,18 @@ fn commit_chunk(
 }
 
 fn finish_job(conn: &Connection, job_id: &str, done: bool) -> Result<(), String> {
+    if done {
+        if let Ok(v_id) = conn.query_row(
+            "SELECT version_id FROM upload_jobs WHERE job_id = ?",
+            [job_id],
+            |r| r.get::<_, String>(0),
+        ) {
+            let _ = conn.execute(
+                "UPDATE objects SET storage_state = 'remote' WHERE version_id = ?",
+                [&v_id],
+            );
+        }
+    }
     conn.execute(
         "UPDATE upload_jobs SET state = ?, lease_owner = NULL, lease_expires = NULL WHERE job_id = ?",
         rusqlite::params![if done { "done" } else { "pending" }, job_id],
@@ -242,6 +254,12 @@ pub fn run_loop_dynamic(
                     cached_chat_id = chat_id;
                     cached_base_url = base_url;
                     cached_transport = Some(t);
+                    if let Ok(conn) = crate::db::open(db_path) {
+                        let _ = conn.execute(
+                            "UPDATE upload_jobs SET state = 'pending', retry_count = 0 WHERE state = 'failed'",
+                            [],
+                        );
+                    }
                 }
                 Err(e) => {
                     tracing::warn!("Worker '{owner}' khởi tạo transport thất bại: {e:?}");
