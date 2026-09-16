@@ -22,6 +22,7 @@ enum Commands {
     /// Khởi tạo thư mục state + config mẫu.
     Init,
     /// Chạy daemon HTTP (S3 + admin + dashboard tĩnh).
+    #[command(alias = "daemon")]
     Serve,
     /// Trạng thái thật: config + DB mở được.
     Status,
