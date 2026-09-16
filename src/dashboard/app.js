@@ -151,7 +151,6 @@
 
   // Initialization & Auth Checks
   async function init() {
-    setupEventListeners();
     await checkSession();
   }
 
@@ -512,8 +511,12 @@
       { key: 'telegram_base_url', value: el.cfgBaseUrl.value }
     ];
 
-    if (el.cfgBotToken.value) items.push({ key: 'telegram_bot_token', value: el.cfgBotToken.value });
-    if (el.cfgAdminPwd.value) items.push({ key: 'admin_password', value: el.cfgAdminPwd.value });
+    if (el.cfgBotToken.value && el.cfgBotToken.value !== '[REDACTED]') {
+      items.push({ key: 'telegram_bot_token', value: el.cfgBotToken.value });
+    }
+    if (el.cfgAdminPwd.value && el.cfgAdminPwd.value !== '[REDACTED]') {
+      items.push({ key: 'admin_password', value: el.cfgAdminPwd.value });
+    }
 
     let successCount = 0;
     for (const item of items) {
