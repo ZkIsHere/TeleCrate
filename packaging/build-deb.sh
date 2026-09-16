@@ -4,26 +4,28 @@ set -euo pipefail
 # Script tạo gói cài đặt Debian/Ubuntu .deb cho TeleCrate
 
 VERSION="0.1.0"
-PKG_DIR="target/debian/telecrate_${VERSION}_amd64"
+BUILD_TMP_DIR="/tmp/telecrate_deb_build/telecrate_${VERSION}_amd64"
+OUT_DIR="target/debian"
 
 echo "==> Building release binary..."
 cargo build --release
 
 echo "==> Preparing Debian package directory structure..."
-rm -rf "${PKG_DIR}"
-mkdir -p "${PKG_DIR}/DEBIAN"
-mkdir -p "${PKG_DIR}/usr/bin"
-mkdir -p "${PKG_DIR}/etc/telecrate"
-mkdir -p "${PKG_DIR}/lib/systemd/system"
-mkdir -p "${PKG_DIR}/var/lib/telecrate/spool"
-mkdir -p "${PKG_DIR}/var/log/telecrate"
+rm -rf "${BUILD_TMP_DIR}"
+mkdir -p "${BUILD_TMP_DIR}/DEBIAN"
+mkdir -p "${BUILD_TMP_DIR}/usr/bin"
+mkdir -p "${BUILD_TMP_DIR}/etc/telecrate"
+mkdir -p "${BUILD_TMP_DIR}/lib/systemd/system"
+mkdir -p "${BUILD_TMP_DIR}/var/lib/telecrate/spool"
+mkdir -p "${BUILD_TMP_DIR}/var/log/telecrate"
+mkdir -p "${OUT_DIR}"
 
 echo "==> Copying binaries and configuration files..."
-cp target/release/telecrate "${PKG_DIR}/usr/bin/"
-cp packaging/telecrate.sample.toml "${PKG_DIR}/etc/telecrate/telecrate.toml"
-cp packaging/telecrate.service "${PKG_DIR}/lib/systemd/system/"
+cp target/release/telecrate "${BUILD_TMP_DIR}/usr/bin/"
+cp packaging/telecrate.sample.toml "${BUILD_TMP_DIR}/etc/telecrate/telecrate.toml"
+cp packaging/telecrate.service "${BUILD_TMP_DIR}/lib/systemd/system/"
 
-cat << EOF > "${PKG_DIR}/DEBIAN/control"
+cat << EOF > "${BUILD_TMP_DIR}/DEBIAN/control"
 Package: telecrate
 Version: ${VERSION}
 Section: utils
@@ -34,7 +36,7 @@ Description: TeleCrate S3-compatible object storage gateway backed by Telegram
  Single-instance, self-hosted, durable local-first S3 object storage server.
 EOF
 
-cat << 'EOF' > "${PKG_DIR}/DEBIAN/postinst"
+cat << 'EOF' > "${BUILD_TMP_DIR}/DEBIAN/postinst"
 #!/bin/sh
 set -e
 if ! id -u telecrate >/dev/null 2>&1; then
@@ -45,8 +47,14 @@ chmod 750 /var/lib/telecrate /var/log/telecrate
 chmod 600 /etc/telecrate/telecrate.toml || true
 systemctl daemon-reload || true
 EOF
-chmod 755 "${PKG_DIR}/DEBIAN/postinst"
+chmod 755 "${BUILD_TMP_DIR}/DEBIAN/postinst"
+chmod 755 "${BUILD_TMP_DIR}/DEBIAN"
+chmod 755 "${BUILD_TMP_DIR}"
 
 echo "==> Building .deb package..."
-dpkg-deb --build "${PKG_DIR}"
-echo "==> Success: Created target/debian/telecrate_${VERSION}_amd64.deb"
+dpkg-deb --build "${BUILD_TMP_DIR}"
+mv "/tmp/telecrate_deb_build/telecrate_${VERSION}_amd64.deb" "${OUT_DIR}/"
+rm -rf "/tmp/telecrate_deb_build"
+
+echo "==> Success: Created ${OUT_DIR}/telecrate_${VERSION}_amd64.deb"
+
