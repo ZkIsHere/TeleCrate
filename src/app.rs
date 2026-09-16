@@ -30,7 +30,8 @@ pub fn router(
         session_store: session_store.clone(),
     });
 
-    let admin_state = (config, session_store);
+    let config_lock = Arc::new(std::sync::RwLock::new(config.clone()));
+    let admin_state: telecrate::admin::AdminState = (config_lock, session_store);
 
     Router::new()
         .route("/health", get(health))

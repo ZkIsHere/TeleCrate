@@ -24,6 +24,13 @@ pub const DASHBOARD_JS: &str = include_str!("dashboard/app.js");
 /// Thời gian sống của Session (24 giờ).
 const SESSION_TTL_SECS: u64 = 86400;
 
+pub type AdminConfig = Arc<std::sync::RwLock<telecrate::config::Config>>;
+pub type AdminState = (AdminConfig, Arc<SessionStore>);
+
+pub fn read_config(config_lock: &AdminConfig) -> telecrate::config::Config {
+    config_lock.read().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionInfo {
     pub session_id: String,
@@ -227,9 +234,10 @@ pub struct LoginPayload {
 
 /// `POST /admin/api/login`
 pub async fn api_login(
-    State((config, store)): State<(telecrate::config::Config, Arc<SessionStore>)>,
+    State((config_lock, store)): State<AdminState>,
     Json(payload): Json<LoginPayload>,
 ) -> Response {
+    let config = read_config(&config_lock);
     let input_pwd = payload.password.unwrap_or_default();
     let expected_pwd = config
         .admin_password
@@ -267,7 +275,7 @@ pub async fn api_login(
 
 /// `POST /admin/api/logout`
 pub async fn api_logout(
-    State((_, store)): State<(telecrate::config::Config, Arc<SessionStore>)>,
+    State((_, store)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Some(session_id) = extract_session_id(&headers) {
@@ -288,7 +296,7 @@ pub async fn api_logout(
 
 /// `GET /admin/api/session`
 pub async fn api_session_status(
-    State((_, store)): State<(telecrate::config::Config, Arc<SessionStore>)>,
+    State((_, store)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Some(session_id) = extract_session_id(&headers) {
@@ -320,13 +328,14 @@ fn dir_size(path: &FilePath) -> u64 {
 
 /// `GET /admin/api/status`
 pub async fn api_get_status(
-    State((config, store)): State<(telecrate::config::Config, Arc<SessionStore>)>,
+    State((config_lock, store)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
         return err_resp.into_response();
     }
 
+    let config = read_config(&config_lock);
     let spool_used = dir_size(FilePath::new(&config.spool_dir));
     let spool_total = 10 * 1024 * 1024 * 1024u64; // Default 10 GB indicator
 
@@ -397,13 +406,14 @@ pub async fn api_get_status(
 
 /// `GET /admin/api/buckets`
 pub async fn api_list_buckets(
-    State((config, store)): State<(telecrate::config::Config, Arc<SessionStore>)>,
+    State((config_lock, store)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
         return err_resp.into_response();
     }
 
+    let config = read_config(&config_lock);
     let conn = match telecrate::db::open(&config.db_path) {
         Ok(c) => c,
         Err(e) => {
@@ -449,7 +459,7 @@ pub struct CreateBucketPayload {
 
 /// `POST /admin/api/buckets`
 pub async fn api_create_bucket(
-    State((config, store)): State<(telecrate::config::Config, Arc<SessionStore>)>,
+    State((config_lock, store)): State<AdminState>,
     headers: HeaderMap,
     Json(payload): Json<CreateBucketPayload>,
 ) -> Response {
@@ -457,6 +467,7 @@ pub async fn api_create_bucket(
         return err_resp.into_response();
     }
 
+    let config = read_config(&config_lock);
     let region = payload.region.unwrap_or_else(|| config.region.clone());
     let conn = match telecrate::db::open(&config.db_path) {
         Ok(c) => c,
@@ -481,7 +492,7 @@ pub async fn api_create_bucket(
 
 /// `DELETE /admin/api/buckets/:name`
 pub async fn api_delete_bucket(
-    State((config, store)): State<(telecrate::config::Config, Arc<SessionStore>)>,
+    State((config_lock, store)): State<AdminState>,
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -489,6 +500,7 @@ pub async fn api_delete_bucket(
         return err_resp.into_response();
     }
 
+    let config = read_config(&config_lock);
     let conn = match telecrate::db::open(&config.db_path) {
         Ok(c) => c,
         Err(e) => {
@@ -512,13 +524,14 @@ pub async fn api_delete_bucket(
 
 /// `GET /admin/api/access-keys`
 pub async fn api_list_access_keys(
-    State((config, store)): State<(telecrate::config::Config, Arc<SessionStore>)>,
+    State((config_lock, store)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
         return err_resp.into_response();
     }
 
+    let config = read_config(&config_lock);
     let conn = match telecrate::db::open(&config.db_path) {
         Ok(c) => c,
         Err(e) => {
@@ -563,7 +576,7 @@ pub struct CreateKeyPayload {
 
 /// `POST /admin/api/access-keys`
 pub async fn api_create_access_key(
-    State((config, store)): State<(telecrate::config::Config, Arc<SessionStore>)>,
+    State((config_lock, store)): State<AdminState>,
     headers: HeaderMap,
     Json(payload): Json<CreateKeyPayload>,
 ) -> Response {
@@ -572,6 +585,7 @@ pub async fn api_create_access_key(
     }
 
     let user_id = payload.user_id.unwrap_or_else(|| "admin".to_string());
+    let config = read_config(&config_lock);
     let conn = match telecrate::db::open(&config.db_path) {
         Ok(c) => c,
         Err(e) => {
@@ -604,7 +618,7 @@ pub async fn api_create_access_key(
 
 /// `DELETE /admin/api/access-keys/:id`
 pub async fn api_revoke_access_key(
-    State((config, store)): State<(telecrate::config::Config, Arc<SessionStore>)>,
+    State((config_lock, store)): State<AdminState>,
     Path(key_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -612,6 +626,7 @@ pub async fn api_revoke_access_key(
         return err_resp.into_response();
     }
 
+    let config = read_config(&config_lock);
     let conn = match telecrate::db::open(&config.db_path) {
         Ok(c) => c,
         Err(e) => {
@@ -635,13 +650,14 @@ pub async fn api_revoke_access_key(
 
 /// `POST /admin/api/gc`
 pub async fn api_run_gc(
-    State((config, store)): State<(telecrate::config::Config, Arc<SessionStore>)>,
+    State((config_lock, store)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, true) {
         return err_resp.into_response();
     }
 
+    let config = read_config(&config_lock);
     let conn = match telecrate::db::open(&config.db_path) {
         Ok(c) => c,
         Err(e) => {
@@ -668,13 +684,14 @@ pub async fn api_run_gc(
 
 /// `POST /admin/api/doctor`
 pub async fn api_run_doctor(
-    State((config, store)): State<(telecrate::config::Config, Arc<SessionStore>)>,
+    State((config_lock, store)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, true) {
         return err_resp.into_response();
     }
 
+    let config = read_config(&config_lock);
     let conn = match telecrate::db::open(&config.db_path) {
         Ok(c) => c,
         Err(e) => {
@@ -699,13 +716,14 @@ pub async fn api_run_doctor(
 
 /// `POST /admin/api/backup`
 pub async fn api_run_backup(
-    State((config, store)): State<(telecrate::config::Config, Arc<SessionStore>)>,
+    State((config_lock, store)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, true) {
         return err_resp.into_response();
     }
 
+    let config = read_config(&config_lock);
     let conn = match telecrate::db::open(&config.db_path) {
         Ok(c) => c,
         Err(e) => {
@@ -742,13 +760,14 @@ pub async fn api_run_backup(
 
 /// `GET /admin/api/audit-logs`
 pub async fn api_get_audit_logs(
-    State((config, store)): State<(telecrate::config::Config, Arc<SessionStore>)>,
+    State((config_lock, store)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
         return err_resp.into_response();
     }
 
+    let config = read_config(&config_lock);
     let bot_token_preview = if config.telegram_bot_token.len() >= 8 {
         config
             .telegram_bot_token
@@ -799,13 +818,14 @@ pub struct ConfigUpdatePayload {
 
 /// `GET /admin/api/config`
 pub async fn api_get_config(
-    State((config, store)): State<(telecrate::config::Config, Arc<SessionStore>)>,
+    State((config_lock, store)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
         return err_resp.into_response();
     }
 
+    let config = read_config(&config_lock);
     let mut cfg_val = serde_json::to_value(&config).unwrap_or_default();
     if let Some(obj) = cfg_val.as_object_mut() {
         if obj.contains_key("telegram_bot_token") {
@@ -821,7 +841,7 @@ pub async fn api_get_config(
 
 /// `POST /admin/api/config`
 pub async fn api_update_config(
-    State((mut config, store)): State<(telecrate::config::Config, Arc<SessionStore>)>,
+    State((config_lock, store)): State<AdminState>,
     headers: HeaderMap,
     Json(payload): Json<ConfigUpdatePayload>,
 ) -> Response {
@@ -831,6 +851,8 @@ pub async fn api_update_config(
 
     let key = payload.key.trim();
     let val = payload.value.trim();
+
+    let mut config = config_lock.write().unwrap_or_else(|e| e.into_inner());
 
     if let Err(e) = config.update_key(key, val) {
         return (
