@@ -47,7 +47,8 @@ pub fn router(
             get(get_object)
                 .put(put_object)
                 .delete(delete_object)
-                .head(head_object),
+                .head(head_object)
+                .post(post_object),
         )
         // Giới hạn body do từng handler tự ép (PUT object 16 MiB ở M2.2),
         // không để axum 413 sớm với 2 MiB mặc định.
@@ -231,6 +232,19 @@ async fn bucket_get(
     ) {
         return e.into_response();
     }
+    let qmap = query_map(query);
+    if qmap.contains_key("uploads") {
+        return list_multipart_uploads_handler(&state, &bucket, &resource, &request_id)
+            .into_response();
+    }
+    if qmap.contains_key("versioning") {
+        return get_bucket_versioning_handler(&state, &bucket, &resource, &request_id)
+            .into_response();
+    }
+    if qmap.contains_key("versions") {
+        return list_object_versions_handler(&state, &bucket, query, &resource, &request_id)
+            .into_response();
+    }
     let is_location = query
         .split('&')
         .any(|p| p == "location" || p.starts_with("location="));
@@ -259,6 +273,157 @@ async fn bucket_get(
     } else {
         list_objects_v2(&state, &bucket, query, &resource, &request_id).into_response()
     }
+}
+
+fn get_bucket_versioning_handler(
+    state: &AppState,
+    bucket: &str,
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    if !matches!(telecrate::db::head_bucket(&conn, bucket), Ok(true)) {
+        return S3Error::new(
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+            StatusCode::NOT_FOUND,
+            resource,
+            request_id,
+        )
+        .into_response();
+    }
+    let status = telecrate::db::get_bucket_versioning(&conn, bucket)
+        .unwrap_or_else(|_| "Disabled".to_string());
+    xml_response(
+        StatusCode::OK,
+        telecrate::s3::versioning_configuration_xml(&status),
+        request_id,
+    )
+}
+
+fn put_bucket_versioning_handler(
+    state: &AppState,
+    bucket: &str,
+    body: &Bytes,
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let text = match std::str::from_utf8(body) {
+        Ok(t) => t,
+        Err(_) => {
+            return S3Error::new(
+                "MalformedXML",
+                "Invalid XML in request body",
+                StatusCode::BAD_REQUEST,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+    let status = match telecrate::s3::parse_versioning_configuration_xml(text) {
+        Ok(s) => s,
+        Err(_) => {
+            return S3Error::new(
+                "MalformedXML",
+                "Invalid VersioningConfiguration XML",
+                StatusCode::BAD_REQUEST,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+    let mut conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    match telecrate::db::set_bucket_versioning(&mut conn, bucket, &status) {
+        Ok(()) => xml_response(StatusCode::OK, String::new(), request_id),
+        Err(e) if e == "NoSuchBucket" => S3Error::new(
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+            StatusCode::NOT_FOUND,
+            resource,
+            request_id,
+        )
+        .into_response(),
+        Err(e) => S3Error::new(
+            "InternalError",
+            e,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            resource,
+            request_id,
+        )
+        .into_response(),
+    }
+}
+
+fn list_object_versions_handler(
+    state: &AppState,
+    bucket: &str,
+    query: &str,
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let q = query_map(query);
+    let prefix = q.get("prefix").cloned().unwrap_or_default();
+    let key_marker = q.get("key-marker").cloned().unwrap_or_default();
+    let version_id_marker = q.get("version-id-marker").cloned().unwrap_or_default();
+    let max_keys: i64 = q
+        .get("max-keys")
+        .and_then(|s| s.parse().ok())
+        .map(|n: i64| n.clamp(1, 1000))
+        .unwrap_or(1000);
+
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    if !matches!(telecrate::db::head_bucket(&conn, bucket), Ok(true)) {
+        return S3Error::new(
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+            StatusCode::NOT_FOUND,
+            resource,
+            request_id,
+        )
+        .into_response();
+    }
+    let versions = match telecrate::db::list_object_versions(
+        &conn,
+        bucket,
+        &prefix,
+        &key_marker,
+        &version_id_marker,
+        max_keys,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            return S3Error::new(
+                "InternalError",
+                e,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+    let xml = telecrate::s3::list_object_versions_xml(
+        bucket,
+        &prefix,
+        &key_marker,
+        &version_id_marker,
+        &versions,
+    );
+    xml_response(StatusCode::OK, xml, request_id)
 }
 
 /// Parse query raw thành map (decode, `+` = space).
@@ -568,6 +733,12 @@ async fn create_bucket(
     ) {
         return e.into_response();
     }
+    let qmap = query_map(query);
+    if qmap.contains_key("versioning") {
+        return put_bucket_versioning_handler(&state, &bucket, &body, &resource, &request_id)
+            .into_response();
+    }
+
     let want_region = match telecrate::s3::parse_location_constraint(&body) {
         Ok(v) => v,
         Err(_) => {
@@ -930,6 +1101,45 @@ async fn best_effort_remote_deletes(
     .await;
 }
 
+fn extract_user_metadata(headers: &HeaderMap) -> Option<String> {
+    let mut map = std::collections::HashMap::new();
+    for (k, v) in headers {
+        let key_str = k.as_str();
+        if key_str.starts_with("x-amz-meta-") {
+            if let Ok(val) = v.to_str() {
+                let meta_key = key_str.strip_prefix("x-amz-meta-").unwrap();
+                map.insert(meta_key.to_lowercase(), val.to_string());
+            }
+        }
+    }
+    if map.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&map).ok()
+    }
+}
+
+fn extract_system_metadata(headers: &HeaderMap) -> Option<String> {
+    let mut map = std::collections::HashMap::new();
+    for header_name in &[
+        "content-disposition",
+        "content-encoding",
+        "cache-control",
+        "expires",
+    ] {
+        if let Some(v) = headers.get(*header_name) {
+            if let Ok(val) = v.to_str() {
+                map.insert(header_name.to_string(), val.to_string());
+            }
+        }
+    }
+    if map.is_empty() {
+        None
+    } else {
+        serde_json::to_string(&map).ok()
+    }
+}
+
 fn object_response_headers(
     headers: &mut HeaderMap,
     version: &telecrate::db::ObjectVersion,
@@ -951,9 +1161,41 @@ fn object_response_headers(
     );
     headers.insert("content-length", len.to_string().parse().unwrap());
     headers.insert("accept-ranges", "bytes".parse().unwrap());
+    if version.version_id != "null" && !version.version_id.is_empty() {
+        if let Ok(v) = version.version_id.parse() {
+            headers.insert("x-amz-version-id", v);
+        }
+    }
     if let Some(d) = telecrate::s3::sqlite_to_http_date(&version.created_at) {
         if let Ok(v) = d.parse() {
             headers.insert("last-modified", v);
+        }
+    }
+    if let Some(user_meta_json) = &version.user_metadata_json {
+        if let Ok(map) =
+            serde_json::from_str::<std::collections::HashMap<String, String>>(user_meta_json)
+        {
+            for (k, v) in map {
+                let header_name = format!("x-amz-meta-{k}");
+                if let Ok(hv) = v.parse() {
+                    if let Ok(hn) = axum::http::HeaderName::from_bytes(header_name.as_bytes()) {
+                        headers.insert(hn, hv);
+                    }
+                }
+            }
+        }
+    }
+    if let Some(sys_meta_json) = &version.system_metadata_json {
+        if let Ok(map) =
+            serde_json::from_str::<std::collections::HashMap<String, String>>(sys_meta_json)
+        {
+            for (k, v) in map {
+                if let Ok(hv) = v.parse() {
+                    if let Ok(hn) = axum::http::HeaderName::from_bytes(k.as_bytes()) {
+                        headers.insert(hn, hv);
+                    }
+                }
+            }
         }
     }
     headers.insert(
@@ -1006,12 +1248,13 @@ async fn put_object(
     let request_id = telecrate::s3::new_request_id();
     let raw_path = uri.path().to_string();
     let resource = format!("/{bucket}/{key}");
+    let raw_query = uri.query().unwrap_or("");
     if let Err(e) = authenticate(
         &state.config,
         &AuthInput {
             method: "PUT",
             path: &raw_path,
-            query: uri.query().unwrap_or(""),
+            query: raw_query,
             headers: &headers,
             body: &body,
             resource: &resource,
@@ -1019,6 +1262,21 @@ async fn put_object(
         },
     ) {
         return e.into_response();
+    }
+    let qmap = query_map(raw_query);
+    if let (Some(upload_id), Some(part_num_str)) = (qmap.get("uploadId"), qmap.get("partNumber")) {
+        return upload_part_handler(
+            &state,
+            &bucket,
+            &key,
+            upload_id,
+            part_num_str,
+            &resource,
+            &request_id,
+            &body,
+        )
+        .await
+        .into_response();
     }
     let mut conn = match open_db(&state) {
         Ok(c) => c,
@@ -1029,6 +1287,124 @@ async fn put_object(
             "NoSuchBucket",
             "The specified bucket does not exist.",
             StatusCode::NOT_FOUND,
+            &resource,
+            &request_id,
+        )
+        .into_response();
+    }
+    if let Some(copy_src_header) = headers
+        .get("x-amz-copy-source")
+        .and_then(|v| v.to_str().ok())
+    {
+        let copy_src = copy_src_header.trim_start_matches('/');
+        let (src_bucket, src_key_raw) = match copy_src.split_once('/') {
+            Some((b, k)) => (b, k),
+            None => {
+                return S3Error::new(
+                    "InvalidArgument",
+                    "Invalid x-amz-copy-source format (expected /bucket/key)",
+                    StatusCode::BAD_REQUEST,
+                    &resource,
+                    &request_id,
+                )
+                .into_response()
+            }
+        };
+        let src_key = telecrate::s3::percent_decode(src_key_raw, false);
+
+        if let Ok(Some(src_ver)) = telecrate::db::latest_version(&conn, src_bucket, &src_key) {
+            let outcome = telecrate::s3::eval_copy_source_conditional_headers(
+                &src_ver.etag,
+                &src_ver.created_at,
+                &headers,
+            );
+            if outcome != telecrate::s3::ConditionalOutcome::Proceed {
+                return S3Error::new(
+                    "PreconditionFailed",
+                    "At least one of the preconditions you specified did not hold.",
+                    StatusCode::PRECONDITION_FAILED,
+                    &resource,
+                    &request_id,
+                )
+                .into_response();
+            }
+        }
+
+        let metadata_directive = headers
+            .get("x-amz-metadata-directive")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("COPY");
+
+        let user_meta = extract_user_metadata(&headers);
+        let sys_meta = extract_system_metadata(&headers);
+        let content_type_opt = headers.get("content-type").and_then(|v| v.to_str().ok());
+
+        let new_version_id = uuid::Uuid::new_v4().simple().to_string();
+        let new_job_id = uuid::Uuid::new_v4().simple().to_string();
+
+        let (old_spools, version) = match telecrate::db::copy_object_txn(
+            &mut conn,
+            src_bucket,
+            &src_key,
+            &bucket,
+            &key,
+            &new_version_id,
+            &new_job_id,
+            metadata_directive,
+            content_type_opt,
+            user_meta.as_deref(),
+            sys_meta.as_deref(),
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                let code = if e == "NoSuchBucket" {
+                    "NoSuchBucket"
+                } else if e == "NoSuchKey" {
+                    "NoSuchKey"
+                } else {
+                    "InternalError"
+                };
+                let status = if e == "NoSuchBucket" || e == "NoSuchKey" {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::INTERNAL_SERVER_ERROR
+                };
+                return S3Error::new(code, e, status, &resource, &request_id).into_response();
+            }
+        };
+
+        for p in old_spools {
+            let _ = std::fs::remove_file(p);
+        }
+
+        let iso_date = version.created_at.replace(' ', "T") + ".000Z";
+        return xml_response(
+            StatusCode::OK,
+            telecrate::s3::copy_object_xml(&version.etag, &iso_date),
+            &request_id,
+        );
+    }
+    let existing = telecrate::db::latest_version(&conn, &bucket, &key)
+        .ok()
+        .flatten();
+    if let Some(ref v) = existing {
+        let outcome =
+            telecrate::s3::eval_conditional_headers("PUT", &v.etag, &v.created_at, &headers);
+        if outcome != telecrate::s3::ConditionalOutcome::Proceed {
+            return S3Error::new(
+                "PreconditionFailed",
+                "At least one of the preconditions you specified did not hold.",
+                StatusCode::PRECONDITION_FAILED,
+                &resource,
+                &request_id,
+            )
+            .into_response();
+        }
+    } else if headers.contains_key("if-match") || headers.contains_key("if-unmodified-since") {
+        return S3Error::new(
+            "PreconditionFailed",
+            "At least one of the preconditions you specified did not hold.",
+            StatusCode::PRECONDITION_FAILED,
             &resource,
             &request_id,
         )
@@ -1148,8 +1524,11 @@ async fn put_object(
             key_ref,
         });
     }
+    let user_meta = extract_user_metadata(&headers);
+    let sys_meta = extract_system_metadata(&headers);
+
     // 2) Một txn duy nhất: object + chunks + job. Từ đây GET đã thấy version mới.
-    let old_spools = match telecrate::db::put_object(
+    let (old_spools, created_vid) = match telecrate::db::put_object(
         &mut conn,
         &bucket,
         &key,
@@ -1157,6 +1536,8 @@ async fn put_object(
         body.len() as i64,
         &etag,
         &content_type,
+        user_meta.as_deref(),
+        sys_meta.as_deref(),
         &specs,
         &job_id,
     ) {
@@ -1181,6 +1562,11 @@ async fn put_object(
     }
     let mut h = HeaderMap::new();
     h.insert("etag", format!("\"{etag}\"").parse().unwrap());
+    if created_vid != "null" && !created_vid.is_empty() {
+        if let Ok(hv) = created_vid.parse() {
+            h.insert("x-amz-version-id", hv);
+        }
+    }
     h.insert(
         "x-amz-request-id",
         request_id
@@ -1201,12 +1587,13 @@ async fn get_object(
     let request_id = telecrate::s3::new_request_id();
     let raw_path = uri.path().to_string();
     let resource = format!("/{bucket}/{key}");
+    let raw_query = uri.query().unwrap_or("");
     if let Err(e) = authenticate(
         &state.config,
         &AuthInput {
             method: "GET",
             path: &raw_path,
-            query: uri.query().unwrap_or(""),
+            query: raw_query,
             headers: &headers,
             body: b"",
             resource: &resource,
@@ -1214,6 +1601,11 @@ async fn get_object(
         },
     ) {
         return e.into_response();
+    }
+    let qmap = query_map(raw_query);
+    if let Some(upload_id) = qmap.get("uploadId") {
+        return list_parts_handler(&state, &bucket, &key, upload_id, &resource, &request_id)
+            .into_response();
     }
     let conn = match open_db(&state) {
         Ok(c) => c,
@@ -1229,29 +1621,99 @@ async fn get_object(
         )
         .into_response();
     }
-    let version = match telecrate::db::latest_version(&conn, &bucket, &key) {
-        Ok(Some(v)) => v,
-        Ok(None) => {
-            return S3Error::new(
-                "NoSuchKey",
-                "The specified key does not exist.",
-                StatusCode::NOT_FOUND,
-                &resource,
-                &request_id,
-            )
-            .into_response()
-        }
-        Err(e) => {
-            return S3Error::new(
-                "InternalError",
-                e,
-                StatusCode::INTERNAL_SERVER_ERROR,
-                &resource,
-                &request_id,
-            )
-            .into_response()
-        }
+    let vid_opt = qmap.get("versionId").map(|s| s.as_str());
+
+    let version = match vid_opt {
+        Some(vid) => match telecrate::db::get_version_by_id(&conn, &bucket, &key, vid) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return S3Error::new(
+                    "NoSuchKey",
+                    "The specified key does not exist.",
+                    StatusCode::NOT_FOUND,
+                    &resource,
+                    &request_id,
+                )
+                .into_response()
+            }
+            Err(e) => {
+                return S3Error::new(
+                    "InternalError",
+                    e,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &resource,
+                    &request_id,
+                )
+                .into_response()
+            }
+        },
+        None => match telecrate::db::latest_version(&conn, &bucket, &key) {
+            Ok(Some(v)) => v,
+            Ok(None) => {
+                return S3Error::new(
+                    "NoSuchKey",
+                    "The specified key does not exist.",
+                    StatusCode::NOT_FOUND,
+                    &resource,
+                    &request_id,
+                )
+                .into_response()
+            }
+            Err(e) => {
+                return S3Error::new(
+                    "InternalError",
+                    e,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &resource,
+                    &request_id,
+                )
+                .into_response()
+            }
+        },
     };
+
+    if version.is_delete_marker {
+        let mut resp = S3Error::new(
+            "NoSuchKey",
+            "The specified key does not exist.",
+            StatusCode::NOT_FOUND,
+            &resource,
+            &request_id,
+        )
+        .into_response();
+        resp.headers_mut()
+            .insert("x-amz-delete-marker", "true".parse().unwrap());
+        if let Some(vid) = vid_opt {
+            resp.headers_mut()
+                .insert("x-amz-version-id", vid.parse().unwrap());
+        }
+        return resp;
+    }
+
+    let outcome = telecrate::s3::eval_conditional_headers(
+        "GET",
+        &version.etag,
+        &version.created_at,
+        &headers,
+    );
+    match outcome {
+        telecrate::s3::ConditionalOutcome::PreconditionFailed => {
+            return S3Error::new(
+                "PreconditionFailed",
+                "At least one of the preconditions you specified did not hold.",
+                StatusCode::PRECONDITION_FAILED,
+                &resource,
+                &request_id,
+            )
+            .into_response();
+        }
+        telecrate::s3::ConditionalOutcome::NotModified => {
+            let mut h = HeaderMap::new();
+            object_response_headers(&mut h, &version, version.size.max(0) as u64, &request_id);
+            return (StatusCode::NOT_MODIFIED, h, Vec::new()).into_response();
+        }
+        telecrate::s3::ConditionalOutcome::Proceed => {}
+    }
     let (mut parts, pending) = match collect_version_parts(&conn, &version, &resource, &request_id)
     {
         Ok(v) => v,
@@ -1330,34 +1792,41 @@ async fn get_object(
             object_response_headers(&mut h, &version, size, &request_id);
             (StatusCode::OK, h, bytes).into_response()
         }
-        Some(spec) => match parse_range(spec, size) {
-            Ok((a, b)) => {
-                object_response_headers(&mut h, &version, b - a + 1, &request_id);
-                h.insert(
-                    "content-range",
-                    format!("bytes {a}-{b}/{size}").parse().unwrap(),
-                );
-                (
-                    StatusCode::PARTIAL_CONTENT,
-                    h,
-                    bytes[a as usize..=b as usize].to_vec(),
-                )
-                    .into_response()
+        Some(spec) => {
+            if !telecrate::s3::eval_if_range(&version.etag, &version.created_at, &headers) {
+                object_response_headers(&mut h, &version, size, &request_id);
+                (StatusCode::OK, h, bytes).into_response()
+            } else {
+                match parse_range(spec, size) {
+                    Ok((a, b)) => {
+                        object_response_headers(&mut h, &version, b - a + 1, &request_id);
+                        h.insert(
+                            "content-range",
+                            format!("bytes {a}-{b}/{size}").parse().unwrap(),
+                        );
+                        (
+                            StatusCode::PARTIAL_CONTENT,
+                            h,
+                            bytes[a as usize..=b as usize].to_vec(),
+                        )
+                            .into_response()
+                    }
+                    Err(()) => {
+                        let mut resp = S3Error::new(
+                            "InvalidRange",
+                            "The requested range is not satisfiable.",
+                            StatusCode::RANGE_NOT_SATISFIABLE,
+                            &resource,
+                            &request_id,
+                        )
+                        .into_response();
+                        resp.headers_mut()
+                            .insert("content-range", format!("bytes */{size}").parse().unwrap());
+                        resp
+                    }
+                }
             }
-            Err(()) => {
-                let mut resp = S3Error::new(
-                    "InvalidRange",
-                    "The requested range is not satisfiable.",
-                    StatusCode::RANGE_NOT_SATISFIABLE,
-                    &resource,
-                    &request_id,
-                )
-                .into_response();
-                resp.headers_mut()
-                    .insert("content-range", format!("bytes */{size}").parse().unwrap());
-                resp
-            }
-        },
+        }
     }
 }
 
@@ -1372,12 +1841,13 @@ async fn head_object(
     let request_id = telecrate::s3::new_request_id();
     let raw_path = uri.path().to_string();
     let resource = format!("/{bucket}/{key}");
+    let raw_query = uri.query().unwrap_or("");
     if let Err(e) = authenticate(
         &state.config,
         &AuthInput {
             method: "HEAD",
             path: &raw_path,
-            query: uri.query().unwrap_or(""),
+            query: raw_query,
             headers: &headers,
             body: b"",
             resource: &resource,
@@ -1393,22 +1863,78 @@ async fn head_object(
     if !matches!(telecrate::db::head_bucket(&conn, &bucket), Ok(true)) {
         return xml_response(StatusCode::NOT_FOUND, String::new(), &request_id);
     }
-    match telecrate::db::latest_version(&conn, &bucket, &key) {
-        Ok(Some(v)) => {
-            let mut h = HeaderMap::new();
-            object_response_headers(&mut h, &v, v.size.max(0) as u64, &request_id);
-            (StatusCode::OK, h, Vec::new()).into_response()
+    let qmap = query_map(raw_query);
+    let vid_opt = qmap.get("versionId").map(|s| s.as_str());
+
+    let version = match vid_opt {
+        Some(vid) => match telecrate::db::get_version_by_id(&conn, &bucket, &key, vid) {
+            Ok(Some(v)) => v,
+            Ok(None) => return xml_response(StatusCode::NOT_FOUND, String::new(), &request_id),
+            Err(e) => {
+                return S3Error::new(
+                    "InternalError",
+                    e,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &resource,
+                    &request_id,
+                )
+                .into_response()
+            }
+        },
+        None => match telecrate::db::latest_version(&conn, &bucket, &key) {
+            Ok(Some(v)) => v,
+            Ok(None) => return xml_response(StatusCode::NOT_FOUND, String::new(), &request_id),
+            Err(e) => {
+                return S3Error::new(
+                    "InternalError",
+                    e,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &resource,
+                    &request_id,
+                )
+                .into_response()
+            }
+        },
+    };
+
+    if version.is_delete_marker {
+        let mut resp = xml_response(StatusCode::NOT_FOUND, String::new(), &request_id);
+        resp.headers_mut()
+            .insert("x-amz-delete-marker", "true".parse().unwrap());
+        if let Some(vid) = vid_opt {
+            resp.headers_mut()
+                .insert("x-amz-version-id", vid.parse().unwrap());
         }
-        Ok(None) => xml_response(StatusCode::NOT_FOUND, String::new(), &request_id),
-        Err(e) => S3Error::new(
-            "InternalError",
-            e,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &resource,
-            &request_id,
-        )
-        .into_response(),
+        return resp;
     }
+
+    let outcome = telecrate::s3::eval_conditional_headers(
+        "HEAD",
+        &version.etag,
+        &version.created_at,
+        &headers,
+    );
+    match outcome {
+        telecrate::s3::ConditionalOutcome::PreconditionFailed => {
+            return S3Error::new(
+                "PreconditionFailed",
+                "At least one of the preconditions you specified did not hold.",
+                StatusCode::PRECONDITION_FAILED,
+                &resource,
+                &request_id,
+            )
+            .into_response();
+        }
+        telecrate::s3::ConditionalOutcome::NotModified => {
+            let mut h = HeaderMap::new();
+            object_response_headers(&mut h, &version, version.size.max(0) as u64, &request_id);
+            return (StatusCode::NOT_MODIFIED, h, Vec::new()).into_response();
+        }
+        telecrate::s3::ConditionalOutcome::Proceed => {}
+    }
+    let mut h = HeaderMap::new();
+    object_response_headers(&mut h, &version, version.size.max(0) as u64, &request_id);
+    (StatusCode::OK, h, Vec::new()).into_response()
 }
 
 /// DELETE object (idempotent → 204 kể cả key không tồn tại; bucket mất → 404).
@@ -1423,12 +1949,13 @@ async fn delete_object(
     let request_id = telecrate::s3::new_request_id();
     let raw_path = uri.path().to_string();
     let resource = format!("/{bucket}/{key}");
+    let raw_query = uri.query().unwrap_or("");
     if let Err(e) = authenticate(
         &state.config,
         &AuthInput {
             method: "DELETE",
             path: &raw_path,
-            query: uri.query().unwrap_or(""),
+            query: raw_query,
             headers: &headers,
             body: b"",
             resource: &resource,
@@ -1436,6 +1963,18 @@ async fn delete_object(
         },
     ) {
         return e.into_response();
+    }
+    let qmap = query_map(raw_query);
+    if let Some(upload_id) = qmap.get("uploadId") {
+        return abort_multipart_upload_handler(
+            &state,
+            &bucket,
+            &key,
+            upload_id,
+            &resource,
+            &request_id,
+        )
+        .into_response();
     }
     let mut conn = match open_db(&state) {
         Ok(c) => c,
@@ -1451,6 +1990,90 @@ async fn delete_object(
         )
         .into_response();
     }
+
+    let vid_opt = qmap.get("versionId").cloned();
+    if let Some(ref vid) = vid_opt {
+        let deleted = match telecrate::db::delete_object_version(&mut conn, &bucket, &key, vid) {
+            Ok(r) => r,
+            Err(e) => {
+                return S3Error::new(
+                    "InternalError",
+                    e,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &resource,
+                    &request_id,
+                )
+                .into_response()
+            }
+        };
+        for p in deleted.spool_paths {
+            let _ = std::fs::remove_file(p);
+        }
+        let mut resp = xml_response(StatusCode::NO_CONTENT, String::new(), &request_id);
+        if let Ok(hv) = vid.parse() {
+            resp.headers_mut().insert("x-amz-version-id", hv);
+        }
+        if deleted.is_delete_marker {
+            resp.headers_mut()
+                .insert("x-amz-delete-marker", "true".parse().unwrap());
+        }
+        return resp;
+    }
+
+    let v_status = telecrate::db::get_bucket_versioning(&conn, &bucket)
+        .unwrap_or_else(|_| "Disabled".to_string());
+    if v_status == "Enabled" || v_status == "Suspended" {
+        let dm_vid = match telecrate::db::create_delete_marker(&mut conn, &bucket, &key) {
+            Ok(v) => v,
+            Err(e) => {
+                return S3Error::new(
+                    "InternalError",
+                    e,
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    &resource,
+                    &request_id,
+                )
+                .into_response()
+            }
+        };
+        let mut resp = xml_response(StatusCode::NO_CONTENT, String::new(), &request_id);
+        resp.headers_mut()
+            .insert("x-amz-delete-marker", "true".parse().unwrap());
+        if dm_vid != "null" && !dm_vid.is_empty() {
+            if let Ok(hv) = dm_vid.parse() {
+                resp.headers_mut().insert("x-amz-version-id", hv);
+            }
+        }
+        return resp;
+    }
+
+    let existing = telecrate::db::latest_version(&conn, &bucket, &key)
+        .ok()
+        .flatten();
+    if let Some(ref v) = existing {
+        let outcome =
+            telecrate::s3::eval_conditional_headers("DELETE", &v.etag, &v.created_at, &headers);
+        if outcome != telecrate::s3::ConditionalOutcome::Proceed {
+            return S3Error::new(
+                "PreconditionFailed",
+                "At least one of the preconditions you specified did not hold.",
+                StatusCode::PRECONDITION_FAILED,
+                &resource,
+                &request_id,
+            )
+            .into_response();
+        }
+    } else if headers.contains_key("if-match") || headers.contains_key("if-unmodified-since") {
+        return S3Error::new(
+            "PreconditionFailed",
+            "At least one of the preconditions you specified did not hold.",
+            StatusCode::PRECONDITION_FAILED,
+            &resource,
+            &request_id,
+        )
+        .into_response();
+    }
+
     let deleted = match telecrate::db::delete_object(&mut conn, &bucket, &key) {
         Ok(r) => r,
         Err(e) => {
@@ -1469,4 +2092,358 @@ async fn delete_object(
     }
     best_effort_remote_deletes(state.transport.clone(), deleted.remote_locators).await;
     xml_response(StatusCode::NO_CONTENT, String::new(), &request_id)
+}
+
+/// POST /:bucket/*key: InitiateMultipartUpload (?uploads) hoặc CompleteMultipartUpload (?uploadId=...).
+async fn post_object(
+    State(state): State<Arc<AppState>>,
+    Path((bucket, key)): Path<(String, String)>,
+    OriginalUri(uri): OriginalUri,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let request_id = telecrate::s3::new_request_id();
+    let resource = format!("/{bucket}/{key}");
+    let raw_query = uri.query().unwrap_or("");
+    if let Err(e) = authenticate(
+        &state.config,
+        &AuthInput {
+            method: "POST",
+            path: &resource,
+            query: raw_query,
+            headers: &headers,
+            body: &body,
+            resource: &resource,
+            request_id: &request_id,
+        },
+    ) {
+        return e.into_response();
+    }
+    let q = query_map(raw_query);
+    if q.contains_key("uploads") {
+        let content_type = headers
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("application/octet-stream");
+        let conn = match open_db(&state) {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+        let user_meta = extract_user_metadata(&headers);
+        let upload_id = uuid::Uuid::new_v4().simple().to_string();
+        if let Err(e) = telecrate::db::create_multipart_upload(
+            &conn,
+            &upload_id,
+            &bucket,
+            &key,
+            content_type,
+            user_meta.as_deref(),
+        ) {
+            let code = if e == "NoSuchBucket" {
+                "NoSuchBucket"
+            } else {
+                "InternalError"
+            };
+            let status = if e == "NoSuchBucket" {
+                StatusCode::NOT_FOUND
+            } else {
+                StatusCode::INTERNAL_SERVER_ERROR
+            };
+            return S3Error::new(code, e, status, &resource, &request_id).into_response();
+        }
+        xml_response(
+            StatusCode::OK,
+            telecrate::s3::initiate_multipart_upload_xml(&bucket, &key, &upload_id),
+            &request_id,
+        )
+    } else if let Some(upload_id) = q.get("uploadId") {
+        let text = match std::str::from_utf8(&body) {
+            Ok(t) => t,
+            Err(_) => {
+                return S3Error::new(
+                    "MalformedXML",
+                    "Invalid UTF-8 XML payload",
+                    StatusCode::BAD_REQUEST,
+                    &resource,
+                    &request_id,
+                )
+                .into_response()
+            }
+        };
+        let requested_parts = match telecrate::s3::parse_complete_multipart_xml(text) {
+            Ok(p) => p,
+            Err(code) => {
+                return S3Error::new(
+                    code,
+                    "Failed to parse CompleteMultipartUpload XML",
+                    StatusCode::BAD_REQUEST,
+                    &resource,
+                    &request_id,
+                )
+                .into_response()
+            }
+        };
+        let mut conn = match open_db(&state) {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+        let version_id = uuid::Uuid::new_v4().simple().to_string();
+        let job_id = uuid::Uuid::new_v4().simple().to_string();
+        let (old_spools, version) = match telecrate::db::complete_multipart_upload_txn(
+            &mut conn,
+            upload_id,
+            &version_id,
+            &requested_parts,
+            &job_id,
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                let code = if e == "NoSuchUpload" {
+                    "NoSuchUpload"
+                } else if e == "InvalidPart" {
+                    "InvalidPart"
+                } else {
+                    "InternalError"
+                };
+                let status = if e == "NoSuchUpload" {
+                    StatusCode::NOT_FOUND
+                } else {
+                    StatusCode::BAD_REQUEST
+                };
+                return S3Error::new(code, e, status, &resource, &request_id).into_response();
+            }
+        };
+        for p in old_spools {
+            let _ = std::fs::remove_file(p);
+        }
+        xml_response(
+            StatusCode::OK,
+            telecrate::s3::complete_multipart_upload_xml(&bucket, &key, &version.etag),
+            &request_id,
+        )
+    } else {
+        S3Error::new(
+            "InvalidRequest",
+            "Unsupported POST operation on object.",
+            StatusCode::BAD_REQUEST,
+            &resource,
+            &request_id,
+        )
+        .into_response()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn upload_part_handler(
+    state: &AppState,
+    _bucket: &str,
+    _key: &str,
+    upload_id: &str,
+    part_num_str: &str,
+    resource: &str,
+    request_id: &str,
+    body: &[u8],
+) -> Response {
+    use telecrate::s3::S3Error;
+    let part_number: i32 = match part_num_str.parse() {
+        Ok(n) if (1..=10000).contains(&n) => n,
+        _ => {
+            return S3Error::new(
+                "InvalidArgument",
+                "Part number must be between 1 and 10000",
+                StatusCode::BAD_REQUEST,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    if matches!(
+        telecrate::db::get_multipart_upload(&conn, upload_id),
+        Ok(None)
+    ) {
+        return S3Error::new(
+            "NoSuchUpload",
+            "The specified upload does not exist.",
+            StatusCode::NOT_FOUND,
+            resource,
+            request_id,
+        )
+        .into_response();
+    }
+    let chunk_path = std::path::Path::new(&state.config.spool_dir)
+        .join(format!("{upload_id}_p{part_number}.chunk"));
+    let spool_str = chunk_path.to_str().unwrap().to_string();
+    if let Err(e) = telecrate::spool::write_durable(&chunk_path, body) {
+        return S3Error::new(
+            "InternalError",
+            e.to_string(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            resource,
+            request_id,
+        )
+        .into_response();
+    }
+    let etag_raw = md5_hex(body);
+    let etag_quoted = format!("\"{etag_raw}\"");
+    let sha256_hex = sha256_hex(body);
+    if let Err(e) = telecrate::db::save_multipart_part(
+        &conn,
+        upload_id,
+        part_number,
+        body.len() as i64,
+        &etag_quoted,
+        &sha256_hex,
+        &sha256_hex,
+        Some(&spool_str),
+    ) {
+        return S3Error::new(
+            "InternalError",
+            e,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            resource,
+            request_id,
+        )
+        .into_response();
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert("etag", etag_quoted.parse().unwrap());
+    headers.insert(
+        "x-amz-request-id",
+        request_id
+            .parse()
+            .unwrap_or_else(|_| "invalid-request-id".parse().unwrap()),
+    );
+    (StatusCode::OK, headers, String::new()).into_response()
+}
+
+fn list_parts_handler(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    if matches!(
+        telecrate::db::get_multipart_upload(&conn, upload_id),
+        Ok(None)
+    ) {
+        return S3Error::new(
+            "NoSuchUpload",
+            "The specified upload does not exist.",
+            StatusCode::NOT_FOUND,
+            resource,
+            request_id,
+        )
+        .into_response();
+    }
+    let parts = match telecrate::db::list_multipart_parts(&conn, upload_id) {
+        Ok(p) => p,
+        Err(e) => {
+            return S3Error::new(
+                "InternalError",
+                e,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+    xml_response(
+        StatusCode::OK,
+        telecrate::s3::list_parts_xml(bucket, key, upload_id, &parts),
+        request_id,
+    )
+}
+
+fn abort_multipart_upload_handler(
+    state: &AppState,
+    _bucket: &str,
+    _key: &str,
+    upload_id: &str,
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let mut conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    let spool_paths = match telecrate::db::abort_multipart_upload(&mut conn, upload_id) {
+        Ok(p) => p,
+        Err(e) => {
+            return S3Error::new(
+                "InternalError",
+                e,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+    for p in spool_paths {
+        let _ = std::fs::remove_file(p);
+    }
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-amz-request-id",
+        request_id
+            .parse()
+            .unwrap_or_else(|_| "invalid-request-id".parse().unwrap()),
+    );
+    (StatusCode::NO_CONTENT, headers, String::new()).into_response()
+}
+
+fn list_multipart_uploads_handler(
+    state: &AppState,
+    bucket: &str,
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    if !matches!(telecrate::db::head_bucket(&conn, bucket), Ok(true)) {
+        return S3Error::new(
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+            StatusCode::NOT_FOUND,
+            resource,
+            request_id,
+        )
+        .into_response();
+    }
+    let uploads = match telecrate::db::list_multipart_uploads(&conn, bucket) {
+        Ok(u) => u,
+        Err(e) => {
+            return S3Error::new(
+                "InternalError",
+                e,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+    xml_response(
+        StatusCode::OK,
+        telecrate::s3::list_multipart_uploads_xml(bucket, &uploads),
+        request_id,
+    )
 }

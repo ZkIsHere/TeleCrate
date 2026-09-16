@@ -65,10 +65,11 @@ async fn run(cli: Cli) -> Result<(), String> {
             std::fs::create_dir_all(&cfg.spool_dir)
                 .map_err(|e| format!("create spool dir: {e}"))?;
             let mut conn = telecrate::db::open(&cfg.db_path)?;
-            if telecrate::db::schema_version(&conn)? == 0 {
-                telecrate::db::apply_migration(&mut conn, 1, telecrate::db::MIGRATION_001)?;
-            }
-            println!("init ok");
+            telecrate::db::apply_all_migrations(&mut conn)?;
+            println!(
+                "init ok: schema_version={}",
+                telecrate::db::schema_version(&conn)?
+            );
             Ok(())
         }
         Commands::Serve => {
@@ -173,9 +174,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                     println!("backup: {backup}");
                 }
                 let mut conn = telecrate::db::open(&cfg.db_path)?;
-                if telecrate::db::schema_version(&conn)? == 0 {
-                    telecrate::db::apply_migration(&mut conn, 1, telecrate::db::MIGRATION_001)?;
-                }
+                telecrate::db::apply_all_migrations(&mut conn)?;
                 println!(
                     "migrations ok: version={}",
                     telecrate::db::schema_version(&conn)?

@@ -344,6 +344,406 @@ pub fn sqlite_to_http_date(s: &str) -> Option<String> {
     ))
 }
 
+pub fn sqlite_date_to_epoch(s: &str) -> Option<u64> {
+    let (d, t) = s.split_once(' ')?;
+    let mut di = d.split('-');
+    let (y, mo, day): (i64, i64, i64) = (
+        di.next()?.parse().ok()?,
+        di.next()?.parse().ok()?,
+        di.next()?.parse().ok()?,
+    );
+    let mut ti = t.split(':');
+    let (h, mi, se): (u64, u64, u64) = (
+        ti.next()?.parse().ok()?,
+        ti.next()?.parse().ok()?,
+        ti.next()?.parse().ok()?,
+    );
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&day) || h > 23 || mi > 59 || se > 59 {
+        return None;
+    }
+    let y = if mo <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400) as u64;
+    let mp = ((mo + 9).rem_euclid(12)) as u64;
+    let doy = (153 * mp + 2) / 5 + day as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = (era * 146097 + doe as i64 - 719468) as u64;
+    Some(days * 86400 + h * 3600 + mi * 60 + se)
+}
+
+pub fn http_date_to_epoch(s: &str) -> Option<u64> {
+    let parts: Vec<&str> = s.split_whitespace().collect();
+    if parts.len() < 4 {
+        return None;
+    }
+    let (day_str, month_str, year_str, time_str) = if parts.len() >= 5 {
+        (parts[1], parts[2], parts[3], parts[4])
+    } else {
+        (parts[0], parts[1], parts[2], parts[3])
+    };
+    let day: u64 = day_str.parse().ok()?;
+    let year: i64 = year_str.parse().ok()?;
+    let month: i64 = match month_str.to_lowercase().as_str() {
+        "jan" => 1,
+        "feb" => 2,
+        "mar" => 3,
+        "apr" => 4,
+        "may" => 5,
+        "jun" => 6,
+        "jul" => 7,
+        "aug" => 8,
+        "sep" => 9,
+        "oct" => 10,
+        "nov" => 11,
+        "dec" => 12,
+        _ => return None,
+    };
+    let mut ti = time_str.split(':');
+    let (h, mi, se): (u64, u64, u64) = (
+        ti.next()?.parse().ok()?,
+        ti.next()?.parse().ok()?,
+        ti.next()?.parse().ok()?,
+    );
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400) as u64;
+    let mp = ((month + 9).rem_euclid(12)) as u64;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = (era * 146097 + doe as i64 - 719468) as u64;
+    Some(days * 86400 + h * 3600 + mi * 60 + se)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConditionalOutcome {
+    Proceed,
+    NotModified,
+    PreconditionFailed,
+}
+
+fn etag_matches(req_etag_spec: &str, target_etag: &str) -> bool {
+    let target_norm = target_etag.trim_matches('"').trim().to_lowercase();
+    for item in req_etag_spec.split(',') {
+        let trimmed = item.trim();
+        if trimmed == "*" {
+            return true;
+        }
+        let norm = trimmed.trim_matches('"').trim().to_lowercase();
+        if norm == target_norm {
+            return true;
+        }
+    }
+    false
+}
+
+pub fn eval_conditional_headers(
+    method: &str,
+    target_etag: &str,
+    target_created_at_sqlite: &str,
+    headers: &HeaderMap,
+) -> ConditionalOutcome {
+    let is_get_or_head = method.eq_ignore_ascii_case("GET") || method.eq_ignore_ascii_case("HEAD");
+
+    if let Some(if_match) = headers.get("if-match").and_then(|v| v.to_str().ok()) {
+        if !etag_matches(if_match, target_etag) {
+            return ConditionalOutcome::PreconditionFailed;
+        }
+    } else if let Some(if_unmod) = headers
+        .get("if-unmodified-since")
+        .and_then(|v| v.to_str().ok())
+    {
+        if let (Some(req_t), Some(target_t)) = (
+            http_date_to_epoch(if_unmod),
+            sqlite_date_to_epoch(target_created_at_sqlite),
+        ) {
+            if target_t > req_t {
+                return ConditionalOutcome::PreconditionFailed;
+            }
+        }
+    }
+
+    if let Some(if_none_match) = headers.get("if-none-match").and_then(|v| v.to_str().ok()) {
+        if etag_matches(if_none_match, target_etag) {
+            if is_get_or_head {
+                return ConditionalOutcome::NotModified;
+            } else {
+                return ConditionalOutcome::PreconditionFailed;
+            }
+        }
+    } else if is_get_or_head {
+        if let Some(if_mod) = headers
+            .get("if-modified-since")
+            .and_then(|v| v.to_str().ok())
+        {
+            if let (Some(req_t), Some(target_t)) = (
+                http_date_to_epoch(if_mod),
+                sqlite_date_to_epoch(target_created_at_sqlite),
+            ) {
+                if target_t <= req_t {
+                    return ConditionalOutcome::NotModified;
+                }
+            }
+        }
+    }
+
+    ConditionalOutcome::Proceed
+}
+
+pub fn eval_if_range(
+    target_etag: &str,
+    target_created_at_sqlite: &str,
+    headers: &HeaderMap,
+) -> bool {
+    let if_range = match headers.get("if-range").and_then(|v| v.to_str().ok()) {
+        Some(v) => v.trim(),
+        None => return true,
+    };
+    if if_range.starts_with('"') || if_range.starts_with("W/\"") {
+        etag_matches(if_range, target_etag)
+    } else if let Some(req_t) = http_date_to_epoch(if_range) {
+        if let Some(target_t) = sqlite_date_to_epoch(target_created_at_sqlite) {
+            target_t <= req_t
+        } else {
+            false
+        }
+    } else {
+        etag_matches(if_range, target_etag)
+    }
+}
+
+pub fn eval_copy_source_conditional_headers(
+    target_etag: &str,
+    target_created_at_sqlite: &str,
+    headers: &HeaderMap,
+) -> ConditionalOutcome {
+    let mut mapped = HeaderMap::new();
+    if let Some(v) = headers.get("x-amz-copy-source-if-match") {
+        mapped.insert("if-match", v.clone());
+    }
+    if let Some(v) = headers.get("x-amz-copy-source-if-none-match") {
+        mapped.insert("if-none-match", v.clone());
+    }
+    if let Some(v) = headers.get("x-amz-copy-source-if-modified-since") {
+        mapped.insert("if-modified-since", v.clone());
+    }
+    if let Some(v) = headers.get("x-amz-copy-source-if-unmodified-since") {
+        mapped.insert("if-unmodified-since", v.clone());
+    }
+    eval_conditional_headers("GET", target_etag, target_created_at_sqlite, &mapped)
+}
+
+pub fn initiate_multipart_upload_xml(bucket: &str, key: &str, upload_id: &str) -> String {
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId></InitiateMultipartUploadResult>",
+        xml_escape(bucket),
+        xml_escape(key),
+        xml_escape(upload_id)
+    )
+}
+
+pub fn list_parts_xml(
+    bucket: &str,
+    key: &str,
+    upload_id: &str,
+    parts: &[crate::db::MultipartPart],
+) -> String {
+    let mut parts_xml = String::new();
+    for p in parts {
+        let etag_quoted = if p.etag.starts_with('"') {
+            xml_escape(&p.etag)
+        } else {
+            xml_escape(&format!("\"{}\"", p.etag))
+        };
+        let last_mod = p.created_at.replace(' ', "T") + ".000Z";
+        parts_xml.push_str(&format!(
+            "<Part><PartNumber>{}</PartNumber><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size></Part>",
+            p.part_number, last_mod, etag_quoted, p.size
+        ));
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListPartsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{}</UploadId><StorageClass>STANDARD</StorageClass><PartNumberMarker>0</PartNumberMarker><NextPartNumberMarker>0</NextPartNumberMarker><MaxParts>1000</MaxParts><IsTruncated>false</IsTruncated>{}</ListPartsResult>",
+        xml_escape(bucket),
+        xml_escape(key),
+        xml_escape(upload_id),
+        parts_xml
+    )
+}
+
+pub fn complete_multipart_upload_xml(bucket: &str, key: &str, etag: &str) -> String {
+    let etag_quoted = if etag.starts_with('"') {
+        xml_escape(etag)
+    } else {
+        xml_escape(&format!("\"{etag}\""))
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><CompleteMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Location>/{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag></CompleteMultipartUploadResult>",
+        xml_escape(&format!("{bucket}/{key}")),
+        xml_escape(bucket),
+        xml_escape(key),
+        etag_quoted
+    )
+}
+
+pub fn list_multipart_uploads_xml(bucket: &str, uploads: &[crate::db::MultipartUpload]) -> String {
+    let mut uploads_xml = String::new();
+    for u in uploads {
+        let init_iso = u.created_at.replace(' ', "T") + ".000Z";
+        uploads_xml.push_str(&format!(
+            "<Upload><Key>{}</Key><UploadId>{}</UploadId><Initiated>{}</Initiated></Upload>",
+            xml_escape(&u.key),
+            xml_escape(&u.upload_id),
+            init_iso
+        ));
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Bucket>{}</Bucket><IsTruncated>false</IsTruncated>{}</ListMultipartUploadsResult>",
+        xml_escape(bucket),
+        uploads_xml
+    )
+}
+
+pub fn copy_object_xml(etag: &str, last_modified_iso: &str) -> String {
+    let etag_quoted = if etag.starts_with('"') {
+        xml_escape(etag)
+    } else {
+        xml_escape(&format!("\"{etag}\""))
+    };
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>{}</LastModified><ETag>{}</ETag></CopyObjectResult>",
+        xml_escape(last_modified_iso),
+        etag_quoted
+    )
+}
+
+/// Parse Body CompleteMultipartUpload -> Vec<(part_number, etag)>.
+pub fn parse_complete_multipart_xml(text: &str) -> Result<Vec<(i32, String)>, &'static str> {
+    use quick_xml::events::Event;
+    use quick_xml::reader::Reader;
+
+    let mut reader = Reader::from_str(text);
+    reader.config_mut().trim_text(true);
+
+    let mut parts = Vec::new();
+    let mut current_tag = String::new();
+    let mut in_part = false;
+    let mut current_part_num: Option<i32> = None;
+    let mut current_etag: Option<String> = None;
+
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf) {
+            Ok(Event::Start(e)) => {
+                let qname = e.name();
+                let name = std::str::from_utf8(qname.as_ref()).map_err(|_| "MalformedXML")?;
+                if name.eq_ignore_ascii_case("Part") {
+                    in_part = true;
+                    current_part_num = None;
+                    current_etag = None;
+                }
+                current_tag = name.to_string();
+            }
+            Ok(Event::Text(e)) => {
+                if in_part {
+                    let val = e.unescape().map_err(|_| "MalformedXML")?.into_owned();
+                    if current_tag.eq_ignore_ascii_case("PartNumber") {
+                        current_part_num = val.parse().ok();
+                    } else if current_tag.eq_ignore_ascii_case("ETag") {
+                        current_etag = Some(val.trim_matches('"').trim().to_string());
+                    }
+                }
+            }
+            Ok(Event::End(e)) => {
+                let qname = e.name();
+                let name = std::str::from_utf8(qname.as_ref()).map_err(|_| "MalformedXML")?;
+                if name.eq_ignore_ascii_case("Part") {
+                    in_part = false;
+                    if let (Some(p), Some(etag)) = (current_part_num, current_etag.take()) {
+                        parts.push((p, etag));
+                    }
+                }
+                current_tag.clear();
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => return Err("MalformedXML"),
+            _ => {}
+        }
+        buf.clear();
+    }
+
+    Ok(parts)
+}
+
+pub fn versioning_configuration_xml(status: &str) -> String {
+    if status == "Enabled" || status == "Suspended" {
+        format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?><VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>{}</Status></VersioningConfiguration>",
+            xml_escape(status)
+        )
+    } else {
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><VersioningConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"/>".to_string()
+    }
+}
+
+pub fn parse_versioning_configuration_xml(xml_body: &str) -> Result<String, &'static str> {
+    if xml_body.contains("<Status>Enabled</Status>")
+        || xml_body.contains("<Status>enabled</Status>")
+    {
+        Ok("Enabled".to_string())
+    } else if xml_body.contains("<Status>Suspended</Status>")
+        || xml_body.contains("<Status>suspended</Status>")
+    {
+        Ok("Suspended".to_string())
+    } else {
+        Err("MalformedXML")
+    }
+}
+
+pub fn list_object_versions_xml(
+    bucket: &str,
+    prefix: &str,
+    key_marker: &str,
+    version_id_marker: &str,
+    versions: &[crate::db::VersionListItem],
+) -> String {
+    let mut items_xml = String::new();
+    for v in versions {
+        let last_mod = v.created_at.replace(' ', "T") + ".000Z";
+        let is_latest_str = if v.is_latest { "true" } else { "false" };
+        if v.is_delete_marker {
+            items_xml.push_str(&format!(
+                "<DeleteMarker><Key>{}</Key><VersionId>{}</VersionId><IsLatest>{}</IsLatest><LastModified>{}</LastModified><Owner><ID>telecrate</ID><DisplayName>telecrate</DisplayName></Owner></DeleteMarker>",
+                xml_escape(&v.key),
+                xml_escape(&v.version_id),
+                is_latest_str,
+                last_mod,
+            ));
+        } else {
+            let etag_quoted = if v.etag.starts_with('"') {
+                xml_escape(&v.etag)
+            } else {
+                xml_escape(&format!("\"{}\"", v.etag))
+            };
+            items_xml.push_str(&format!(
+                "<Version><Key>{}</Key><VersionId>{}</VersionId><IsLatest>{}</IsLatest><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><Owner><ID>telecrate</ID><DisplayName>telecrate</DisplayName></Owner><StorageClass>STANDARD</StorageClass></Version>",
+                xml_escape(&v.key),
+                xml_escape(&v.version_id),
+                is_latest_str,
+                last_mod,
+                etag_quoted,
+                v.size,
+            ));
+        }
+    }
+    format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ListVersionsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Name>{}</Name><Prefix>{}</Prefix><KeyMarker>{}</KeyMarker><VersionIdMarker>{}</VersionIdMarker><MaxKeys>1000</MaxKeys><IsTruncated>false</IsTruncated>{}</ListVersionsResult>",
+        xml_escape(bucket),
+        xml_escape(prefix),
+        xml_escape(key_marker),
+        xml_escape(version_id_marker),
+        items_xml,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -379,6 +779,7 @@ mod tests {
             &[crate::db::Bucket {
                 name: "b&1".to_string(),
                 region: "r".to_string(),
+                versioning_status: "Disabled".to_string(),
                 created_at: "2026-09-15T00:00:00".to_string(),
             }],
             "owner",

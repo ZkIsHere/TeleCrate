@@ -44,13 +44,414 @@ pub fn apply_migration(conn: &mut Connection, version: i64, sql: &str) -> Result
 }
 
 pub const MIGRATION_001: &str = include_str!("../migrations/0001_init.sql");
+pub const MIGRATION_002: &str = include_str!("../migrations/0002_m3_multipart_versioning.sql");
+
+/// Apply tất cả migrations chưa apply từ 0 lên head.
+pub fn apply_all_migrations(conn: &mut Connection) -> Result<i64, String> {
+    let mut current = schema_version(conn)?;
+    if current < 1 {
+        apply_migration(conn, 1, MIGRATION_001)?;
+        current = 1;
+    }
+    if current < 2 {
+        apply_migration(conn, 2, MIGRATION_002)?;
+        current = 2;
+    }
+    Ok(current)
+}
+
+/// Thông tin một Multipart Upload đang tiến hành.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartUpload {
+    pub upload_id: String,
+    pub bucket: String,
+    pub key: String,
+    pub content_type: String,
+    pub metadata_json: Option<String>,
+    pub created_at: String,
+}
+
+/// Thông tin một Part của Multipart Upload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MultipartPart {
+    pub upload_id: String,
+    pub part_number: i32,
+    pub size: i64,
+    pub etag: String,
+    pub plaintext_sha256: String,
+    pub ciphertext_sha256: String,
+    pub spool_path: Option<String>,
+    pub remote_locator_json: Option<String>,
+    pub state: String,
+    pub created_at: String,
+}
+
+/// Khởi tạo Multipart Upload mới. Trả về Error nếu bucket không tồn tại.
+pub fn create_multipart_upload(
+    conn: &Connection,
+    upload_id: &str,
+    bucket: &str,
+    key: &str,
+    content_type: &str,
+    metadata_json: Option<&str>,
+) -> Result<(), String> {
+    if !head_bucket(conn, bucket)? {
+        return Err("NoSuchBucket".to_string());
+    }
+    conn.execute(
+        "INSERT INTO multipart_uploads(upload_id, bucket, key, content_type, metadata_json) VALUES (?, ?, ?, ?, ?)",
+        rusqlite::params![upload_id, bucket, key, content_type, metadata_json],
+    )
+    .map_err(|e| format!("insert multipart_upload: {e}"))?;
+    Ok(())
+}
+
+/// Lấy thông tin Multipart Upload theo upload_id.
+pub fn get_multipart_upload(
+    conn: &Connection,
+    upload_id: &str,
+) -> Result<Option<MultipartUpload>, String> {
+    let mut stmt = conn
+        .prepare("SELECT upload_id, bucket, key, content_type, metadata_json, created_at FROM multipart_uploads WHERE upload_id = ?")
+        .map_err(|e| format!("prepare get multipart_upload: {e}"))?;
+    let mut rows = stmt
+        .query_map([upload_id], |r| {
+            Ok(MultipartUpload {
+                upload_id: r.get(0)?,
+                bucket: r.get(1)?,
+                key: r.get(2)?,
+                content_type: r.get(3)?,
+                metadata_json: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })
+        .map_err(|e| format!("query get multipart_upload: {e}"))?;
+    match rows.next() {
+        Some(Ok(u)) => Ok(Some(u)),
+        Some(Err(e)) => Err(format!("row multipart_upload: {e}")),
+        None => Ok(None),
+    }
+}
+
+/// Lưu hoặc cập nhật một Part của Multipart Upload.
+#[allow(clippy::too_many_arguments)]
+pub fn save_multipart_part(
+    conn: &Connection,
+    upload_id: &str,
+    part_number: i32,
+    size: i64,
+    etag: &str,
+    plaintext_sha256: &str,
+    ciphertext_sha256: &str,
+    spool_path: Option<&str>,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO multipart_parts(upload_id, part_number, size, etag, plaintext_sha256, ciphertext_sha256, spool_path)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(upload_id, part_number) DO UPDATE SET
+            size=excluded.size, etag=excluded.etag, plaintext_sha256=excluded.plaintext_sha256,
+            ciphertext_sha256=excluded.ciphertext_sha256, spool_path=excluded.spool_path, state='pending'",
+        rusqlite::params![upload_id, part_number, size, etag, plaintext_sha256, ciphertext_sha256, spool_path],
+    )
+    .map_err(|e| format!("insert/update multipart_part: {e}"))?;
+    Ok(())
+}
+
+/// Liệt kê các Part đã upload theo thứ tự part_number tăng dần.
+pub fn list_multipart_parts(
+    conn: &Connection,
+    upload_id: &str,
+) -> Result<Vec<MultipartPart>, String> {
+    let mut stmt = conn
+        .prepare("SELECT upload_id, part_number, size, etag, plaintext_sha256, ciphertext_sha256, spool_path, remote_locator_json, state, created_at
+                  FROM multipart_parts WHERE upload_id = ? ORDER BY part_number ASC")
+        .map_err(|e| format!("prepare list multipart_parts: {e}"))?;
+    let rows = stmt
+        .query_map([upload_id], |r| {
+            Ok(MultipartPart {
+                upload_id: r.get(0)?,
+                part_number: r.get(1)?,
+                size: r.get(2)?,
+                etag: r.get(3)?,
+                plaintext_sha256: r.get(4)?,
+                ciphertext_sha256: r.get(5)?,
+                spool_path: r.get(6)?,
+                remote_locator_json: r.get(7)?,
+                state: r.get(8)?,
+                created_at: r.get(9)?,
+            })
+        })
+        .map_err(|e| format!("query list multipart_parts: {e}"))?;
+    let mut parts = Vec::new();
+    for r in rows {
+        parts.push(r.map_err(|e| format!("row multipart_part: {e}"))?);
+    }
+    Ok(parts)
+}
+
+/// Hủy Multipart Upload: xóa record DB và trả về danh sách spool_path để dọn đĩa.
+pub fn abort_multipart_upload(
+    conn: &mut Connection,
+    upload_id: &str,
+) -> Result<Vec<String>, String> {
+    let parts = list_multipart_parts(conn, upload_id)?;
+    let spool_paths: Vec<String> = parts.into_iter().filter_map(|p| p.spool_path).collect();
+
+    let tx = conn.transaction().map_err(|e| format!("begin txn: {e}"))?;
+    tx.execute(
+        "DELETE FROM multipart_parts WHERE upload_id = ?",
+        [upload_id],
+    )
+    .map_err(|e| format!("delete parts: {e}"))?;
+    tx.execute(
+        "DELETE FROM multipart_uploads WHERE upload_id = ?",
+        [upload_id],
+    )
+    .map_err(|e| format!("delete upload: {e}"))?;
+    tx.commit().map_err(|e| format!("commit: {e}"))?;
+
+    Ok(spool_paths)
+}
+
+/// Liệt kê tất cả Multipart Uploads chưa hoàn thành của một bucket.
+pub fn list_multipart_uploads(
+    conn: &Connection,
+    bucket: &str,
+) -> Result<Vec<MultipartUpload>, String> {
+    let mut stmt = conn
+        .prepare("SELECT upload_id, bucket, key, content_type, metadata_json, created_at FROM multipart_uploads WHERE bucket = ? ORDER BY created_at ASC")
+        .map_err(|e| format!("prepare list multipart_uploads: {e}"))?;
+    let rows = stmt
+        .query_map([bucket], |r| {
+            Ok(MultipartUpload {
+                upload_id: r.get(0)?,
+                bucket: r.get(1)?,
+                key: r.get(2)?,
+                content_type: r.get(3)?,
+                metadata_json: r.get(4)?,
+                created_at: r.get(5)?,
+            })
+        })
+        .map_err(|e| format!("query list multipart_uploads: {e}"))?;
+    let mut uploads = Vec::new();
+    for r in rows {
+        uploads.push(r.map_err(|e| format!("row list multipart_uploads: {e}"))?);
+    }
+    Ok(uploads)
+}
+
+fn get_bucket_versioning_tx(tx: &rusqlite::Transaction, bucket: &str) -> Result<String, String> {
+    let mut stmt = tx
+        .prepare("SELECT versioning_status FROM buckets WHERE name = ?")
+        .map_err(|e| format!("prepare: {e}"))?;
+    let mut rows = stmt
+        .query_map([bucket], |r| r.get(0))
+        .map_err(|e| format!("query: {e}"))?;
+    match rows.next() {
+        Some(r) => r.map_err(|e| format!("row: {e}")),
+        None => Ok("Disabled".to_string()),
+    }
+}
+
+fn prepare_versioning_write_tx(
+    tx: &rusqlite::Transaction,
+    bucket: &str,
+    key: &str,
+    requested_version_id: &str,
+) -> Result<(String, Vec<String>), String> {
+    let v_status = get_bucket_versioning_tx(tx, bucket)?;
+    let final_version_id = if v_status == "Suspended" {
+        "null".to_string()
+    } else if v_status == "Enabled" {
+        if requested_version_id == "null" || requested_version_id.is_empty() {
+            uuid::Uuid::new_v4().simple().to_string()
+        } else {
+            requested_version_id.to_string()
+        }
+    } else {
+        requested_version_id.to_string()
+    };
+
+    let mut old_spools = Vec::new();
+    if v_status == "Enabled" {
+        // Preserves existing versions
+    } else if v_status == "Suspended" {
+        // Overwrite existing "null" version
+        let null_spools: Vec<String> = tx
+            .prepare("SELECT spool_path FROM chunks WHERE version_id = 'null' AND version_id IN (SELECT version_id FROM objects WHERE bucket = ? AND key = ?)")
+            .map_err(|e| format!("prepare: {e}"))?
+            .query_map(rusqlite::params![bucket, key], |r| r.get(0))
+            .map_err(|e| format!("query: {e}"))?
+            .collect::<Result<Vec<Option<String>>, _>>()
+            .map_err(|e| format!("rows: {e}"))?
+            .into_iter()
+            .flatten()
+            .collect();
+        old_spools.extend(null_spools);
+        tx.execute("DELETE FROM upload_jobs WHERE version_id = 'null' AND version_id IN (SELECT version_id FROM objects WHERE bucket = ? AND key = ?)", rusqlite::params![bucket, key]).ok();
+        tx.execute("DELETE FROM chunks WHERE version_id = 'null' AND version_id IN (SELECT version_id FROM objects WHERE bucket = ? AND key = ?)", rusqlite::params![bucket, key]).ok();
+        tx.execute(
+            "DELETE FROM objects WHERE bucket = ? AND key = ? AND version_id = 'null'",
+            rusqlite::params![bucket, key],
+        )
+        .ok();
+    } else {
+        // Disabled: delete all previous versions
+        let spools: Vec<String> = tx
+            .prepare("SELECT spool_path FROM chunks WHERE version_id IN (SELECT version_id FROM objects WHERE bucket = ? AND key = ?)")
+            .map_err(|e| format!("prepare: {e}"))?
+            .query_map(rusqlite::params![bucket, key], |r| r.get(0))
+            .map_err(|e| format!("query: {e}"))?
+            .collect::<Result<Vec<Option<String>>, _>>()
+            .map_err(|e| format!("rows: {e}"))?
+            .into_iter()
+            .flatten()
+            .collect();
+        old_spools.extend(spools);
+        tx.execute("DELETE FROM upload_jobs WHERE version_id IN (SELECT version_id FROM objects WHERE bucket = ? AND key = ?)", rusqlite::params![bucket, key]).ok();
+        tx.execute("DELETE FROM chunks WHERE version_id IN (SELECT version_id FROM objects WHERE bucket = ? AND key = ?)", rusqlite::params![bucket, key]).ok();
+        tx.execute(
+            "DELETE FROM objects WHERE bucket = ? AND key = ?",
+            rusqlite::params![bucket, key],
+        )
+        .ok();
+    }
+    Ok((final_version_id, old_spools))
+}
+
+/// Hoàn tất Multipart Upload trong 1 SQLite txn duy nhất.
+pub fn complete_multipart_upload_txn(
+    conn: &mut Connection,
+    upload_id: &str,
+    version_id: &str,
+    requested_parts: &[(i32, String)],
+    job_id: &str,
+) -> Result<(Vec<String>, ObjectVersion), String> {
+    let upload =
+        get_multipart_upload(conn, upload_id)?.ok_or_else(|| "NoSuchUpload".to_string())?;
+
+    let parts = list_multipart_parts(conn, upload_id)?;
+    if parts.is_empty() {
+        return Err("InvalidRequest".to_string());
+    }
+
+    if requested_parts.len() != parts.len() {
+        return Err("InvalidPart".to_string());
+    }
+
+    let mut total_size: i64 = 0;
+    let mut part_etags_raw: Vec<u8> = Vec::new();
+
+    for (req_num, req_etag) in requested_parts {
+        let db_part = parts
+            .iter()
+            .find(|p| p.part_number == *req_num)
+            .ok_or_else(|| "InvalidPart".to_string())?;
+
+        let db_etag_norm = db_part.etag.trim_matches('"').trim().to_lowercase();
+        let req_etag_norm = req_etag.trim_matches('"').trim().to_lowercase();
+
+        if db_etag_norm != req_etag_norm {
+            return Err("InvalidPart".to_string());
+        }
+
+        total_size += db_part.size;
+
+        let etag_bytes = hex::decode(&db_etag_norm).map_err(|_| "InvalidPart".to_string())?;
+        part_etags_raw.extend_from_slice(&etag_bytes);
+    }
+
+    // Compute S3 Multipart ETag: md5(concat(part_etags_raw)) + "-" + num_parts
+    let combined_md5 = format!("{:x}", md5::compute(&part_etags_raw));
+    let multipart_etag = format!("\"{combined_md5}-{}\"", parts.len());
+
+    let bucket = upload.bucket.clone();
+    let key = upload.key.clone();
+
+    let tx = conn.transaction().map_err(|e| format!("begin txn: {e}"))?;
+
+    let (final_version_id, old_spools) =
+        prepare_versioning_write_tx(&tx, &bucket, &key, version_id)?;
+
+    tx.execute(
+        "INSERT INTO objects(bucket, key, version_id, is_delete_marker, storage_state, size, etag, content_type, user_metadata_json) VALUES (?, ?, ?, 0, 'accepted-local', ?, ?, ?, ?)",
+        rusqlite::params![bucket, key, final_version_id, total_size, multipart_etag, upload.content_type, upload.metadata_json],
+    )
+    .map_err(|e| format!("insert object: {e}"))?;
+
+    let mut current_offset: i64 = 0;
+    for (idx, part) in parts.iter().enumerate() {
+        let spool_path = part.spool_path.as_deref().unwrap_or("");
+        tx.execute(
+            "INSERT INTO chunks(version_id, idx, offset, length, plaintext_sha256, ciphertext_sha256, encryption_mode, spool_path, state) VALUES (?, ?, ?, ?, ?, ?, 'none', ?, 'pending')",
+            rusqlite::params![final_version_id, idx as i64, current_offset, part.size, part.plaintext_sha256, part.ciphertext_sha256, spool_path],
+        )
+        .map_err(|e| format!("insert chunk: {e}"))?;
+        current_offset += part.size;
+    }
+
+    tx.execute(
+        "INSERT INTO upload_jobs(job_id, version_id, state) VALUES (?, ?, 'pending')",
+        rusqlite::params![job_id, final_version_id],
+    )
+    .map_err(|e| format!("insert job: {e}"))?;
+
+    tx.execute(
+        "DELETE FROM multipart_parts WHERE upload_id = ?",
+        [upload_id],
+    )
+    .map_err(|e| format!("delete parts: {e}"))?;
+    tx.execute(
+        "DELETE FROM multipart_uploads WHERE upload_id = ?",
+        [upload_id],
+    )
+    .map_err(|e| format!("delete upload: {e}"))?;
+
+    tx.commit().map_err(|e| format!("commit: {e}"))?;
+
+    let version = latest_version(conn, &bucket, &key)?
+        .ok_or_else(|| "Failed to fetch created object version".to_string())?;
+
+    Ok((old_spools, version))
+}
 
 /// Một bucket trong index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Bucket {
     pub name: String,
     pub region: String,
+    pub versioning_status: String,
     pub created_at: String,
+}
+
+pub fn get_bucket_versioning(conn: &Connection, bucket: &str) -> Result<String, String> {
+    let mut stmt = conn
+        .prepare("SELECT versioning_status FROM buckets WHERE name = ?")
+        .map_err(|e| format!("prepare: {e}"))?;
+    let mut rows = stmt
+        .query_map([bucket], |r| r.get(0))
+        .map_err(|e| format!("query: {e}"))?;
+    match rows.next() {
+        Some(r) => r.map_err(|e| format!("row: {e}")),
+        None => Ok("Disabled".to_string()),
+    }
+}
+
+pub fn set_bucket_versioning(
+    conn: &mut Connection,
+    bucket: &str,
+    status: &str,
+) -> Result<(), String> {
+    let affected = conn
+        .execute(
+            "UPDATE buckets SET versioning_status = ? WHERE name = ?",
+            rusqlite::params![status, bucket],
+        )
+        .map_err(|e| format!("execute update bucket versioning: {e}"))?;
+    if affected == 0 {
+        return Err("NoSuchBucket".to_string());
+    }
+    Ok(())
 }
 
 /// Chuẩn S3 bucket naming (rút gọn M2: 3-63 ký tự, chữ thường/số/dấu chấm/gạch nối,
@@ -138,14 +539,15 @@ pub enum DeleteBucketOutcome {
 
 pub fn list_buckets(conn: &Connection) -> Result<Vec<Bucket>, String> {
     let mut stmt = conn
-        .prepare("SELECT name, region, created_at FROM buckets ORDER BY name")
+        .prepare("SELECT name, region, versioning_status, created_at FROM buckets ORDER BY name")
         .map_err(|e| format!("prepare: {e}"))?;
     let rows = stmt
         .query_map([], |r| {
             Ok(Bucket {
                 name: r.get(0)?,
                 region: r.get(1)?,
-                created_at: r.get(2)?,
+                versioning_status: r.get(2)?,
+                created_at: r.get(3)?,
             })
         })
         .map_err(|e| format!("query: {e}"))?;
@@ -153,16 +555,32 @@ pub fn list_buckets(conn: &Connection) -> Result<Vec<Bucket>, String> {
         .map_err(|e| format!("rows: {e}"))
 }
 
-// --- Objects M2.2 (chưa versioning: PUT thay thế hàng cũ cùng key trong cùng txn) ---
+// --- Objects M2.2 & M3.5 Versioning ---
 
-/// Một object version (M2.2: mỗi key một hàng hiện hành).
+/// Một object version.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectVersion {
     pub version_id: String,
+    pub key: String,
+    pub is_delete_marker: bool,
     pub size: i64,
     pub etag: String,
     pub content_type: String,
     pub storage_state: String,
+    pub created_at: String,
+    pub user_metadata_json: Option<String>,
+    pub system_metadata_json: Option<String>,
+}
+
+/// Item cho ListObjectVersions.
+#[derive(Debug, Clone)]
+pub struct VersionListItem {
+    pub key: String,
+    pub version_id: String,
+    pub is_latest: bool,
+    pub is_delete_marker: bool,
+    pub size: i64,
+    pub etag: String,
     pub created_at: String,
 }
 
@@ -202,55 +620,118 @@ pub fn put_object(
     size: i64,
     etag: &str,
     content_type: &str,
+    user_metadata_json: Option<&str>,
+    system_metadata_json: Option<&str>,
     chunks: &[NewChunk],
     job_id: &str,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, String), String> {
     let tx = conn.transaction().map_err(|e| format!("begin: {e}"))?;
-    // Spool cũ mồ côi nếu PUT đè — thu gom để caller xóa sau commit.
-    let old: Vec<String> = tx
-        .prepare("SELECT spool_path FROM chunks WHERE version_id IN (SELECT version_id FROM objects WHERE bucket = ? AND key = ?)")
-        .map_err(|e| format!("prepare: {e}"))?
-        .query_map(rusqlite::params![bucket, key], |r| r.get(0))
-        .map_err(|e| format!("query: {e}"))?
-        .collect::<Result<Vec<Option<String>>, _>>()
-        .map_err(|e| format!("rows: {e}"))?
-        .into_iter()
-        .flatten()
-        .collect();
+
+    let (final_version_id, old_spools) = prepare_versioning_write_tx(&tx, bucket, key, version_id)?;
+
     tx.execute(
-        "DELETE FROM upload_jobs WHERE version_id IN (SELECT version_id FROM objects WHERE bucket = ? AND key = ?)",
-        rusqlite::params![bucket, key],
-    )
-    .map_err(|e| format!("delete jobs: {e}"))?;
-    tx.execute(
-        "DELETE FROM chunks WHERE version_id IN (SELECT version_id FROM objects WHERE bucket = ? AND key = ?)",
-        rusqlite::params![bucket, key],
-    )
-    .map_err(|e| format!("delete chunks: {e}"))?;
-    tx.execute(
-        "DELETE FROM objects WHERE bucket = ? AND key = ?",
-        rusqlite::params![bucket, key],
-    )
-    .map_err(|e| format!("delete objects: {e}"))?;
-    tx.execute(
-        "INSERT INTO objects(bucket, key, version_id, storage_state, size, etag, content_type) VALUES (?, ?, ?, 'accepted-local', ?, ?, ?)",
-        rusqlite::params![bucket, key, version_id, size, etag, content_type],
+        "INSERT INTO objects(bucket, key, version_id, is_delete_marker, storage_state, size, etag, content_type, user_metadata_json, system_metadata_json) VALUES (?, ?, ?, 0, 'accepted-local', ?, ?, ?, ?, ?)",
+        rusqlite::params![bucket, key, final_version_id, size, etag, content_type, user_metadata_json, system_metadata_json],
     )
     .map_err(|e| format!("insert object: {e}"))?;
     for (idx, c) in chunks.iter().enumerate() {
         tx.execute(
             "INSERT INTO chunks(version_id, idx, offset, length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref, spool_path, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
-            rusqlite::params![version_id, idx as i64, c.offset, c.length, c.plaintext_sha256, c.ciphertext_sha256, c.mode, c.key_ref, c.spool_path],
+            rusqlite::params![final_version_id, idx as i64, c.offset, c.length, c.plaintext_sha256, c.ciphertext_sha256, c.mode, c.key_ref, c.spool_path],
         )
         .map_err(|e| format!("insert chunk: {e}"))?;
     }
     tx.execute(
         "INSERT INTO upload_jobs(job_id, version_id, state) VALUES (?, ?, 'pending')",
-        rusqlite::params![job_id, version_id],
+        rusqlite::params![job_id, final_version_id],
     )
     .map_err(|e| format!("insert job: {e}"))?;
     tx.commit().map_err(|e| format!("commit: {e}"))?;
-    Ok(old)
+    Ok((old_spools, final_version_id))
+}
+
+/// CopyObject: Sao chép object từ (src_bucket, src_key) sang (dest_bucket, dest_key).
+/// Hỗ trợ zero-duplicate spool bằng cách tạo version_id mới và trỏ cùng các chunks/locators từ DB.
+#[allow(clippy::too_many_arguments)]
+pub fn copy_object_txn(
+    conn: &mut Connection,
+    src_bucket: &str,
+    src_key: &str,
+    dest_bucket: &str,
+    dest_key: &str,
+    new_version_id: &str,
+    new_job_id: &str,
+    metadata_directive: &str,
+    override_content_type: Option<&str>,
+    user_metadata_json: Option<&str>,
+    system_metadata_json: Option<&str>,
+) -> Result<(Vec<String>, ObjectVersion), String> {
+    if !head_bucket(conn, dest_bucket)? {
+        return Err("NoSuchBucket".to_string());
+    }
+
+    let src_version =
+        latest_version(conn, src_bucket, src_key)?.ok_or_else(|| "NoSuchKey".to_string())?;
+
+    let src_chunks = chunks_of(conn, &src_version.version_id)?;
+
+    let (final_content_type, final_user_meta, final_sys_meta) =
+        if metadata_directive.eq_ignore_ascii_case("REPLACE") {
+            (
+                override_content_type
+                    .unwrap_or(&src_version.content_type)
+                    .to_string(),
+                user_metadata_json.map(|s| s.to_string()),
+                system_metadata_json.map(|s| s.to_string()),
+            )
+        } else {
+            (
+                src_version.content_type.clone(),
+                src_version.user_metadata_json.clone(),
+                src_version.system_metadata_json.clone(),
+            )
+        };
+
+    let tx = conn.transaction().map_err(|e| format!("begin txn: {e}"))?;
+
+    let (final_version_id, old_spools) =
+        prepare_versioning_write_tx(&tx, dest_bucket, dest_key, new_version_id)?;
+
+    tx.execute(
+        "INSERT INTO objects(bucket, key, version_id, is_delete_marker, storage_state, size, etag, content_type, user_metadata_json, system_metadata_json) VALUES (?, ?, ?, 0, 'accepted-local', ?, ?, ?, ?, ?)",
+        rusqlite::params![dest_bucket, dest_key, final_version_id, src_version.size, src_version.etag, final_content_type, final_user_meta, final_sys_meta],
+    )
+    .map_err(|e| format!("insert object: {e}"))?;
+
+    let mut need_upload = false;
+    for c in &src_chunks {
+        tx.execute(
+            "INSERT INTO chunks(version_id, idx, offset, length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref, spool_path, remote_locator_json, state)
+             SELECT ?, idx, offset, length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref, spool_path, remote_locator_json, state
+             FROM chunks WHERE version_id = ? AND idx = ?",
+            rusqlite::params![final_version_id, src_version.version_id, c.idx],
+        )
+        .map_err(|e| format!("copy chunk: {e}"))?;
+
+        if c.state == "pending" {
+            need_upload = true;
+        }
+    }
+
+    if need_upload {
+        tx.execute(
+            "INSERT INTO upload_jobs(job_id, version_id, state) VALUES (?, ?, 'pending')",
+            rusqlite::params![new_job_id, final_version_id],
+        )
+        .map_err(|e| format!("insert job: {e}"))?;
+    }
+
+    tx.commit().map_err(|e| format!("commit: {e}"))?;
+
+    let version = latest_version(conn, dest_bucket, dest_key)?
+        .ok_or_else(|| "Failed to fetch copied object version".to_string())?;
+
+    Ok((old_spools, version))
 }
 
 pub fn latest_version(
@@ -259,17 +740,55 @@ pub fn latest_version(
     key: &str,
 ) -> Result<Option<ObjectVersion>, String> {
     let mut stmt = conn
-        .prepare("SELECT version_id, size, etag, content_type, storage_state, created_at FROM objects WHERE bucket = ? AND key = ? ORDER BY created_at DESC LIMIT 1")
+        .prepare("SELECT version_id, key, is_delete_marker, size, etag, content_type, storage_state, created_at, user_metadata_json, system_metadata_json FROM objects WHERE bucket = ? AND key = ? ORDER BY created_at DESC, rowid DESC LIMIT 1")
         .map_err(|e| format!("prepare: {e}"))?;
+
     let mut rows = stmt
         .query_map(rusqlite::params![bucket, key], |r| {
+            let is_dm: i64 = r.get(2)?;
             Ok(ObjectVersion {
                 version_id: r.get(0)?,
-                size: r.get(1)?,
-                etag: r.get(2)?,
-                content_type: r.get(3)?,
-                storage_state: r.get(4)?,
-                created_at: r.get(5)?,
+                key: r.get(1)?,
+                is_delete_marker: is_dm != 0,
+                size: r.get(3)?,
+                etag: r.get(4)?,
+                content_type: r.get(5)?,
+                storage_state: r.get(6)?,
+                created_at: r.get(7)?,
+                user_metadata_json: r.get(8)?,
+                system_metadata_json: r.get(9)?,
+            })
+        })
+        .map_err(|e| format!("query: {e}"))?;
+    match rows.next() {
+        Some(r) => r.map(Some).map_err(|e| format!("row: {e}")),
+        None => Ok(None),
+    }
+}
+
+pub fn get_version_by_id(
+    conn: &Connection,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<Option<ObjectVersion>, String> {
+    let mut stmt = conn
+        .prepare("SELECT version_id, key, is_delete_marker, size, etag, content_type, storage_state, created_at, user_metadata_json, system_metadata_json FROM objects WHERE bucket = ? AND key = ? AND version_id = ?")
+        .map_err(|e| format!("prepare: {e}"))?;
+    let mut rows = stmt
+        .query_map(rusqlite::params![bucket, key, version_id], |r| {
+            let is_dm: i64 = r.get(2)?;
+            Ok(ObjectVersion {
+                version_id: r.get(0)?,
+                key: r.get(1)?,
+                is_delete_marker: is_dm != 0,
+                size: r.get(3)?,
+                etag: r.get(4)?,
+                content_type: r.get(5)?,
+                storage_state: r.get(6)?,
+                created_at: r.get(7)?,
+                user_metadata_json: r.get(8)?,
+                system_metadata_json: r.get(9)?,
             })
         })
         .map_err(|e| format!("query: {e}"))?;
@@ -306,6 +825,89 @@ pub struct DeleteObjectResult {
     pub existed: bool,
     pub spool_paths: Vec<String>,
     pub remote_locators: Vec<crate::telegram::RemoteLocator>,
+    pub is_delete_marker: bool,
+    pub version_id: String,
+}
+
+pub fn create_delete_marker(
+    conn: &mut Connection,
+    bucket: &str,
+    key: &str,
+) -> Result<String, String> {
+    let tx = conn.transaction().map_err(|e| format!("begin: {e}"))?;
+    let (version_id, _) = prepare_versioning_write_tx(&tx, bucket, key, "null")?;
+    tx.execute(
+        "INSERT INTO objects(bucket, key, version_id, is_delete_marker, storage_state, size, etag, content_type) VALUES (?, ?, ?, 1, 'accepted-local', 0, '', '')",
+        rusqlite::params![bucket, key, version_id],
+    ).map_err(|e| format!("insert delete marker: {e}"))?;
+    tx.commit().map_err(|e| format!("commit: {e}"))?;
+    Ok(version_id)
+}
+
+pub fn delete_object_version(
+    conn: &mut Connection,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<DeleteObjectResult, String> {
+    use rusqlite::OptionalExtension;
+    let tx = conn.transaction().map_err(|e| format!("begin: {e}"))?;
+
+    let is_dm: Option<bool> = tx
+        .prepare(
+            "SELECT is_delete_marker FROM objects WHERE bucket = ? AND key = ? AND version_id = ?",
+        )
+        .map_err(|e| format!("prepare: {e}"))?
+        .query_row(rusqlite::params![bucket, key, version_id], |r| {
+            let dm: i64 = r.get(0)?;
+            Ok(dm != 0)
+        })
+        .optional()
+        .map_err(|e| format!("query: {e}"))?;
+
+    let is_delete_marker = match is_dm {
+        Some(b) => b,
+        None => {
+            return Ok(DeleteObjectResult {
+                existed: false,
+                spool_paths: Vec::new(),
+                remote_locators: Vec::new(),
+                is_delete_marker: false,
+                version_id: version_id.to_string(),
+            })
+        }
+    };
+
+    let spool_paths: Vec<String> = tx
+        .prepare("SELECT spool_path FROM chunks WHERE version_id = ?")
+        .map_err(|e| format!("prepare: {e}"))?
+        .query_map([version_id], |r| r.get(0))
+        .map_err(|e| format!("query: {e}"))?
+        .collect::<Result<Vec<Option<String>>, _>>()
+        .map_err(|e| format!("rows: {e}"))?
+        .into_iter()
+        .flatten()
+        .collect();
+
+    tx.execute("DELETE FROM upload_jobs WHERE version_id = ?", [version_id])
+        .ok();
+    tx.execute("DELETE FROM chunks WHERE version_id = ?", [version_id])
+        .ok();
+    tx.execute(
+        "DELETE FROM objects WHERE bucket = ? AND key = ? AND version_id = ?",
+        rusqlite::params![bucket, key, version_id],
+    )
+    .map_err(|e| format!("delete version: {e}"))?;
+
+    tx.commit().map_err(|e| format!("commit: {e}"))?;
+
+    Ok(DeleteObjectResult {
+        existed: true,
+        spool_paths,
+        remote_locators: Vec::new(),
+        is_delete_marker,
+        version_id: version_id.to_string(),
+    })
 }
 
 pub fn delete_object(
@@ -326,12 +928,13 @@ pub fn delete_object(
             existed: false,
             spool_paths: Vec::new(),
             remote_locators: Vec::new(),
+            is_delete_marker: false,
+            version_id: String::new(),
         });
     }
     let mut spool_paths = Vec::new();
     let mut remote_locators = Vec::new();
     for v in &versions {
-        // Thu gọn rows về Vec rồi mới ghi (không giữ cursor đọc mở khi DELETE cùng txn).
         let chunk_rows: Vec<(Option<String>, String, Option<String>)> = tx
             .prepare(
                 "SELECT spool_path, state, remote_locator_json FROM chunks WHERE version_id = ?",
@@ -351,7 +954,6 @@ pub fn delete_object(
             if let Some(p) = spool {
                 spool_paths.push(p);
             }
-            // Remote cleanup best-effort ở tầng route (M2.2); orphan dọn ở M5 GC.
             if state == "remote" {
                 if let Some(loc) = locator {
                     if let Ok(parsed) = serde_json::from_str(&loc) {
@@ -375,7 +977,71 @@ pub fn delete_object(
         existed: true,
         spool_paths,
         remote_locators,
+        is_delete_marker: false,
+        version_id: String::new(),
     })
+}
+
+pub fn list_object_versions(
+    conn: &Connection,
+    bucket: &str,
+    prefix: &str,
+    key_marker: &str,
+    version_id_marker: &str,
+    limit: i64,
+) -> Result<Vec<VersionListItem>, String> {
+    let esc = prefix
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let mut stmt = conn
+        .prepare("SELECT key, version_id, is_delete_marker, size, etag, created_at FROM objects WHERE bucket = ? AND key LIKE ? || '%' ESCAPE '\\' AND (key > ? OR (key = ? AND version_id > ?)) ORDER BY key ASC, created_at DESC, rowid DESC LIMIT ?")
+        .map_err(|e| format!("prepare: {e}"))?;
+
+    let rows = stmt
+        .query_map(
+            rusqlite::params![
+                bucket,
+                esc,
+                key_marker,
+                key_marker,
+                version_id_marker,
+                limit
+            ],
+            |r| {
+                let is_dm: i64 = r.get(2)?;
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    is_dm != 0,
+                    r.get::<_, i64>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                ))
+            },
+        )
+        .map_err(|e| format!("query: {e}"))?;
+
+    let mut result = Vec::new();
+    let mut last_key: Option<String> = None;
+
+    for row in rows {
+        let (key, version_id, is_delete_marker, size, etag, created_at) =
+            row.map_err(|e| format!("row: {e}"))?;
+        let is_latest = !matches!(&last_key, Some(k) if k == &key);
+        last_key = Some(key.clone());
+        result.push(VersionListItem {
+            key,
+            version_id,
+            is_latest,
+            is_delete_marker,
+            size,
+            etag,
+            created_at,
+        });
+    }
+
+    Ok(result)
 }
 
 /// List keys phục vụ ListObjectsV2: lọc prefix, sắp xếp, cắt max-keys+1 để biết truncated.
@@ -386,27 +1052,33 @@ pub fn list_keys(
     start_after: &str,
     limit_plus_one: i64,
 ) -> Result<Vec<(String, ObjectVersion)>, String> {
-    // Escape LIKE wildcards trong prefix (key có thể chứa % _ \).
     let esc = prefix
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_");
     let mut stmt = conn
-        .prepare("SELECT key, version_id, size, etag, content_type, storage_state, created_at FROM objects WHERE bucket = ? AND key LIKE ? || '%' ESCAPE '\\' AND key > ? ORDER BY key LIMIT ?")
+        .prepare("SELECT key, version_id, is_delete_marker, size, etag, content_type, storage_state, created_at, user_metadata_json, system_metadata_json FROM objects o1 WHERE bucket = ? AND key LIKE ? || '%' ESCAPE '\\' AND key > ? AND rowid = (SELECT MAX(rowid) FROM objects o2 WHERE o2.bucket = o1.bucket AND o2.key = o1.key) AND is_delete_marker = 0 ORDER BY key LIMIT ?")
         .map_err(|e| format!("prepare: {e}"))?;
+
     let rows = stmt
         .query_map(
             rusqlite::params![bucket, esc, start_after, limit_plus_one],
             |r| {
+                let is_dm: i64 = r.get(2)?;
+                let key: String = r.get(0)?;
                 Ok((
-                    r.get::<_, String>(0)?,
+                    key.clone(),
                     ObjectVersion {
                         version_id: r.get(1)?,
-                        size: r.get(2)?,
-                        etag: r.get(3)?,
-                        content_type: r.get(4)?,
-                        storage_state: r.get(5)?,
-                        created_at: r.get(6)?,
+                        key,
+                        is_delete_marker: is_dm != 0,
+                        size: r.get(3)?,
+                        etag: r.get(4)?,
+                        content_type: r.get(5)?,
+                        storage_state: r.get(6)?,
+                        created_at: r.get(7)?,
+                        user_metadata_json: r.get(8)?,
+                        system_metadata_json: r.get(9)?,
                     },
                 ))
             },
@@ -416,12 +1088,17 @@ pub fn list_keys(
         .map_err(|e| format!("rows: {e}"))
 }
 
-/// Lấy tất cả đường dẫn spool_path đang active (không NULL) trong bảng chunks.
+/// Lấy tất cả đường dẫn spool_path đang active (không NULL) trong bảng chunks và multipart_parts.
 pub fn active_spool_paths(
     conn: &Connection,
 ) -> Result<std::collections::HashSet<std::path::PathBuf>, String> {
+    let sql = if schema_version(conn).unwrap_or(0) >= 2 {
+        "SELECT spool_path FROM chunks WHERE spool_path IS NOT NULL UNION SELECT spool_path FROM multipart_parts WHERE spool_path IS NOT NULL"
+    } else {
+        "SELECT spool_path FROM chunks WHERE spool_path IS NOT NULL"
+    };
     let mut stmt = conn
-        .prepare("SELECT spool_path FROM chunks WHERE spool_path IS NOT NULL")
+        .prepare(sql)
         .map_err(|e| format!("prepare active spool query: {e}"))?;
     let rows = stmt
         .query_map([], |r| r.get::<_, String>(0))
@@ -449,14 +1126,88 @@ mod tests {
         assert_eq!(schema_version(&conn).unwrap(), 0);
         apply_migration(&mut conn, 1, MIGRATION_001).unwrap();
         assert_eq!(schema_version(&conn).unwrap(), 1);
-        // Apply tuần tự từng version đều pass — hiện chỉ có 1 version.
+        apply_migration(&mut conn, 2, MIGRATION_002).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 2);
     }
 
     fn test_db() -> (tempfile::TempDir, Connection) {
         let dir = tempfile::tempdir().unwrap();
         let mut conn = open(dir.path().join("index.db").to_str().unwrap()).unwrap();
-        apply_migration(&mut conn, 1, MIGRATION_001).unwrap();
+        apply_all_migrations(&mut conn).unwrap();
         (dir, conn)
+    }
+
+    #[test]
+    fn multipart_uploads_crud() {
+        let (_d, mut conn) = test_db();
+        create_bucket(&conn, "mybucket", "us-east-1").unwrap();
+
+        // Create
+        create_multipart_upload(
+            &conn,
+            "upload-123",
+            "mybucket",
+            "photo.jpg",
+            "image/jpeg",
+            Some(r#"{"x-amz-meta-author":"alice"}"#),
+        )
+        .unwrap();
+
+        // Get
+        let upload = get_multipart_upload(&conn, "upload-123").unwrap().unwrap();
+        assert_eq!(upload.upload_id, "upload-123");
+        assert_eq!(upload.bucket, "mybucket");
+        assert_eq!(upload.key, "photo.jpg");
+        assert_eq!(upload.content_type, "image/jpeg");
+        assert_eq!(
+            upload.metadata_json.as_deref(),
+            Some(r#"{"x-amz-meta-author":"alice"}"#)
+        );
+
+        // Save part
+        save_multipart_part(
+            &conn,
+            "upload-123",
+            1,
+            1024,
+            "etag1",
+            "sha1",
+            "sha1",
+            Some("spool/p1"),
+        )
+        .unwrap();
+        save_multipart_part(
+            &conn,
+            "upload-123",
+            2,
+            2048,
+            "etag2",
+            "sha2",
+            "sha2",
+            Some("spool/p2"),
+        )
+        .unwrap();
+
+        // List parts
+        let parts = list_multipart_parts(&conn, "upload-123").unwrap();
+        assert_eq!(parts.len(), 2);
+        assert_eq!(parts[0].part_number, 1);
+        assert_eq!(parts[0].size, 1024);
+        assert_eq!(parts[1].part_number, 2);
+        assert_eq!(parts[1].size, 2048);
+
+        // List uploads for bucket
+        let uploads = list_multipart_uploads(&conn, "mybucket").unwrap();
+        assert_eq!(uploads.len(), 1);
+
+        // Active spool paths contains multipart parts
+        let active = active_spool_paths(&conn).unwrap();
+        assert!(active.contains(std::path::Path::new("spool/p1")));
+
+        // Abort
+        let spools = abort_multipart_upload(&mut conn, "upload-123").unwrap();
+        assert_eq!(spools, vec!["spool/p1".to_string(), "spool/p2".to_string()]);
+        assert!(get_multipart_upload(&conn, "upload-123").unwrap().is_none());
     }
 
     #[test]
@@ -536,7 +1287,7 @@ mod tests {
             }]
         };
         // PUT 2 keys (1 key có % _ để kiểm LIKE escape).
-        let old = put_object(
+        let (old, _) = put_object(
             &mut conn,
             "bkt",
             "a/b",
@@ -544,6 +1295,8 @@ mod tests {
             3,
             "etag1",
             "text/plain",
+            None,
+            None,
             &one("/spool/x1", "ph1", 3),
             "job1",
         )
@@ -557,12 +1310,14 @@ mod tests {
             4,
             "etag2",
             "text/plain",
+            None,
+            None,
             &one("/spool/x2", "ph2", 4),
             "job2",
         )
         .unwrap();
         // PUT đè: thu spool cũ + version mới thấy ngay.
-        let old = put_object(
+        let (old, _) = put_object(
             &mut conn,
             "bkt",
             "a/b",
@@ -570,11 +1325,14 @@ mod tests {
             5,
             "etag3",
             "text/plain",
+            None,
+            None,
             &one("/spool/x3", "ph3", 5),
             "job3",
         )
         .unwrap();
         assert_eq!(old, vec!["/spool/x1".to_string()]);
+
         let v = latest_version(&conn, "bkt", "a/b").unwrap().unwrap();
         assert_eq!(v.version_id, "v3");
         assert_eq!(v.etag, "etag3");
@@ -588,6 +1346,8 @@ mod tests {
             30,
             "etagm",
             "bin",
+            None,
+            None,
             &[
                 NewChunk {
                     offset: 0,

@@ -66,7 +66,7 @@ fn spawn_with(cfg: Config) -> String {
     std::fs::create_dir_all(&cfg.spool_dir).unwrap();
     let mut conn = telecrate::db::open(&cfg.db_path).unwrap();
     if telecrate::db::schema_version(&conn).unwrap() == 0 {
-        telecrate::db::apply_migration(&mut conn, 1, telecrate::db::MIGRATION_001).unwrap();
+        telecrate::db::apply_all_migrations(&mut conn).unwrap();
     }
     drop(conn);
     let keys = cfg.load_keystore().unwrap_or_default();

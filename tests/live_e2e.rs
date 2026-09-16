@@ -148,7 +148,7 @@ fn live_config(dir: &tempfile::TempDir, token: &str, chat: i64) -> Config {
 fn run_e2e(cfg: Config, token: &str, chat: i64, payload_len: u32, label: &str) {
     std::fs::create_dir_all(&cfg.spool_dir).unwrap();
     let mut conn = telecrate::db::open(&cfg.db_path).unwrap();
-    telecrate::db::apply_migration(&mut conn, 1, telecrate::db::MIGRATION_001).unwrap();
+    telecrate::db::apply_all_migrations(&mut conn).unwrap();
     drop(conn);
 
     // Server HTTP — router dựng NGOÀI async context (transport blocking).

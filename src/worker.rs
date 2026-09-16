@@ -263,7 +263,7 @@ mod tests {
     fn job_db() -> (tempfile::TempDir, Connection) {
         let dir = tempfile::tempdir().unwrap();
         let mut conn = crate::db::open(dir.path().join("i.db").to_str().unwrap()).unwrap();
-        crate::db::apply_migration(&mut conn, 1, crate::db::MIGRATION_001).unwrap();
+        crate::db::apply_all_migrations(&mut conn).unwrap();
         crate::db::create_bucket(&conn, "bkt", "r").unwrap();
         (dir, conn)
     }
@@ -287,6 +287,8 @@ mod tests {
             12,
             "etag",
             "text/plain",
+            None,
+            None,
             &[crate::db::NewChunk {
                 offset: 0,
                 length: 12,
@@ -374,6 +376,8 @@ mod tests {
             1,
             "e",
             "text/plain",
+            None,
+            None,
             &[crate::db::NewChunk {
                 offset: 0,
                 length: 1,
@@ -414,6 +418,8 @@ mod tests {
             7,
             "e",
             "text/plain",
+            None,
+            None,
             &[crate::db::NewChunk {
                 offset: 0,
                 length: 7,
@@ -452,7 +458,7 @@ mod tests {
         let db_path = dir.path().join("c.db");
         {
             let mut conn = crate::db::open(db_path.to_str().unwrap()).unwrap();
-            crate::db::apply_migration(&mut conn, 1, crate::db::MIGRATION_001).unwrap();
+            crate::db::apply_all_migrations(&mut conn).unwrap();
             crate::db::create_bucket(&conn, "bkt", "r").unwrap();
             // 4 jobs, mỗi job 2 chunks.
             for i in 0..4 {
@@ -478,6 +484,8 @@ mod tests {
                     8,
                     "e",
                     "text/plain",
+                    None,
+                    None,
                     &chunks,
                     &format!("job{i}"),
                 )
