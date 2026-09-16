@@ -14,13 +14,18 @@
 
 ## 2. Cài đặt từ Gói Đóng gói sẵn (`.deb` / Tarball)
 
+> **Lưu ý**: Đường dẫn `wget` bên dưới là URL chuẩn khi tag release (ví dụ `v0.1.0`) đã được publish trên GitHub Releases. Nếu bạn đang chạy trực tiếp từ mã nguồn local, bạn có thể tự đóng gói bằng script `packaging/build-deb.sh` hoặc tự biên dịch bằng Cargo (xem Phần 2.3).
+
 ### Cách 1: Cài đặt gói `.deb` (Debian / Ubuntu)
 
 ```bash
-# Tải gói cài đặt .deb
+# Tải gói cài đặt .deb (khi đã publish release trên GitHub)
 wget https://github.com/ZkIsHere/TeleCrate/releases/download/v0.1.0/telecrate_0.1.0_amd64.deb
 
-# Cài đặt gói
+# Hoặc tự tạo gói .deb tại local từ repo mã nguồn:
+./packaging/build-deb.sh
+
+# Cài đặt gói .deb vừa tạo hoặc tải về
 sudo dpkg -i telecrate_0.1.0_amd64.deb
 
 # Đóng gói tự động khởi tạo user hệ thống telecrate, thư mục /var/lib/telecrate và service systemd.
@@ -29,7 +34,7 @@ sudo dpkg -i telecrate_0.1.0_amd64.deb
 ### Cách 2: Cài đặt từ Binary / Tarball
 
 ```bash
-# Giải nén tarball
+# Giải nén tarball (khi tải về từ Releases)
 tar -xzvf telecrate-v0.1.0-linux-amd64.tar.gz
 cd telecrate-v0.1.0-linux-amd64
 
