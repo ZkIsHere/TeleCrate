@@ -3,7 +3,7 @@
 > Trạng thái: `implemented-and-tested` | `implemented-unverified` | `partial` | `blocked` | `unsupported`.
 > Semantics theo S3 API Reference chính thức (kiểm tra 2026-09-15). Không suy đoán từ tên API.
 > M0 (bootstrap): toàn bộ S3 ở `unsupported` trừ health/config — đúng quy tắc "không mock 200".
-> Cập nhật 2026-09-16 (sau M6.5): Milestone M6 đã hoàn tất (`implemented-and-tested`) bao gồm Admin REST API & Session Cookie/CSRF Authentication, Embedded Web Dashboard UI, CLI Client API integration (tránh SQLite lock), Systemd Native Hardening Service (`telecrate.service`), Linux Packaging (.deb, .rpm, tarball) và bộ tài liệu vận hành/khôi phục thảm họa đầy đủ.
+> Cập nhật 2026-09-16 (sau M7.5): Milestone M7 đã hoàn tất (`implemented-and-tested`) bao gồm S3 Tool Conformance Suite (AWS CLI, rclone, MinIO mc), High-Density Scale Simulation Fixture (25,000 objects / 62 GB mô phỏng), Live Telegram Production Verification và Advanced Features Gap Report (`docs/gap-report.md`).
 
 ## Telegram transport (ngoài S3 — nền tảng TeleCrate)
 
