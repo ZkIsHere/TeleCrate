@@ -76,6 +76,8 @@ chmod +x packaging/build-deb.sh
 ./packaging/build-deb.sh
 
 # Cài đặt gói .deb vừa được tạo ra tại target/debian/
+# (Thêm /sbin vào PATH nếu gặp lỗi ldconfig/start-stop-daemon khi dùng 'su')
+export PATH=$PATH:/usr/local/sbin:/usr/sbin:/sbin
 sudo dpkg -i target/debian/telecrate_0.1.0_amd64.deb
 
 # Gói .deb sẽ tự động thiết lập user `telecrate`, thư mục dữ liệu và service systemd.
