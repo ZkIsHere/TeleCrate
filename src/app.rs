@@ -1364,7 +1364,7 @@ async fn create_bucket(
             }
         };
         if let Some(loc) = want_region {
-            if loc != state.config.region {
+            if state.config.region != "*" && loc != "aws-global" && loc != state.config.region {
                 return telecrate::s3::S3Error::new(
                     "InvalidLocationConstraint",
                     format!(
