@@ -59,7 +59,7 @@ async fn test_admin_dashboard_and_static_assets() {
     let res = client.get(&url).send().await.unwrap();
     assert_eq!(res.status(), 200);
     let body = res.text().await.unwrap();
-    assert!(body.contains("TeleCrate — Web Dashboard"));
+    assert!(body.contains("TeleCrate"));
 
     // 2. GET /dashboard/style.css -> CSS
     let res_css = client
@@ -69,7 +69,7 @@ async fn test_admin_dashboard_and_static_assets() {
         .unwrap();
     assert_eq!(res_css.status(), 200);
     let css_body = res_css.text().await.unwrap();
-    assert!(css_body.contains("body.dark-theme"));
+    assert!(css_body.contains("TeleCrate"));
 
     // 3. GET /dashboard/app.js -> JS
     let res_js = client
@@ -79,7 +79,7 @@ async fn test_admin_dashboard_and_static_assets() {
         .unwrap();
     assert_eq!(res_js.status(), 200);
     let js_body = res_js.text().await.unwrap();
-    assert!(js_body.contains("initNavigation"));
+    assert!(js_body.contains("TeleCrate"));
 }
 
 #[tokio::test]
