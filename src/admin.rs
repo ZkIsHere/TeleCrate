@@ -28,7 +28,10 @@ pub type AdminConfig = Arc<std::sync::RwLock<telecrate::config::Config>>;
 pub type AdminState = (AdminConfig, Arc<SessionStore>);
 
 pub fn read_config(config_lock: &AdminConfig) -> telecrate::config::Config {
-    config_lock.read().unwrap_or_else(|e| e.into_inner()).clone()
+    config_lock
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 #[derive(Debug, Clone)]
@@ -292,10 +295,7 @@ pub async fn api_login(
 }
 
 /// `POST /admin/api/logout`
-pub async fn api_logout(
-    State((_, store)): State<AdminState>,
-    headers: HeaderMap,
-) -> Response {
+pub async fn api_logout(State((_, store)): State<AdminState>, headers: HeaderMap) -> Response {
     if let Some(session_id) = extract_session_id(&headers) {
         store.remove_session(&session_id);
     }
