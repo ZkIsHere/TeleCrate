@@ -3,7 +3,7 @@
 > Trạng thái: `implemented-and-tested` | `implemented-unverified` | `partial` | `blocked` | `unsupported`.
 > Semantics theo S3 API Reference chính thức (kiểm tra 2026-09-15). Không suy đoán từ tên API.
 > M0 (bootstrap): toàn bộ S3 ở `unsupported` trừ health/config — đúng quy tắc "không mock 200".
-> Cập nhật 2026-09-16 (sau M4.6): Milestone M4 đã hoàn tất (`implemented-and-tested`) bao gồm Presigned URLs & POST Form Policy Upload, Multi-Access Keys & Clock Skew (±15m), CORS Engine & Bucket Policy Engine with Deny precedence, Block Public Access (BPA), SSE-S3 & SSE-C Cryptographic Validation, và Object Lock WORM Gateway (GOVERNANCE/COMPLIANCE mode retention & Legal Hold).
+> Cập nhật 2026-09-16 (sau M5.6): Milestone M5 đã hoàn tất (`implemented-and-tested`) bao gồm Database Online Backup & AEAD Passphrase Restore, Physical Garbage Collection Engine (Spool & Remote Telegram respecting WORM), Standalone Recovery Bundle Export/Import (JSON plain & AEAD encrypted), Integrity Verification Engine (`telecrate doctor`, `verify`, `scrub`), và các integration test suites đầy đủ.
 
 ## Telegram transport (ngoài S3 — nền tảng TeleCrate)
 
@@ -55,6 +55,15 @@
 | Presigned URL / POST Policy Upload | implemented-and-tested | Query parameter authentication & HTML Form POST upload validation |
 | Multi-Access Keys / Clock Skew | implemented-and-tested | SQLite `access_keys` active check & ±15m timestamp window |
 
+## Maintenance, GC & Disaster Recovery (M5.6)
+
+| Capability | Trạng thái | Bằng chứng |
+|---|---|---|
+| Database Online Backup & AEAD Restore | implemented-and-tested | `telecrate db backup/restore`, SQLite online backup API + ChaCha20-Poly1305 encryption & `PRAGMA integrity_check` validation |
+| Physical Garbage Collection Engine | implemented-and-tested | `telecrate gc`, cleans unreferenced spool chunks & deletes remote Telegram messages with Object Lock WORM retention guard |
+| Standalone Recovery Bundle Export/Import | implemented-and-tested | `telecrate recovery export/import`, JSON format with AEAD passphrase encryption for DB-less disaster recovery |
+| Integrity Doctor, Verify & Scrub Engine | implemented-and-tested | `telecrate doctor`, `telecrate verify`, `telecrate scrub`, validates local spool SHA256 & remote Telegram message presence |
+
 ## Crash Recovery & Durability (M3.6)
 
 | Capability | Trạng thái | Bằng chứng |
@@ -64,4 +73,4 @@
 
 ## Nâng cao (website, access points, batch, IAM/STS/SNS/SQS/Lambda, Glacier)
 
-unsupported ở M0-M3; mỗi mục sẽ có gap report bằng chứng trước khi đánh `unsupported` vĩnh viễn.
+unsupported ở M0-M5; mỗi mục sẽ có gap report bằng chứng trước khi đánh `unsupported` vĩnh viễn.

@@ -1,7 +1,9 @@
 //! DB layer — SQLite WAL, migrations forward-only.
 
+use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::Path;
 
 /// Mở DB (tạo file + bật WAL + foreign keys). Không giữ txn mở suốt network upload.
@@ -64,6 +66,161 @@ pub fn apply_all_migrations(conn: &mut Connection) -> Result<i64, String> {
         current = 3;
     }
     Ok(current)
+}
+
+pub const ENC_DB_MAGIC: &[u8] = b"TELECRATE_ENC_DB_V1";
+
+/// Backup DB online (dùng SQLite online backup API).
+pub fn backup_db(conn: &Connection, target_path: &str) -> Result<(), String> {
+    if let Some(parent) = Path::new(target_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create backup parent dir: {e}"))?;
+        }
+    }
+    if Path::new(target_path).exists() {
+        std::fs::remove_file(target_path)
+            .map_err(|e| format!("remove existing backup file: {e}"))?;
+    }
+    let mut dst = Connection::open(target_path).map_err(|e| format!("open backup dst: {e}"))?;
+    let backup =
+        rusqlite::backup::Backup::new(conn, &mut dst).map_err(|e| format!("init backup: {e}"))?;
+    backup
+        .run_to_completion(5, std::time::Duration::from_millis(250), None)
+        .map_err(|e| format!("backup progress: {e}"))?;
+    Ok(())
+}
+
+/// Backup DB có mã hóa bằng passphrase.
+pub fn backup_db_encrypted(
+    conn: &Connection,
+    target_path: &str,
+    passphrase: &str,
+) -> Result<(), String> {
+    let temp_dir = tempfile::tempdir().map_err(|e| format!("create temp dir: {e}"))?;
+    let temp_backup = temp_dir.path().join("plain_backup.db");
+    let temp_str = temp_backup.to_str().ok_or("invalid temp path")?;
+
+    backup_db(conn, temp_str)?;
+    let plain_bytes = std::fs::read(&temp_backup).map_err(|e| format!("read temp backup: {e}"))?;
+
+    let mut salt = [0u8; 16];
+    let mut nonce_bytes = [0u8; 12];
+    getrandom::getrandom(&mut salt).map_err(|e| format!("getrandom salt: {e}"))?;
+    getrandom::getrandom(&mut nonce_bytes).map_err(|e| format!("getrandom nonce: {e}"))?;
+
+    let mut hasher = Sha256::new();
+    hasher.update(passphrase.as_bytes());
+    hasher.update(salt);
+    let key_bytes = hasher.finalize();
+
+    let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
+    let mut buf = plain_bytes;
+    cipher
+        .encrypt_in_place(Nonce::from_slice(&nonce_bytes), ENC_DB_MAGIC, &mut buf)
+        .map_err(|e| format!("encrypt db: {e}"))?;
+
+    let mut out = Vec::with_capacity(ENC_DB_MAGIC.len() + 16 + 12 + buf.len());
+    out.extend_from_slice(ENC_DB_MAGIC);
+    out.extend_from_slice(&salt);
+    out.extend_from_slice(&nonce_bytes);
+    out.extend_from_slice(&buf);
+
+    if let Some(parent) = Path::new(target_path).parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create enc backup parent dir: {e}"))?;
+        }
+    }
+    std::fs::write(target_path, out).map_err(|e| format!("write encrypted backup: {e}"))?;
+    Ok(())
+}
+
+/// Restore DB từ file backup (plain hoặc encrypted với passphrase).
+pub fn restore_db(
+    backup_path: &str,
+    target_db_path: &str,
+    passphrase: Option<&str>,
+) -> Result<(), String> {
+    let raw = std::fs::read(backup_path).map_err(|e| format!("read backup file: {e}"))?;
+    if raw.is_empty() {
+        return Err("backup file is empty".into());
+    }
+
+    let temp_dir = tempfile::tempdir().map_err(|e| format!("create temp dir: {e}"))?;
+    let temp_restored = temp_dir.path().join("restored.db");
+
+    if raw.starts_with(ENC_DB_MAGIC) {
+        let pass = passphrase.ok_or("encrypted backup requires a passphrase")?;
+        if raw.len() < ENC_DB_MAGIC.len() + 16 + 12 {
+            return Err("encrypted backup file is corrupted or truncated".into());
+        }
+        let salt = &raw[ENC_DB_MAGIC.len()..ENC_DB_MAGIC.len() + 16];
+        let nonce = &raw[ENC_DB_MAGIC.len() + 16..ENC_DB_MAGIC.len() + 28];
+        let ciphertext = &raw[ENC_DB_MAGIC.len() + 28..];
+
+        let mut hasher = Sha256::new();
+        hasher.update(pass.as_bytes());
+        hasher.update(salt);
+        let key_bytes = hasher.finalize();
+
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(&key_bytes));
+        let mut buf = ciphertext.to_vec();
+        cipher
+            .decrypt_in_place(Nonce::from_slice(nonce), ENC_DB_MAGIC, &mut buf)
+            .map_err(|_| "decrypt backup failed (wrong passphrase or tampered file)".to_string())?;
+
+        std::fs::write(&temp_restored, buf).map_err(|e| format!("write restored temp: {e}"))?;
+    } else {
+        if !raw.starts_with(b"SQLite format 3\0") {
+            return Err("invalid SQLite database backup format".into());
+        }
+        std::fs::write(&temp_restored, raw).map_err(|e| format!("write restored temp: {e}"))?;
+    }
+
+    // Kiểm tra integrity và schema_version của file DB sau giải mã
+    let conn = open(temp_restored.to_str().unwrap())?;
+    let integrity: String = conn
+        .query_row("PRAGMA integrity_check", [], |r| r.get(0))
+        .map_err(|e| format!("pragma integrity check: {e}"))?;
+    if integrity != "ok" {
+        return Err(format!("backup DB integrity check failed: {integrity}"));
+    }
+    let ver = schema_version(&conn)?;
+    if ver < 1 {
+        return Err(format!("invalid DB schema version in backup: {ver}"));
+    }
+    drop(conn);
+
+    // Backup DB hiện tại (nếu có) trước khi ghi đè
+    let target = Path::new(target_db_path);
+    if target.exists() {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let safety_backup = format!("{target_db_path}.bak_{ts}");
+        let _ = std::fs::copy(target_db_path, &safety_backup);
+    } else if let Some(parent) = target.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("create target db parent dir: {e}"))?;
+        }
+    }
+
+    // Ghi đè file DB đích
+    std::fs::copy(&temp_restored, target_db_path).map_err(|e| format!("copy restored db: {e}"))?;
+
+    // Verify DB đích mở được bình thường
+    let target_conn = open(target_db_path)?;
+    let target_ver = schema_version(&target_conn)?;
+    if target_ver != ver {
+        return Err(format!(
+            "mismatch in schema version after restore: expected {ver}, got {target_ver}"
+        ));
+    }
+
+    Ok(())
 }
 
 /// Thông tin một Multipart Upload đang tiến hành.
@@ -1880,5 +2037,55 @@ mod tests {
             delete_bucket(&conn, "bkt").unwrap(),
             DeleteBucketOutcome::Deleted
         );
+    }
+
+    #[test]
+    fn test_db_backup_and_restore() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let db_path = temp_dir.path().join("source.db");
+        let plain_backup = temp_dir.path().join("plain_backup.db");
+        let enc_backup = temp_dir.path().join("enc_backup.db");
+        let restored_db = temp_dir.path().join("restored.db");
+
+        let mut conn = open(db_path.to_str().unwrap()).unwrap();
+        apply_all_migrations(&mut conn).unwrap();
+        create_bucket(&conn, "backup-bkt", "us-east-1").unwrap();
+
+        // 1. Plain backup
+        backup_db(&conn, plain_backup.to_str().unwrap()).unwrap();
+        assert!(plain_backup.exists());
+
+        // Restore plain backup to restored_db
+        restore_db(
+            plain_backup.to_str().unwrap(),
+            restored_db.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
+        let restored_conn = open(restored_db.to_str().unwrap()).unwrap();
+        assert!(head_bucket(&restored_conn, "backup-bkt").unwrap());
+        drop(restored_conn);
+
+        // 2. Encrypted backup
+        backup_db_encrypted(&conn, enc_backup.to_str().unwrap(), "my-secret-passphrase").unwrap();
+        assert!(enc_backup.exists());
+
+        // Restore with wrong passphrase -> fails
+        let res = restore_db(
+            enc_backup.to_str().unwrap(),
+            restored_db.to_str().unwrap(),
+            Some("wrong-pass"),
+        );
+        assert!(res.is_err());
+
+        // Restore with correct passphrase -> succeeds
+        restore_db(
+            enc_backup.to_str().unwrap(),
+            restored_db.to_str().unwrap(),
+            Some("my-secret-passphrase"),
+        )
+        .unwrap();
+        let restored_conn2 = open(restored_db.to_str().unwrap()).unwrap();
+        assert!(head_bucket(&restored_conn2, "backup-bkt").unwrap());
     }
 }

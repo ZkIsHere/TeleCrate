@@ -45,7 +45,14 @@
 - **4.4: `implemented-and-tested` (2026-09-16)** — SSE-S3 (`AES256` default encryption headers) and SSE-C (256-bit Base64 customer key validation & Base64 MD5 checksum verification).
 - **4.5: `implemented-and-tested` (2026-09-16)** — Object Lock WORM Gateway (`?object-lock`, `?retention`, `?legal-hold`), GOVERNANCE/COMPLIANCE mode retention enforcement, bypass header (`x-amz-bypass-governance-retention`), Legal Hold 403 AccessDenied guard.
 - **4.6: `implemented-and-tested` (2026-09-16)** — Complete code quality and verification pass (cargo fmt, clippy -D warnings, full test suite pass). Chính thức đóng M4. TIẾP THEO: M5 (GC, recovery bundle, doctor/verify/scrub, backup/restore index).
-- **M5 — GC, recovery bundle, doctor/verify/scrub, backup/restore index**.
+- **M5 — GC, recovery bundle, doctor/verify/scrub, backup/restore index: `implemented-and-tested` (cập nhật 2026-09-16)**.
+  Breakdown: 5.1 (Database Backup & Restore Engine) → 5.2 (Physical GC Engine) → 5.3 (Standalone Recovery Bundle) → 5.4 (Integrity Verification, Doctor & Scrubbing Engine) → 5.5 (Integration Test Suite & CLI Wiring) → 5.6 (Documentation & Quality Assurance).
+- **5.1: `implemented-and-tested` (2026-09-16)** — SQLite online backup engine (`rusqlite::backup`), AEAD ChaCha20-Poly1305 database backup encryption, and safe database restore with `PRAGMA integrity_check` validation & automatic safety backups.
+- **5.2: `implemented-and-tested` (2026-09-16)** — Physical Garbage Collection Engine (`telecrate gc`), local spool cleanup, orphan chunk removal, aborted/expired multipart cleanup, and remote Telegram message deletion respecting Object Lock WORM retention & legal holds.
+- **5.3: `implemented-and-tested` (2026-09-16)** — Standalone Recovery Bundle (`telecrate recovery export/import`), JSON format export/import with optional AEAD passphrase encryption for offline disaster recovery without DB access.
+- **5.4: `implemented-and-tested` (2026-09-16)** — Integrity Verification, Doctor & Scrubbing Engine (`telecrate doctor`, `telecrate verify`, `telecrate scrub`), local spool hash validation, remote Telegram presence check, and automatic error detection/fixing.
+- **5.5: `implemented-and-tested` (2026-09-16)** — Integration test suites (`tests/backup_restore_api.rs`, `tests/gc_api.rs`, `tests/doctor_recovery_api.rs`) and CLI subcommands wired in `src/main.rs`.
+- **5.6: `implemented-and-tested` (2026-09-16)** — Complete code quality and verification pass (`cargo fmt`, `clippy -D warnings`, full test suite pass). Chính thức đóng M5. TIẾP THEO: M6 (CLI + dashboard đầy đủ, packaging Linux, docs install/admin/recovery).
 - **M6 — CLI + dashboard đầy đủ, packaging Linux, docs install/admin/recovery**.
 - **M7 — Conformance (AWS CLI, rclone, SDK), fixture 25k objects/62 GB mô phỏng, live Telegram nhỏ có kiểm soát, gap report advanced**.
 

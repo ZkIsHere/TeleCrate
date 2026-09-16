@@ -26,12 +26,60 @@ enum Commands {
     Serve,
     /// Trạng thái thật: config + DB mở được.
     Status,
-    /// Kiểm tra sức khỏe: config validate + migrations version.
+    /// Kiểm tra sức khỏe: config validate, SQLite integrity check, migrations version.
     Doctor,
+    /// Kiểm tra spool local (thiếu file, mồ côi, sai checksum).
+    Verify,
+    /// Scrubbing remote Telegram locators (tải/xác minh locator).
+    Scrub,
+    /// Thực thi Garbage Collection (dọn spool committed, delete messages Telegram đã xóa).
+    Gc,
+    /// Thao tác DB (backup/restore).
+    Db {
+        #[command(subcommand)]
+        op: DbOp,
+    },
+    /// Standalone Recovery Bundle (export/import index metadata).
+    Recovery {
+        #[command(subcommand)]
+        op: RecoveryOp,
+    },
     /// Quản lý migrations: apply lên head (có backup DB trước khi apply).
     Migrations {
         #[command(subcommand)]
         op: MigOp,
+    },
+}
+
+#[derive(Subcommand)]
+enum DbOp {
+    Backup {
+        #[arg(short, long)]
+        output: String,
+        #[arg(short, long)]
+        passphrase: Option<String>,
+    },
+    Restore {
+        #[arg(short, long)]
+        input: String,
+        #[arg(short, long)]
+        passphrase: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum RecoveryOp {
+    Export {
+        #[arg(short, long)]
+        output: String,
+        #[arg(short, long)]
+        passphrase: Option<String>,
+    },
+    Import {
+        #[arg(short, long)]
+        input: String,
+        #[arg(short, long)]
+        passphrase: Option<String>,
     },
 }
 
@@ -156,14 +204,106 @@ async fn run(cli: Cli) -> Result<(), String> {
         Commands::Doctor => {
             let cfg = telecrate::config::load(&cli.config)?;
             let conn = telecrate::db::open(&cfg.db_path)?;
-            let v = telecrate::db::schema_version(&conn)?;
-            // Chỉ in đường dẫn + version, không in nội dung config (có secrets từ M2.1).
-            println!(
-                "doctor ok: schema_version={v} spool={} db={}",
-                cfg.spool_dir, cfg.db_path
-            );
+            let rep = telecrate::doctor::run_doctor(&conn)?;
+            println!("{}", serde_json::to_string_pretty(&rep).unwrap());
+            if rep.db_integrity_ok && rep.foreign_keys_ok {
+                Ok(())
+            } else {
+                Err("doctor detected DB integrity issues".into())
+            }
+        }
+        Commands::Verify => {
+            let cfg = telecrate::config::load(&cli.config)?;
+            let conn = telecrate::db::open(&cfg.db_path)?;
+            let rep =
+                telecrate::doctor::run_verify_spool(&conn, std::path::Path::new(&cfg.spool_dir))?;
+            println!("{}", serde_json::to_string_pretty(&rep).unwrap());
+            if rep.missing_spool_chunks.is_empty() && rep.corrupt_checksum_files.is_empty() {
+                Ok(())
+            } else {
+                Err("verify detected missing or corrupt spool chunks".into())
+            }
+        }
+        Commands::Scrub => {
+            let cfg = telecrate::config::load(&cli.config)?;
+            let conn = telecrate::db::open(&cfg.db_path)?;
+            let cfg_route = cfg.clone();
+            let (transport, _) = tokio::task::spawn_blocking(move || {
+                (telecrate::app::build_transport(&cfg_route), ())
+            })
+            .await
+            .map_err(|e| format!("build transport: {e}"))?;
+            let tr = transport.ok_or("cannot scrub without configured telegram bot token")?;
+            let rep = telecrate::doctor::run_scrub_remote(&conn, &tr)?;
+            println!("{}", serde_json::to_string_pretty(&rep).unwrap());
+            if rep.missing_or_corrupt_remote.is_empty() {
+                Ok(())
+            } else {
+                Err("scrub detected unreachable remote chunks".into())
+            }
+        }
+        Commands::Gc => {
+            let cfg = telecrate::config::load(&cli.config)?;
+            let conn = telecrate::db::open(&cfg.db_path)?;
+            let cfg_route = cfg.clone();
+            let (transport, _) = tokio::task::spawn_blocking(move || {
+                (telecrate::app::build_transport(&cfg_route), ())
+            })
+            .await
+            .map_err(|e| format!("build transport: {e}"))?;
+            let stats = telecrate::gc::run_gc(
+                &conn,
+                std::path::Path::new(&cfg.spool_dir),
+                transport
+                    .as_ref()
+                    .map(|t| t as &dyn telecrate::telegram::Transport),
+            )?;
+            println!("{}", serde_json::to_string_pretty(&stats).unwrap());
             Ok(())
         }
+        Commands::Db { op } => match op {
+            DbOp::Backup { output, passphrase } => {
+                let cfg = telecrate::config::load(&cli.config)?;
+                let conn = telecrate::db::open(&cfg.db_path)?;
+                if let Some(pass) = passphrase {
+                    telecrate::db::backup_db_encrypted(&conn, &output, &pass)?;
+                    println!("db backup encrypted ok: {output}");
+                } else {
+                    telecrate::db::backup_db(&conn, &output)?;
+                    println!("db backup plain ok: {output}");
+                }
+                Ok(())
+            }
+            DbOp::Restore { input, passphrase } => {
+                let cfg = telecrate::config::load(&cli.config)?;
+                telecrate::db::restore_db(&input, &cfg.db_path, passphrase.as_deref())?;
+                println!("db restore ok: {}", cfg.db_path);
+                Ok(())
+            }
+        },
+        Commands::Recovery { op } => match op {
+            RecoveryOp::Export { output, passphrase } => {
+                let cfg = telecrate::config::load(&cli.config)?;
+                let conn = telecrate::db::open(&cfg.db_path)?;
+                telecrate::recovery::export_recovery_bundle_file(
+                    &conn,
+                    &output,
+                    passphrase.as_deref(),
+                )?;
+                println!("recovery export ok: {output}");
+                Ok(())
+            }
+            RecoveryOp::Import { input, passphrase } => {
+                let cfg = telecrate::config::load(&cli.config)?;
+                telecrate::recovery::import_recovery_bundle_file(
+                    &input,
+                    &cfg.db_path,
+                    passphrase.as_deref(),
+                )?;
+                println!("recovery import ok: {}", cfg.db_path);
+                Ok(())
+            }
+        },
         Commands::Migrations { op } => match op {
             MigOp::Apply => {
                 let cfg = telecrate::config::load(&cli.config)?;
