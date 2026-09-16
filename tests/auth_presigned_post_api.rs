@@ -311,9 +311,7 @@ fn test_post_policy_form_upload() {
     let date_stamp = &date_iso[..8];
     let cred = format!("{KEY}/{date_stamp}/{REGION}/s3/aws4_request");
 
-    let policy_json = format!(
-        r#"{{"expiration":"2030-01-01T00:00:00Z","conditions":[{{"bucket":"post-bkt"}},["starts-with","$key","user/"]]}}"#
-    );
+    let policy_json = r#"{"expiration":"2030-01-01T00:00:00Z","conditions":[{"bucket":"post-bkt"},["starts-with","$key","user/"]]}"#;
     let policy_b64 = base64_encode(policy_json.as_bytes());
 
     // Compute POST signature

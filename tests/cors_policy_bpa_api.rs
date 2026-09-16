@@ -197,7 +197,7 @@ fn test_cors_api_and_preflight() {
     let preflight = client
         .request(
             reqwest::Method::OPTIONS,
-            &format!("{base}/cors-bucket/myobject"),
+            format!("{base}/cors-bucket/myobject"),
         )
         .header("Origin", "https://app.example.com")
         .header("Access-Control-Request-Method", "PUT")
@@ -237,7 +237,7 @@ fn test_cors_api_and_preflight() {
     let forbidden_preflight = client
         .request(
             reqwest::Method::OPTIONS,
-            &format!("{base}/cors-bucket/myobject"),
+            format!("{base}/cors-bucket/myobject"),
         )
         .header("Origin", "https://evil.com")
         .header("Access-Control-Request-Method", "PUT")
@@ -285,7 +285,7 @@ fn test_bucket_policy_and_bpa() {
 
     // 3. Anonymous GET hello.txt without policy -> 403 AccessDenied
     let anon_r = client
-        .get(&format!("{base}/policy-bucket/hello.txt"))
+        .get(format!("{base}/policy-bucket/hello.txt"))
         .send()
         .unwrap();
     assert_eq!(anon_r.status().as_u16(), 403);
@@ -327,7 +327,7 @@ fn test_bucket_policy_and_bpa() {
 
     // 6. Anonymous GET hello.txt -> SUCCEEDS (200 OK)!
     let anon_hello = client
-        .get(&format!("{base}/policy-bucket/hello.txt"))
+        .get(format!("{base}/policy-bucket/hello.txt"))
         .send()
         .unwrap();
     assert_eq!(anon_hello.status().as_u16(), 200);
@@ -335,7 +335,7 @@ fn test_bucket_policy_and_bpa() {
 
     // 7. Anonymous GET secret.txt -> DENIED (403 Forbidden)!
     let anon_secret = client
-        .get(&format!("{base}/policy-bucket/secret.txt"))
+        .get(format!("{base}/policy-bucket/secret.txt"))
         .send()
         .unwrap();
     assert_eq!(anon_secret.status().as_u16(), 403);

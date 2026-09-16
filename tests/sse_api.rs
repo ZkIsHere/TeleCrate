@@ -208,7 +208,7 @@ fn test_sse_s3_and_ssec_lifecycle() {
     // 4. SSE-C setup (32 bytes key)
     let raw_key = [42u8; 32];
     let key_b64 = telecrate::s3::base64_encode(&raw_key);
-    let key_md5 = md5::compute(&raw_key);
+    let key_md5 = md5::compute(raw_key);
     let key_md5_b64 = telecrate::s3::base64_encode(key_md5.as_ref());
 
     // PUT object with SSE-C
