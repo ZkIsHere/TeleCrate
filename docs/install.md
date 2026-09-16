@@ -31,12 +31,17 @@ sudo dpkg -i telecrate_0.1.0_amd64.deb
 # Đóng gói tự động khởi tạo user hệ thống telecrate, thư mục /var/lib/telecrate và service systemd.
 ```
 
-### Cách 2: Cài đặt từ Binary / Tarball
+### Cách 2: Cài đặt từ Mã nguồn Archive / Zip / Tarball
 
 ```bash
-# Giải nén tarball (khi tải về từ Releases)
-tar -xzvf telecrate-v0.1.0-linux-amd64.tar.gz
-cd telecrate-v0.1.0-linux-amd64
+# Nếu tải file .zip (Source code zip từ GitHub Releases):
+sudo apt install -y unzip # (Nếu chưa có unzip)
+unzip TeleCrate-0.1.0.zip
+cd TeleCrate-0.1.0
+
+# Nếu tải file .tar.gz:
+tar -xzvf TeleCrate-0.1.0.tar.gz
+cd TeleCrate-0.1.0
 
 # Copy binary vào /usr/bin
 sudo cp bin/telecrate /usr/bin/
