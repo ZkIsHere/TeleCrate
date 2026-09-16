@@ -190,18 +190,25 @@ impl BotApiHttpTransport {
         resp: reqwest::blocking::Response,
     ) -> Result<serde_json::Value, TransportError> {
         let status = resp.status().as_u16();
-        if status == 429 || status >= 500 {
-            return Ok(serde_json::json!({"__transport_status__": status}));
-        }
         let body = resp.text().map_err(|e| TransportError::Transient {
-            reason: format!("read body: {}", self.redact(&e.to_string())),
+            reason: format!("read body (http {status}): {}", self.redact(&e.to_string())),
             retry_after_secs: None,
         })?;
-        let v: serde_json::Value =
-            serde_json::from_str(&body).map_err(|e| TransportError::Transient {
-                reason: format!("bad api json (http {status}): {e}"),
-                retry_after_secs: None,
-            })?;
+        let v: serde_json::Value = match serde_json::from_str(&body) {
+            Ok(val) => val,
+            Err(e) => {
+                if status >= 500 || status == 429 {
+                    return Err(TransportError::Transient {
+                        reason: format!("HTTP {status} server error: {}", self.redact(&body)),
+                        retry_after_secs: None,
+                    });
+                }
+                return Err(TransportError::Transient {
+                    reason: format!("bad api json (http {status}): {e}"),
+                    retry_after_secs: None,
+                });
+            }
+        };
         if v.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
             return Ok(v);
         }
@@ -223,6 +230,12 @@ fn map_api_error(token: &str, status: u16, v: &serde_json::Value) -> TransportEr
         return TransportError::Transient {
             reason: redact(&format!("rate limited: {desc}")),
             retry_after_secs: retry_after,
+        };
+    }
+    if status >= 500 {
+        return TransportError::Transient {
+            reason: redact(&format!("telegram 5xx error {status}: {desc}")),
+            retry_after_secs: Some(10),
         };
     }
     if status == 401 {
