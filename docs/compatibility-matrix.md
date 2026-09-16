@@ -16,12 +16,13 @@
 | Channel `-100...` admin tối thiểu / `channels.deleteMessages` | blocked | ràng buộc nền tảng: nâng supergroup bất khả thi ở môi trường này — không chặn M2 |
 | Local Bot API / MTProto bot | unsupported | chờ capability test |
 
-## Bucket
+## Bucket (cập nhật 2026-09-16 — M2.1)
 
 | Operation | Trạng thái | Ghi chú |
 |---|---|---|
-| CreateBucket / DeleteBucket / HeadBucket / ListBuckets | unsupported | M2 |
-| GetBucketLocation / naming rules / từ chối xóa bucket không rỗng | unsupported | M2 |
+| CreateBucket (LocationConstraint khớp region) / HeadBucket / DeleteBucket (409 khi không rỗng) / ListBuckets | implemented-and-tested | SigV4 header-auth + unit/integration tests qua HTTP thật |
+| GetBucketLocation | implemented-and-tested | integration test |
+| Bucket naming rules | implemented-and-tested | rút gọn M2 (3-63, lowercase/số/`.-`); full rules + virtual-hosted → M3-M4 |
 | Bucket config (versioning, policy, CORS, BPA) | unsupported | M3-M4 |
 
 ## Object (M2-M3)
@@ -37,8 +38,9 @@
 ListObjects v1/v2, ListObjectVersions, pagination + concurrent change: unsupported.
 Multipart toàn bộ (initiate/upload/list/complete/abort/list-uploads, part-copy, checksum, cleanup): unsupported.
 Range, conditional, ETag theo loại upload, request ID, lỗi chuẩn: unsupported.
-SigV4 header/query, presigned, POST policy, streaming checksum: unsupported.
-Path-style trước; virtual-hosted-style khi có DNS/TLS: unsupported (tài liệu hóa).
+SigV4 header/query, presigned, POST policy, streaming checksum: header-auth `implemented-and-tested` (M2.1);
+presigned query + POST policy + streaming → M4.
+Path-style trước (M2.1); virtual-hosted-style khi có DNS/TLS: unsupported (tài liệu hóa).
 
 ## Versioning / Lifecycle / Access / Encryption / Lock / Events (M3-M6)
 

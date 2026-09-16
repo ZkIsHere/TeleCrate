@@ -1,7 +1,6 @@
 //! Binary `telecrate` — CLI + daemon dùng chung logic trong lib.
-//! S3 API vẫn unsupported cho tới M2 — không mock 200.
+//! S3 buckets + SigV4 ở M2.1 (objects → 2.2) — không mock 200.
 
-use axum::{routing::get, Json, Router};
 use clap::{Parser, Subcommand};
 use serde_json::json;
 use tracing_subscriber::EnvFilter;
@@ -74,15 +73,12 @@ async fn run(cli: Cli) -> Result<(), String> {
         }
         Commands::Serve => {
             let cfg = telecrate::config::load(&cli.config)?;
-            let app = Router::new()
-                .route("/health", get(health))
-                .route("/", get(index));
             let addr = format!("0.0.0.0:{}", cfg.listen_port);
             let listener = tokio::net::TcpListener::bind(&addr)
                 .await
                 .map_err(|e| format!("bind {addr}: {e}"))?;
             println!("telecrate serving on {addr}");
-            axum::serve(listener, app)
+            axum::serve(listener, telecrate::app::router(cfg))
                 .await
                 .map_err(|e| format!("serve: {e}"))?;
             Ok(())
@@ -106,7 +102,7 @@ async fn run(cli: Cli) -> Result<(), String> {
             let cfg = telecrate::config::load(&cli.config)?;
             let conn = telecrate::db::open(&cfg.db_path)?;
             let v = telecrate::db::schema_version(&conn)?;
-            // Redaction: config hiện chưa có secret field nào (keys/secrets vào M2/M4).
+            // Chỉ in đường dẫn + version, không in nội dung config (có secrets từ M2.1).
             println!(
                 "doctor ok: schema_version={v} spool={} db={}",
                 cfg.spool_dir, cfg.db_path
@@ -116,7 +112,7 @@ async fn run(cli: Cli) -> Result<(), String> {
         Commands::Migrations { op } => match op {
             MigOp::Apply => {
                 let cfg = telecrate::config::load(&cli.config)?;
-                // Backup DB trước khi apply (M0: copy file sau checkpoint).
+                // Backup DB trước khi apply (copy file).
                 let backup = format!("{}.pre-mig-backup", cfg.db_path);
                 if std::path::Path::new(&cfg.db_path).exists() {
                     std::fs::copy(&cfg.db_path, &backup).map_err(|e| format!("backup db: {e}"))?;
@@ -134,12 +130,4 @@ async fn run(cli: Cli) -> Result<(), String> {
             }
         },
     }
-}
-
-async fn health() -> Json<serde_json::Value> {
-    Json(json!({ "ok": true, "version": telecrate::VERSION, "s3": "unsupported-m0" }))
-}
-
-async fn index() -> &'static str {
-    "TeleCrate M0 bootstrap — dashboard đầy đủ ở M6."
 }

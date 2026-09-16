@@ -9,6 +9,9 @@
 - **M2 — Vertical slice durable PUT/GET (single-part): TIẾP THEO, thiết kế ở `docs/adr/0003-m2-vertical-slice.md`**.
   Breakdown: 2.1 (keys + SigV4 + bucket CRUD) → 2.2 (flow durable + worker tối giản) → 2.3 (multi-chunk + worker đủ)
   → 2.4 (mã hóa on/AEAD) → 2.5 (crash injection + AWS CLI + đóng M2).
+- **2.1: `implemented-and-tested` (2026-09-16)** — config keys + region, SigV4 verify (vector AWS get-vanilla +
+  roundtrip/tamper/skew), bucket CRUD + GetBucketLocation + error XML/request-id, integration HTTP ký thật.
+  Op chưa tới milestone trả 501 `NotImplemented` (GET /bucket = ListObjects → 2.2).
 - **M3 — Multipart, copy, Range, conditional, ETag, versioning, metadata/tags**.
 - **M4 — Auth hoàn chỉnh (presigned/POST policy), policies/ACL/BPA/CORS, SSE hành vi đúng, Object Lock gateway**.
 - **M5 — GC, recovery bundle, doctor/verify/scrub, backup/restore index**.

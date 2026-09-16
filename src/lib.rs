@@ -1,7 +1,10 @@
 //! TeleCrate library — dùng chung giữa daemon và CLI (không sửa DB trực tiếp khi daemon chạy).
 
+pub mod app;
 pub mod config;
 pub mod db;
+pub mod s3;
+pub mod sigv4;
 pub mod spool;
 pub mod telegram;
 

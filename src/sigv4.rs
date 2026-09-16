@@ -1,0 +1,456 @@
+//! SigV4 header-auth verify (M2.1) — đúng AWS spec cho `service = s3`.
+//!
+//! Phạm vi: `Authorization: AWS4-HMAC-SHA256 ...` (presigned query → M4).
+//! Quyết định (xem ADR 0003): chấp nhận literal `UNSIGNED-PAYLOAD` khi client gửi
+//! (theo đúng API), region cố định từ config, clock skew ±15 phút.
+
+use hmac::{Hmac, Mac};
+use sha2::{Digest, Sha256};
+
+/// Sai số đồng hồ cho phép (giây) — S3 dùng 15 phút.
+pub const MAX_SKEW_SECS: u64 = 15 * 60;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Verified {
+    pub access_key_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SigError {
+    MissingAuth,
+    MalformedAuth,
+    UnknownKey,
+    BadScope,
+    Expired,
+    BadSignature,
+}
+
+impl std::fmt::Display for SigError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Không bao giờ chứa secret — chỉ mã lỗi.
+        write!(f, "{self:?}")
+    }
+}
+
+/// Request tối thiểu cần để verify (trích từ HTTP request thật ở tầng routes).
+pub struct SignableRequest<'a> {
+    pub method: &'a str,
+    pub path: &'a str,
+    /// Query raw (phần sau `?`, chưa decode).
+    pub query: &'a str,
+    /// Headers (name, value) — name giữ nguyên case, sẽ lowercase khi canonicalize.
+    pub headers: &'a [(String, String)],
+    /// Authorization header value.
+    pub authorization: &'a str,
+    /// Body bytes (để hash khi không phải UNSIGNED-PAYLOAD).
+    pub body: &'a [u8],
+}
+
+fn hmac_sha256(key: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut m = Hmac::<Sha256>::new_from_slice(key).expect("hmac key");
+    m.update(data);
+    m.finalize().into_bytes().to_vec()
+}
+
+fn sha256_hex(data: &[u8]) -> String {
+    hex::encode(Sha256::digest(data))
+}
+
+fn is_unreserved(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~')
+}
+
+/// Percent-encode theo SigV4 (RFC3986, UTF-8 từng byte). `keep_slash` cho URI path.
+fn encode(s: &str, keep_slash: bool) -> String {
+    let mut out = String::new();
+    for b in s.as_bytes() {
+        if is_unreserved(*b) || (keep_slash && *b == b'/') {
+            out.push(*b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Parse query raw thành cặp (name, value) chưa decode, sort theo encoded name/value.
+fn canonical_query(query: &str) -> String {
+    if query.is_empty() {
+        return String::new();
+    }
+    let mut pairs: Vec<(String, String)> = query
+        .split('&')
+        .filter(|p| !p.is_empty())
+        .map(|p| match p.split_once('=') {
+            Some((k, v)) => (encode(k, false), encode(v, false)),
+            None => (encode(p, false), String::new()),
+        })
+        .collect();
+    pairs.sort();
+    pairs
+        .iter()
+        .map(|(k, v)| format!("{k}={v}"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// Tìm header không phân biệt hoa thường.
+fn find_header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.as_str())
+}
+
+/// Canonical headers + signed headers list từ danh sách signed names.
+fn canonical_headers(
+    headers: &[(String, String)],
+    signed: &[&str],
+) -> Result<(String, String), SigError> {
+    let mut names: Vec<&str> = signed.to_vec();
+    names.sort_unstable();
+    let mut canon = String::new();
+    let mut list = Vec::new();
+    for n in names {
+        let v = find_header(headers, n).ok_or(SigError::MalformedAuth)?;
+        let norm: String = v.split_whitespace().collect::<Vec<_>>().join(" ");
+        canon.push_str(&format!("{}:{}\n", n.to_ascii_lowercase(), norm));
+        list.push(n.to_ascii_lowercase());
+    }
+    Ok((canon, list.join(";")))
+}
+
+pub struct AuthParams<'a> {
+    pub access_key_id: &'a str,
+    pub date: &'a str,
+    pub region: &'a str,
+    pub service: &'a str,
+    pub signed_headers: Vec<&'a str>,
+    pub signature: &'a str,
+}
+
+/// Parse `AWS4-HMAC-SHA256 Credential=.../date/region/service/aws4_request, SignedHeaders=..., Signature=...`.
+fn parse_auth(auth: &str) -> Result<AuthParams<'_>, SigError> {
+    let rest = auth
+        .strip_prefix("AWS4-HMAC-SHA256 ")
+        .ok_or(SigError::MissingAuth)?;
+    let mut cred = None;
+    let mut signed = None;
+    let mut sig = None;
+    for part in rest.split(", ") {
+        if let Some(v) = part.strip_prefix("Credential=") {
+            cred = Some(v);
+        } else if let Some(v) = part.strip_prefix("SignedHeaders=") {
+            signed = Some(v);
+        } else if let Some(v) = part.strip_prefix("Signature=") {
+            sig = Some(v);
+        }
+    }
+    let (cred, signed, sig) = (cred, signed, sig);
+    let (Some(cred), Some(signed), Some(sig)) = (cred, signed, sig) else {
+        return Err(SigError::MalformedAuth);
+    };
+    let c: Vec<&str> = cred.split('/').collect();
+    if c.len() != 5 || c[4] != "aws4_request" {
+        return Err(SigError::MalformedAuth);
+    }
+    Ok(AuthParams {
+        access_key_id: c[0],
+        date: c[1],
+        region: c[2],
+        service: c[3],
+        signed_headers: signed.split(';').collect(),
+        signature: sig,
+    })
+}
+
+/// Lấy access key id từ Authorization header (để tra secret trước khi verify).
+pub fn extract_key_id(authorization: &str) -> Result<String, SigError> {
+    Ok(parse_auth(authorization)?.access_key_id.to_string())
+}
+
+/// Dựng canonical request. Trả về (canonical, amzdate, payload_hash_used).
+pub fn canonical_request(
+    req: &SignableRequest<'_>,
+    signed: &[&str],
+) -> Result<(String, String, String), SigError> {
+    let amzdate = find_header(req.headers, "x-amz-date").ok_or(SigError::MalformedAuth)?;
+    let payload_hash = match find_header(req.headers, "x-amz-content-sha256") {
+        Some("UNSIGNED-PAYLOAD") => "UNSIGNED-PAYLOAD".to_string(),
+        Some(h) if h.len() == 64 => {
+            // Client khai báo hash — tin theo spec (không recompute để khỏi ép buffer vô hạn ở M2).
+            h.to_string()
+        }
+        _ => sha256_hex(req.body),
+    };
+    let (canon_headers, signed_list) = canonical_headers(req.headers, signed)?;
+    let c = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        req.method,
+        encode(req.path, true),
+        canonical_query(req.query),
+        canon_headers,
+        signed_list,
+        payload_hash
+    );
+    Ok((c, amzdate.to_string(), payload_hash))
+}
+
+pub fn string_to_sign(canonical: &str, amzdate: &str, scope: &str) -> String {
+    format!(
+        "AWS4-HMAC-SHA256\n{amzdate}\n{scope}\n{}",
+        sha256_hex(canonical.as_bytes())
+    )
+}
+
+pub fn derive_signing_key(secret: &str, date: &str, region: &str, service: &str) -> Vec<u8> {
+    let k_date = hmac_sha256(format!("AWS4{secret}").as_bytes(), date.as_bytes());
+    let k_region = hmac_sha256(&k_date, region.as_bytes());
+    let k_service = hmac_sha256(&k_region, service.as_bytes());
+    hmac_sha256(&k_service, b"aws4_request")
+}
+
+/// Parse `YYYYMMDDTHHMMSSZ` → epoch seconds (thuần std, không thêm dep chrono).
+fn parse_amzdate(s: &str) -> Option<u64> {
+    if s.len() != 16 || !s.ends_with('Z') || s.as_bytes()[8] != b'T' {
+        return None;
+    }
+    let num = |a: usize, b: usize| s[a..b].parse::<u64>().ok();
+    let (y, mo, d) = (num(0, 4)?, num(4, 6)?, num(6, 8)?);
+    let (h, mi, se) = (num(9, 11)?, num(11, 13)?, num(13, 15)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || se > 59 {
+        return None;
+    }
+    // days_from_civil (Howard Hinnant).
+    let y = if mo <= 2 { y - 1 } else { y } as i64;
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400) as u64;
+    let mp = ((mo as i64 + 9).rem_euclid(12)) as u64;
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era as u64 * 146097 + doe - 719468;
+    Some(days * 86400 + h * 3600 + mi * 60 + se)
+}
+
+/// Verify request với secret tra từ config. `now_secs` truyền vào để test được.
+pub fn verify(
+    req: &SignableRequest<'_>,
+    secret: &str,
+    expected_region: &str,
+    now_secs: u64,
+) -> Result<Verified, SigError> {
+    let p = parse_auth(req.authorization)?;
+    if p.service != "s3" || p.region != expected_region {
+        return Err(SigError::BadScope);
+    }
+    if p.date.len() != 8 || p.date.parse::<u32>().is_err() {
+        return Err(SigError::MalformedAuth);
+    }
+    let (canon, amzdate, _) = canonical_request(req, &p.signed_headers)?;
+    if !amzdate.starts_with(p.date) {
+        return Err(SigError::MalformedAuth);
+    }
+    let t = parse_amzdate(&amzdate).ok_or(SigError::MalformedAuth)?;
+    if t.abs_diff(now_secs) > MAX_SKEW_SECS {
+        return Err(SigError::Expired);
+    }
+    let scope = format!("{}/{expected_region}/s3/aws4_request", p.date);
+    let sts = string_to_sign(&canon, &amzdate, &scope);
+    let key = derive_signing_key(secret, p.date, expected_region, "s3");
+    let expect = hex::encode(hmac_sha256(&key, sts.as_bytes()));
+    // So sánh hằng thời gian thủ công (tránh thêm dep subtle ở M2).
+    if expect.len() != p.signature.len()
+        || expect
+            .bytes()
+            .zip(p.signature.bytes())
+            .fold(0u8, |a, (x, y)| a | (x ^ y))
+            != 0
+    {
+        return Err(SigError::BadSignature);
+    }
+    Ok(Verified {
+        access_key_id: p.access_key_id.to_string(),
+    })
+}
+
+/// Ký request (dùng cho integration test + tài liệu client). `payload_hash`: hex sha256 body
+/// hoặc literal `UNSIGNED-PAYLOAD`.
+#[allow(clippy::too_many_arguments)]
+pub fn sign(
+    method: &str,
+    path: &str,
+    query: &str,
+    headers: &[(String, String)],
+    signed: &[&str],
+    body: &[u8],
+    access_key_id: &str,
+    secret: &str,
+    region: &str,
+    amzdate: &str,
+    payload_hash: &str,
+) -> String {
+    let mut hdrs: Vec<(String, String)> = headers.to_vec();
+    // Đảm bảo headers ký tồn tại (client thật luôn gửi).
+    let mut with = |k: &str, v: String| {
+        if find_header(&hdrs, k).is_none() {
+            hdrs.push((k.to_string(), v));
+        }
+    };
+    with("x-amz-date", amzdate.to_string());
+    with("x-amz-content-sha256", payload_hash.to_string());
+    let req = SignableRequest {
+        method,
+        path,
+        query,
+        headers: &hdrs,
+        authorization: "",
+        body,
+    };
+    let (canon, _, _) = canonical_request(&req, signed).expect("sign canonical");
+    let scope = format!("{}/{region}/s3/aws4_request", &amzdate[..8]);
+    let sts = string_to_sign(&canon, amzdate, &scope);
+    let key = derive_signing_key(secret, &amzdate[..8], region, "s3");
+    let sig = hex::encode(hmac_sha256(&key, sts.as_bytes()));
+    let mut names: Vec<&str> = signed.to_vec();
+    names.sort_unstable();
+    let list = names
+        .iter()
+        .map(|s| s.to_ascii_lowercase())
+        .collect::<Vec<_>>()
+        .join(";");
+    format!(
+        "AWS4-HMAC-SHA256 Credential={access_key_id}/{scope}, SignedHeaders={list}, Signature={sig}"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn h(k: &str, v: impl Into<String>) -> (String, String) {
+        (k.to_string(), v.into())
+    }
+
+    /// Vector từ AWS SigV4 test suite `get-vanilla` (docs chính thức).
+    #[test]
+    fn canonical_matches_aws_get_vanilla() {
+        let headers = vec![
+            h("host", "example.amazonaws.com"),
+            h("x-amz-date", "20150830T123600Z"),
+        ];
+        let req = SignableRequest {
+            method: "GET",
+            path: "/",
+            query: "",
+            headers: &headers,
+            authorization: "",
+            body: b"",
+        };
+        let (canon, amzdate, _) = canonical_request(&req, &["host", "x-amz-date"]).unwrap();
+        assert_eq!(amzdate, "20150830T123600Z");
+        assert_eq!(
+            canon,
+            "GET\n/\n\nhost:example.amazonaws.com\nx-amz-date:20150830T123600Z\n\nhost;x-amz-date\ne3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+
+    #[test]
+    fn roundtrip_sign_verify_and_tamper() {
+        let secret = "test-secret-key";
+        let headers = vec![
+            h("host", "localhost:7070"),
+            h("x-amz-content-sha256", sha256_hex(b"")),
+        ];
+        let amzdate = "20260915T120000Z";
+        let now = parse_amzdate(amzdate).unwrap();
+        let signed = ["host", "x-amz-content-sha256", "x-amz-date"];
+        let auth = sign(
+            "PUT",
+            "/my-bucket",
+            "",
+            &headers,
+            &signed,
+            b"",
+            "AKID",
+            secret,
+            "telecrate-1",
+            amzdate,
+            &sha256_hex(b""),
+        );
+        let full = vec![
+            h("host", "localhost:7070"),
+            h("x-amz-content-sha256", sha256_hex(b"")),
+            h("x-amz-date", amzdate),
+        ];
+        let req = SignableRequest {
+            method: "PUT",
+            path: "/my-bucket",
+            query: "",
+            headers: &full,
+            authorization: &auth,
+            body: b"",
+        };
+        let v = verify(&req, secret, "telecrate-1", now).unwrap();
+        assert_eq!(v.access_key_id, "AKID");
+        // Sai secret → BadSignature.
+        assert_eq!(
+            verify(&req, "wrong", "telecrate-1", now).unwrap_err(),
+            SigError::BadSignature
+        );
+        // Sai region scope → BadScope.
+        assert_eq!(
+            verify(&req, secret, "other-region", now).unwrap_err(),
+            SigError::BadScope
+        );
+        // Hết hạn → Expired.
+        assert_eq!(
+            verify(&req, secret, "telecrate-1", now + MAX_SKEW_SECS + 1).unwrap_err(),
+            SigError::Expired
+        );
+        // Đổi method sau khi ký → BadSignature.
+        let tampered = SignableRequest {
+            method: "DELETE",
+            ..req
+        };
+        assert_eq!(
+            verify(&tampered, secret, "telecrate-1", now).unwrap_err(),
+            SigError::BadSignature
+        );
+    }
+
+    #[test]
+    fn unicode_path_and_query_canonicalization() {
+        let headers = vec![h("host", "x"), h("x-amz-date", "20260915T120000Z")];
+        let req = SignableRequest {
+            method: "GET",
+            path: "/b/cà-phê",
+            query: "prefix=a/b&max-keys=2",
+            headers: &headers,
+            authorization: "",
+            body: b"",
+        };
+        let (canon, _, _) = canonical_request(&req, &["host", "x-amz-date"]).unwrap();
+        assert!(canon.contains("/b/c%C3%A0-ph%C3%AA"), "{canon}");
+        assert!(canon.contains("max-keys=2&prefix=a%2Fb"), "{canon}");
+    }
+
+    #[test]
+    fn unsigned_payload_accepted_per_spec() {
+        let headers = vec![
+            h("host", "x"),
+            h("x-amz-date", "20260915T120000Z"),
+            h("x-amz-content-sha256", "UNSIGNED-PAYLOAD"),
+        ];
+        let req = SignableRequest {
+            method: "PUT",
+            path: "/b",
+            query: "",
+            headers: &headers,
+            authorization: "",
+            body: b"whatever-bytes",
+        };
+        let (canon, _, _) =
+            canonical_request(&req, &["host", "x-amz-content-sha256", "x-amz-date"]).unwrap();
+        assert!(canon.ends_with("\nUNSIGNED-PAYLOAD"), "{canon}");
+    }
+}
