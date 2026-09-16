@@ -1,0 +1,35 @@
+# Cấu hình mẫu sản phẩm TeleCrate (production /etc/telecrate/telecrate.toml)
+
+# Đường dẫn lưu trữ cơ sở dữ liệu chỉ mục SQLite (chế độ WAL tự động)
+db_path = "/var/lib/telecrate/index.db"
+
+# Thư mục lưu trữ tạm spool cho các chunk dữ liệu local-first
+spool_dir = "/var/lib/telecrate/spool"
+
+# Cổng HTTP phục vụ đồng thời S3 Gateway, Admin REST API và Web Dashboard
+listen_port = 7070
+
+# Mã hóa dữ liệu nội dung: "off" | "on" (ChaCha20-Poly1305 AEAD)
+encryption = "off"
+
+# Vùng phục vụ S3 SigV4 region
+region = "us-east-1"
+
+# Mật khẩu quản trị Web Dashboard & Admin API (khuyên dùng đổi mật khẩu khi vận hành)
+admin_password = "telecrate-change-this-password"
+
+# Access keys tĩnh mặc định khởi tạo
+[[access_keys]]
+access_key_id = "AKIAEXAMPLE12345"
+secret_key = "secret1234567890secret1234567890"
+
+# Cấu hình kết nối Telegram Bot API làm backend lưu trữ bền vững
+telegram_bot_token = ""
+telegram_chat_id = 0
+telegram_base_url = "https://api.telegram.org"
+
+# Kích thước chunk upload Telegram (mặc định 8 MiB)
+chunk_size_bytes = 8388608
+
+# Số lượng worker đồng thời tải dữ liệu lên Telegram nền (1..8)
+worker_concurrency = 2

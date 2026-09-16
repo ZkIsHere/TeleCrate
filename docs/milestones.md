@@ -53,7 +53,13 @@
 - **5.4: `implemented-and-tested` (2026-09-16)** — Integrity Verification, Doctor & Scrubbing Engine (`telecrate doctor`, `telecrate verify`, `telecrate scrub`), local spool hash validation, remote Telegram presence check, and automatic error detection/fixing.
 - **5.5: `implemented-and-tested` (2026-09-16)** — Integration test suites (`tests/backup_restore_api.rs`, `tests/gc_api.rs`, `tests/doctor_recovery_api.rs`) and CLI subcommands wired in `src/main.rs`.
 - **5.6: `implemented-and-tested` (2026-09-16)** — Complete code quality and verification pass (`cargo fmt`, `clippy -D warnings`, full test suite pass). Chính thức đóng M5. TIẾP THEO: M6 (CLI + dashboard đầy đủ, packaging Linux, docs install/admin/recovery).
-- **M6 — CLI + dashboard đầy đủ, packaging Linux, docs install/admin/recovery**.
+- **M6 — CLI + dashboard đầy đủ, packaging Linux, docs install/admin/recovery: `implemented-and-tested` (cập nhật 2026-09-16)**.
+  Breakdown: 6.1 (Admin REST API & Embedded Web Dashboard) → 6.2 (Complete CLI & Socket/API Client) → 6.3 (Linux Packaging & Systemd Hardening) → 6.4 (Operational Documentation) → 6.5 (Integration Testing & Verification).
+- **6.1: `implemented-and-tested` (2026-09-16)** — Admin REST API (`src/admin.rs`), Session Cookie protection, CSRF token validation, secret redaction engine, and embedded Web Dashboard HTML/CSS/JS frontend (`src/dashboard/`).
+- **6.2: `implemented-and-tested` (2026-09-16)** — CLI client module (`src/cli.rs`) enforcing architectural rule: CLI routes operations via Admin REST API when daemon is running to avoid SQLite lock conflicts.
+- **6.3: `implemented-and-tested` (2026-09-16)** — Systemd service unit (`packaging/telecrate.service`) with Linux native security hardening, sample config (`packaging/telecrate.sample.toml`), and packaging scripts (`build-deb.sh`, `build-rpm.sh`).
+- **6.4: `implemented-and-tested` (2026-09-16)** — Operational guides: installation (`docs/install.md`), administration (`docs/admin.md`), and disaster recovery (`docs/disaster-recovery.md`).
+- **6.5: `implemented-and-tested` (2026-09-16)** — Complete code quality and verification pass (`cargo fmt`, `clippy -D warnings`, full test suite pass including `tests/admin_api.rs`). Chính thức đóng M6. TIẾP THEO: M7 (Conformance AWS CLI/rclone, fixture 25k objects/62 GB mô phỏng, live Telegram nhỏ có kiểm soát, gap report advanced).
 - **M7 — Conformance (AWS CLI, rclone, SDK), fixture 25k objects/62 GB mô phỏng, live Telegram nhỏ có kiểm soát, gap report advanced**.
 
 Không dừng ở demo upload/download rồi tuyên bố xong. Mỗi milestone chỉ sang tiếp khi required checks của SHA đó xanh.

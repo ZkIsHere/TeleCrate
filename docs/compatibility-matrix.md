@@ -3,7 +3,7 @@
 > Trạng thái: `implemented-and-tested` | `implemented-unverified` | `partial` | `blocked` | `unsupported`.
 > Semantics theo S3 API Reference chính thức (kiểm tra 2026-09-15). Không suy đoán từ tên API.
 > M0 (bootstrap): toàn bộ S3 ở `unsupported` trừ health/config — đúng quy tắc "không mock 200".
-> Cập nhật 2026-09-16 (sau M5.6): Milestone M5 đã hoàn tất (`implemented-and-tested`) bao gồm Database Online Backup & AEAD Passphrase Restore, Physical Garbage Collection Engine (Spool & Remote Telegram respecting WORM), Standalone Recovery Bundle Export/Import (JSON plain & AEAD encrypted), Integrity Verification Engine (`telecrate doctor`, `verify`, `scrub`), và các integration test suites đầy đủ.
+> Cập nhật 2026-09-16 (sau M6.5): Milestone M6 đã hoàn tất (`implemented-and-tested`) bao gồm Admin REST API & Session Cookie/CSRF Authentication, Embedded Web Dashboard UI, CLI Client API integration (tránh SQLite lock), Systemd Native Hardening Service (`telecrate.service`), Linux Packaging (.deb, .rpm, tarball) và bộ tài liệu vận hành/khôi phục thảm họa đầy đủ.
 
 ## Telegram transport (ngoài S3 — nền tảng TeleCrate)
 

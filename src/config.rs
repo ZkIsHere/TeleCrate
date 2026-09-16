@@ -57,6 +57,9 @@ pub struct Config {
     /// Key id dùng cho ghi mới (rỗng = key đầu tiên). Đổi id = rotation cho ghi mới.
     #[serde(default)]
     pub content_key_id: String,
+    /// Mật khẩu đăng nhập Web Dashboard & Admin API (tùy chọn).
+    #[serde(default)]
+    pub admin_password: Option<String>,
 }
 
 /// Một khóa mã hóa: chỉ id + đường dẫn file (không bao giờ chứa key material).
@@ -119,6 +122,7 @@ impl Default for Config {
             worker_concurrency: default_worker_concurrency(),
             content_keys: Vec::new(),
             content_key_id: String::new(),
+            admin_password: None,
         }
     }
 }

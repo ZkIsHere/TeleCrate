@@ -1,0 +1,30 @@
+[Unit]
+Description=TeleCrate S3-Compatible Object Storage Gateway
+Documentation=https://github.com/ZkIsHere/TeleCrate
+After=network.target network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=telecrate
+Group=telecrate
+WorkingDirectory=/var/lib/telecrate
+ExecStart=/usr/bin/telecrate --config /etc/telecrate/telecrate.toml serve
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+# Security & Isolation Hardening (Systemd Native)
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+ReadWritePaths=/var/lib/telecrate /var/log/telecrate /run/telecrate
+
+[Install]
+WantedBy=multi-user.target

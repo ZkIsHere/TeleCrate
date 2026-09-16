@@ -2,7 +2,6 @@
 //! S3 buckets + SigV4 ở M2.1 (objects → 2.2) — không mock 200.
 
 use clap::{Parser, Subcommand};
-use serde_json::json;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -186,21 +185,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 .map_err(|e| format!("serve: {e}"))?;
             Ok(())
         }
-        Commands::Status => {
-            let h = telecrate::health_check(&cli.config);
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&json!({
-                    "ok": h.ok, "version": h.version, "detail": h.detail
-                }))
-                .unwrap()
-            );
-            if h.ok {
-                Ok(())
-            } else {
-                Err(h.detail)
-            }
-        }
+        Commands::Status => telecrate::cli::run_status_cli(&cli.config).await,
         Commands::Doctor => {
             let cfg = telecrate::config::load(&cli.config)?;
             let conn = telecrate::db::open(&cfg.db_path)?;
@@ -242,25 +227,7 @@ async fn run(cli: Cli) -> Result<(), String> {
                 Err("scrub detected unreachable remote chunks".into())
             }
         }
-        Commands::Gc => {
-            let cfg = telecrate::config::load(&cli.config)?;
-            let conn = telecrate::db::open(&cfg.db_path)?;
-            let cfg_route = cfg.clone();
-            let (transport, _) = tokio::task::spawn_blocking(move || {
-                (telecrate::app::build_transport(&cfg_route), ())
-            })
-            .await
-            .map_err(|e| format!("build transport: {e}"))?;
-            let stats = telecrate::gc::run_gc(
-                &conn,
-                std::path::Path::new(&cfg.spool_dir),
-                transport
-                    .as_ref()
-                    .map(|t| t as &dyn telecrate::telegram::Transport),
-            )?;
-            println!("{}", serde_json::to_string_pretty(&stats).unwrap());
-            Ok(())
-        }
+        Commands::Gc => telecrate::cli::run_gc_cli(&cli.config).await,
         Commands::Db { op } => match op {
             DbOp::Backup { output, passphrase } => {
                 let cfg = telecrate::config::load(&cli.config)?;

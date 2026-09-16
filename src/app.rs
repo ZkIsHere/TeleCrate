@@ -22,13 +22,77 @@ pub fn router(
     transport: Option<telecrate::telegram::BotApiHttpTransport>,
     keys: telecrate::crypto::KeyStore,
 ) -> Router {
+    let session_store = Arc::new(telecrate::admin::SessionStore::new());
     let state = Arc::new(AppState {
-        config,
+        config: config.clone(),
         transport,
         keys,
+        session_store: session_store.clone(),
     });
+
+    let admin_state = (config, session_store);
+
     Router::new()
         .route("/health", get(health))
+        .route(
+            "/dashboard/style.css",
+            get(telecrate::admin::get_dashboard_css),
+        )
+        .route("/dashboard/app.js", get(telecrate::admin::get_dashboard_js))
+        .route(
+            "/admin/api/login",
+            axum::routing::post(telecrate::admin::api_login).with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/logout",
+            axum::routing::post(telecrate::admin::api_logout).with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/session",
+            get(telecrate::admin::api_session_status).with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/status",
+            get(telecrate::admin::api_get_status).with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/buckets",
+            get(telecrate::admin::api_list_buckets)
+                .post(telecrate::admin::api_create_bucket)
+                .with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/buckets/:name",
+            axum::routing::delete(telecrate::admin::api_delete_bucket)
+                .with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/access-keys",
+            get(telecrate::admin::api_list_access_keys)
+                .post(telecrate::admin::api_create_access_key)
+                .with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/access-keys/:id",
+            axum::routing::delete(telecrate::admin::api_revoke_access_key)
+                .with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/gc",
+            axum::routing::post(telecrate::admin::api_run_gc).with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/doctor",
+            axum::routing::post(telecrate::admin::api_run_doctor).with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/backup",
+            axum::routing::post(telecrate::admin::api_run_backup).with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/audit-logs",
+            get(telecrate::admin::api_get_audit_logs).with_state(admin_state.clone()),
+        )
         // GET / vừa là dashboard index (không auth) vừa là S3 ListBuckets (có auth) —
         // phân biệt bằng Authorization header, ghi rõ ở docs (M2.1).
         .route("/", get(root_get))
@@ -68,6 +132,8 @@ struct AppState {
     transport: Option<telecrate::telegram::BotApiHttpTransport>,
     /// KeyStore chỉ chứa key material trong RAM — không Debug/log.
     keys: telecrate::crypto::KeyStore,
+    #[allow(dead_code)]
+    session_store: Arc<telecrate::admin::SessionStore>,
 }
 
 fn now_secs() -> u64 {
@@ -324,7 +390,7 @@ async fn root_get(
     raw_query: RawQuery,
 ) -> Response {
     if !headers.contains_key("authorization") {
-        return "TeleCrate M2 — dashboard đầy đủ ở M6.".into_response();
+        return telecrate::admin::get_dashboard_html().await;
     }
     let request_id = telecrate::s3::new_request_id();
     let query = raw_query.0.as_deref().unwrap_or("");
