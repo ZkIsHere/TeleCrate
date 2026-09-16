@@ -3,7 +3,7 @@
 > Trạng thái: `implemented-and-tested` | `implemented-unverified` | `partial` | `blocked` | `unsupported`.
 > Semantics theo S3 API Reference chính thức (kiểm tra 2026-09-15). Không suy đoán từ tên API.
 > M0 (bootstrap): toàn bộ S3 ở `unsupported` trừ health/config — đúng quy tắc "không mock 200".
-> Cập nhật 2026-09-16 (sau M3.6): Milestone M3 đã hoàn tất (`implemented-and-tested`) bao gồm Multipart Upload API (6 endpoints), CopyObject & Metadata, Conditional Requests & Advanced Range (304/412/206/416), Bucket/Object Versioning & Delete Markers, Spool Reconciliation & 10 ranh giới Crash Injection.
+> Cập nhật 2026-09-16 (sau M4.6): Milestone M4 đã hoàn tất (`implemented-and-tested`) bao gồm Presigned URLs & POST Form Policy Upload, Multi-Access Keys & Clock Skew (±15m), CORS Engine & Bucket Policy Engine with Deny precedence, Block Public Access (BPA), SSE-S3 & SSE-C Cryptographic Validation, và Object Lock WORM Gateway (GOVERNANCE/COMPLIANCE mode retention & Legal Hold).
 
 ## Telegram transport (ngoài S3 — nền tảng TeleCrate)
 
@@ -16,7 +16,7 @@
 | Channel `-100...` admin tối thiểu / `channels.deleteMessages` | blocked | ràng buộc nền tảng: nâng supergroup bất khả thi ở môi trường này — không chặn M2/M3 |
 | Local Bot API / MTProto bot | unsupported | chờ capability test |
 
-## Bucket (cập nhật 2026-09-16 — M3.5)
+## Bucket (cập nhật 2026-09-16 — M4.6)
 
 | Operation | Trạng thái | Ghi chú |
 |---|---|---|
@@ -24,9 +24,11 @@
 | GetBucketLocation | implemented-and-tested | integration test |
 | Bucket naming rules | implemented-and-tested | 3-63 ký tự, lowercase/số/`.-` |
 | Bucket Versioning (`PUT/GET /{bucket}?versioning`) | implemented-and-tested | Hỗ trợ `Enabled` và `Suspended` |
-| Bucket policy, CORS, BPA | unsupported | M4 |
+| Bucket CORS (`PUT/GET/DELETE /{bucket}?cors` & OPTIONS preflight) | implemented-and-tested | Dynamic header reflection & origin/method/header matching |
+| Bucket policy & BPA (`PUT/GET/DELETE /{bucket}?policy`, `?publicAccessBlock`) | implemented-and-tested | Evaluator Deny precedence, BPA block public policy/access |
+| Bucket Object Lock Config (`PUT/GET /{bucket}?object-lock`) | implemented-and-tested | Enable Object Lock WORM configuration |
 
-## Object (cập nhật 2026-09-16 — M3.5)
+## Object (cập nhật 2026-09-16 — M4.6)
 
 | Operation | Trạng thái | Ghi chú |
 |---|---|---|
@@ -39,8 +41,10 @@
 | Wrong key / tamper / reorder / truncate | fail-đóng-đã-test | 500 `cannot decrypt`, không lộ key; unit + integration |
 | DeleteObjects (≤100 keys, hỗ trợ VersionId & Delete Markers) | implemented-and-tested | integration test |
 | Range request (`bytes=a-b/a-/-suffix`, 206/416, If-Range) | implemented-and-tested | Cắt range chính xác across chunk boundaries; 416 `RangeNotSatisfiable` |
+| SSE-S3 / SSE-C Encryption Validation | implemented-and-tested | Validates `AES256`, 256-bit Base64 customer key & Base64 MD5 checksum |
+| Object Lock Retention & Legal Hold (`?retention`, `?legal-hold`) | implemented-and-tested | GOVERNANCE/COMPLIANCE WORM retention, bypass header, Legal Hold guard |
 
-## Listing / Multipart / HTTP / Auth (M3.2)
+## Listing / Multipart / HTTP / Auth (M4.6)
 
 | Operation | Trạng thái | Ghi chú |
 |---|---|---|
@@ -48,7 +52,8 @@
 | ListObjectVersions (`GET /{bucket}?versions`) | implemented-and-tested | Đánh dấu `IsLatest` chính xác theo version mới nhất |
 | S3 Multipart Upload API (Create, UploadPart, ListParts, Complete, Abort, ListUploads) | implemented-and-tested | 6 endpoints tương thích chuẩn XML S3, multipart ETag |
 | SigV4 header auth / Unsigned payload | implemented-and-tested | integration tests qua HTTP thật |
-| Presigned URL / POST Policy | unsupported | M4 |
+| Presigned URL / POST Policy Upload | implemented-and-tested | Query parameter authentication & HTML Form POST upload validation |
+| Multi-Access Keys / Clock Skew | implemented-and-tested | SQLite `access_keys` active check & ±15m timestamp window |
 
 ## Crash Recovery & Durability (M3.6)
 

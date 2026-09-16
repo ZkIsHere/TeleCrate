@@ -47,7 +47,7 @@ pub fn new_request_id() -> String {
     uuid::Uuid::new_v4().simple().to_string()
 }
 
-fn xml_escape(s: &str) -> String {
+pub fn xml_escape(s: &str) -> String {
     let mut o = String::with_capacity(s.len());
     for c in s.chars() {
         match c {
@@ -742,6 +742,177 @@ pub fn list_object_versions_xml(
         xml_escape(version_id_marker),
         items_xml,
     )
+}
+
+pub fn parse_iso_date(s: &str) -> Option<u64> {
+    let clean = s.replace(['-', ':'], "").replace(".000", "");
+    if clean.len() >= 15 && clean.as_bytes()[8] == b'T' {
+        let num = |a: usize, b: usize| clean[a..b].parse::<u64>().ok();
+        let (y, mo, d) = (num(0, 4)?, num(4, 6)?, num(6, 8)?);
+        let (h, mi, se) = (num(9, 11)?, num(11, 13)?, num(13, 15)?);
+        if (1..=12).contains(&mo) && (1..=31).contains(&d) && h <= 23 && mi <= 59 && se <= 59 {
+            let y = if mo <= 2 { y - 1 } else { y } as i64;
+            let era = y.div_euclid(400);
+            let yoe = y.rem_euclid(400) as u64;
+            let mp = ((mo as i64 + 9).rem_euclid(12)) as u64;
+            let doy = (153 * mp + 2) / 5 + d - 1;
+            let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+            let days = era as u64 * 146097 + doe - 719468;
+            return Some(days * 86400 + h * 3600 + mi * 60 + se);
+        }
+    }
+    None
+}
+
+pub fn base64_decode(input: &str) -> Option<Vec<u8>> {
+    let input = input.trim();
+    let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut map = [255u8; 256];
+    for (i, &b) in table.iter().enumerate() {
+        map[b as usize] = i as u8;
+    }
+    let mut out = Vec::new();
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'=' || bytes[i].is_ascii_whitespace() {
+            i += 1;
+            continue;
+        }
+        let b1 = map[bytes[i] as usize];
+        if b1 == 255 {
+            return None;
+        }
+        i += 1;
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'=' {
+            break;
+        }
+        let b2 = map[bytes[i] as usize];
+        if b2 == 255 {
+            return None;
+        }
+        i += 1;
+        out.push((b1 << 2) | (b2 >> 4));
+
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'=' {
+            break;
+        }
+        let b3 = map[bytes[i] as usize];
+        if b3 == 255 {
+            return None;
+        }
+        i += 1;
+        out.push(((b2 & 0x0F) << 4) | (b3 >> 2));
+
+        while i < bytes.len() && bytes[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] == b'=' {
+            break;
+        }
+        let b4 = map[bytes[i] as usize];
+        if b4 == 255 {
+            return None;
+        }
+        i += 1;
+        out.push(((b3 & 0x03) << 6) | b4);
+    }
+    Some(out)
+}
+
+pub fn base64_encode(input: &[u8]) -> String {
+    let table = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
+    for chunk in input.chunks(3) {
+        let b0 = chunk[0] as u32;
+        let b1 = if chunk.len() > 1 { chunk[1] as u32 } else { 0 };
+        let b2 = if chunk.len() > 2 { chunk[2] as u32 } else { 0 };
+        let triple = (b0 << 16) | (b1 << 8) | b2;
+
+        out.push(table[((triple >> 18) & 0x3F) as usize] as char);
+        out.push(table[((triple >> 12) & 0x3F) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(table[((triple >> 6) & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(table[(triple & 0x3F) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+pub fn parse_and_validate_post_policy(
+    policy_b64: &str,
+    bucket: &str,
+    key: &str,
+    body_len: u64,
+    now_secs: u64,
+) -> Result<(), &'static str> {
+    let bytes = base64_decode(policy_b64).ok_or("MalformedPolicy")?;
+    let val: serde_json::Value = serde_json::from_slice(&bytes).map_err(|_| "MalformedPolicy")?;
+
+    if let Some(exp_str) = val.get("expiration").and_then(|v| v.as_str()) {
+        if let Some(exp_secs) = parse_iso_date(exp_str) {
+            if now_secs > exp_secs {
+                return Err("PolicyExpired");
+            }
+        }
+    }
+
+    if let Some(conditions) = val.get("conditions").and_then(|v| v.as_array()) {
+        for cond in conditions {
+            if let Some(obj) = cond.as_object() {
+                if let Some(b) = obj.get("bucket").and_then(|v| v.as_str()) {
+                    if b != bucket {
+                        return Err("PolicyConditionFailed");
+                    }
+                }
+                if let Some(k) = obj.get("key").and_then(|v| v.as_str()) {
+                    if k != key {
+                        return Err("PolicyConditionFailed");
+                    }
+                }
+            } else if let Some(arr) = cond.as_array() {
+                if arr.len() >= 3 {
+                    let op = arr[0].as_str().unwrap_or("");
+                    let var = arr[1].as_str().unwrap_or("");
+                    if op == "content-length-range" {
+                        let min_len = arr[1].as_u64().unwrap_or(0);
+                        let max_len = arr[2].as_u64().unwrap_or(u64::MAX);
+                        if body_len < min_len || body_len > max_len {
+                            return Err("EntityTooLarge");
+                        }
+                    } else if op == "eq" {
+                        let val_str = arr[2].as_str().unwrap_or("");
+                        if (var == "$bucket" && val_str != bucket)
+                            || (var == "$key" && val_str != key)
+                        {
+                            return Err("PolicyConditionFailed");
+                        }
+                    } else if op == "starts-with" {
+                        let val_str = arr[2].as_str().unwrap_or("");
+                        if (var == "$key" && !key.starts_with(val_str))
+                            || (var == "$bucket" && !bucket.starts_with(val_str))
+                        {
+                            return Err("PolicyConditionFailed");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

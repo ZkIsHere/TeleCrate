@@ -37,7 +37,14 @@
 - **3.4: `implemented-and-tested` (2026-09-16)** — HTTP Conditional Headers (If-Match, If-None-Match 304/412, If-Modified-Since, If-Unmodified-Since), If-Range, 206 Partial Content, 416 Range Not Satisfiable.
 - **3.5: `implemented-and-tested` (2026-09-16)** — Bucket Versioning (Enabled/Suspended), Delete Markers, ListObjectVersions, versioned GET/HEAD/DELETE (`?versionId=...`).
 - **3.6: `implemented-and-tested` (2026-09-16)** — Spool reconciliation extension for orphaned multipart parts & 10 crash point boundaries in `tests/crash_injection.rs`. Chính thức đóng M3. TIẾP THEO: M4 (Auth, Presigned URLs, Policies, CORS, SSE).
-- **M4 — Auth hoàn chỉnh (presigned/POST policy), policies/ACL/BPA/CORS, SSE hành vi đúng, Object Lock gateway**.
+- **M4 — Auth hoàn chỉnh (presigned/POST policy), policies/ACL/BPA/CORS, SSE hành vi đúng, Object Lock gateway: `implemented-and-tested` (cập nhật 2026-09-16)**.
+  Breakdown: 4.1 (Migration 0003 & DB DAL) → 4.2 (Presigned URLs, POST Form Policy, Multi-Access Keys, Clock Skew) → 4.3 (CORS Engine, Bucket Policies, BPA) → 4.4 (SSE-S3 & SSE-C Cryptographic Validation) → 4.5 (Object Lock WORM Governance/Compliance & Legal Hold) → 4.6 (Full Suite Verification).
+- **4.1: `implemented-and-tested` (2026-09-16)** — Schema Migration 0003 (`access_keys`, `bucket_cors`, `bucket_policies`, `bucket_bpa`, `bucket_object_lock`, `object_locks`) & DB DAL.
+- **4.2: `implemented-and-tested` (2026-09-16)** — Presigned URLs (SigV4 query auth), POST Form Policy upload & condition evaluation (`content-length-range`, `eq`, `starts-with`), Multi-Access Keys authorization (`status='active'`), Clock Skew enforcement (±15m).
+- **4.3: `implemented-and-tested` (2026-09-16)** — CORS Engine (XML config, OPTIONS preflight matching), Bucket Policy evaluator (Deny precedence, principal matching, action wildcarding), Block Public Access (BPA) enforcement & public policy rejection.
+- **4.4: `implemented-and-tested` (2026-09-16)** — SSE-S3 (`AES256` default encryption headers) and SSE-C (256-bit Base64 customer key validation & Base64 MD5 checksum verification).
+- **4.5: `implemented-and-tested` (2026-09-16)** — Object Lock WORM Gateway (`?object-lock`, `?retention`, `?legal-hold`), GOVERNANCE/COMPLIANCE mode retention enforcement, bypass header (`x-amz-bypass-governance-retention`), Legal Hold 403 AccessDenied guard.
+- **4.6: `implemented-and-tested` (2026-09-16)** — Complete code quality and verification pass (cargo fmt, clippy -D warnings, full test suite pass). Chính thức đóng M4. TIẾP THEO: M5 (GC, recovery bundle, doctor/verify/scrub, backup/restore index).
 - **M5 — GC, recovery bundle, doctor/verify/scrub, backup/restore index**.
 - **M6 — CLI + dashboard đầy đủ, packaging Linux, docs install/admin/recovery**.
 - **M7 — Conformance (AWS CLI, rclone, SDK), fixture 25k objects/62 GB mô phỏng, live Telegram nhỏ có kiểm soát, gap report advanced**.

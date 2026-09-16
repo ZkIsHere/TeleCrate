@@ -2,8 +2,10 @@
 
 pub mod app;
 pub mod config;
+pub mod cors;
 pub mod crypto;
 pub mod db;
+pub mod policy;
 pub mod s3;
 pub mod sigv4;
 pub mod spool;

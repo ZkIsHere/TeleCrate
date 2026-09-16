@@ -39,7 +39,8 @@ pub fn router(
                 .put(create_bucket)
                 .delete(delete_bucket)
                 .head(head_bucket)
-                .post(bucket_post),
+                .post(bucket_post)
+                .options(bucket_options),
         )
         // Object key có thể chứa `/` → wildcard (axum 0.7: `*key`).
         .route(
@@ -48,7 +49,8 @@ pub fn router(
                 .put(put_object)
                 .delete(delete_object)
                 .head(head_object)
-                .post(post_object),
+                .post(post_object)
+                .options(object_options),
         )
         // Giới hạn body do từng handler tự ép (PUT object 16 MiB ở M2.2),
         // không để axum 413 sớm với 2 MiB mặc định.
@@ -97,11 +99,22 @@ struct AuthInput<'a> {
     request_id: &'a str,
 }
 
-/// Xác thực SigV4 header. Trả access key id hoặc S3Error (không chứa secret).
-fn authenticate(
-    cfg: &telecrate::config::Config,
-    input: &AuthInput<'_>,
-) -> Result<String, telecrate::s3::S3Error> {
+fn find_secret_key(state: &AppState, key_id: &str) -> Option<String> {
+    if let Some(s) = state.config.find_secret(key_id) {
+        return Some(s.to_string());
+    }
+    if let Ok(conn) = telecrate::db::open(&state.config.db_path) {
+        if let Ok(Some(k)) = telecrate::db::get_access_key(&conn, key_id) {
+            if k.status == "Active" {
+                return Some(k.secret_key);
+            }
+        }
+    }
+    None
+}
+
+/// Xác thực SigV4 header hoặc presigned query. Trả access key id hoặc S3Error.
+fn authenticate(state: &AppState, input: &AuthInput<'_>) -> Result<String, telecrate::s3::S3Error> {
     use telecrate::s3::{sig_error_to_s3, S3Error};
     let AuthInput {
         method,
@@ -112,29 +125,108 @@ fn authenticate(
         resource,
         request_id,
     } = *input;
+
     let auth = headers
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
-    if auth.is_empty() {
-        return Err(S3Error::access_denied(resource, request_id));
+
+    if !auth.is_empty() {
+        let key_id = telecrate::sigv4::extract_key_id(auth)
+            .map_err(|e| sig_error_to_s3(e, resource, request_id))?;
+        let secret = find_secret_key(state, &key_id).ok_or_else(|| {
+            sig_error_to_s3(telecrate::sigv4::SigError::UnknownKey, resource, request_id)
+        })?;
+        let req = telecrate::sigv4::SignableRequest {
+            method,
+            path,
+            query,
+            headers: &header_pairs(headers),
+            authorization: auth,
+            body,
+        };
+        let v = telecrate::sigv4::verify(&req, &secret, &state.config.region, now_secs())
+            .map_err(|e| sig_error_to_s3(e, resource, request_id))?;
+        return Ok(v.access_key_id);
     }
-    let key_id = telecrate::sigv4::extract_key_id(auth)
-        .map_err(|e| sig_error_to_s3(e, resource, request_id))?;
-    let secret = cfg.find_secret(&key_id).ok_or_else(|| {
-        sig_error_to_s3(telecrate::sigv4::SigError::UnknownKey, resource, request_id)
-    })?;
-    let req = telecrate::sigv4::SignableRequest {
-        method,
-        path,
-        query,
-        headers: &header_pairs(headers),
-        authorization: auth,
-        body,
-    };
-    let v = telecrate::sigv4::verify(&req, secret, &cfg.region, now_secs())
-        .map_err(|e| sig_error_to_s3(e, resource, request_id))?;
-    Ok(v.access_key_id)
+
+    if query.contains("X-Amz-Algorithm") || query.contains("X-Amz-Credential") {
+        let key_id = telecrate::sigv4::extract_key_id_from_query(query)
+            .map_err(|e| sig_error_to_s3(e, resource, request_id))?;
+        let secret = find_secret_key(state, &key_id).ok_or_else(|| {
+            sig_error_to_s3(telecrate::sigv4::SigError::UnknownKey, resource, request_id)
+        })?;
+        let req = telecrate::sigv4::SignableRequest {
+            method,
+            path,
+            query,
+            headers: &header_pairs(headers),
+            authorization: "",
+            body,
+        };
+        let v = telecrate::sigv4::verify_presigned(&req, &secret, &state.config.region, now_secs())
+            .map_err(|e| sig_error_to_s3(e, resource, request_id))?;
+        return Ok(v.access_key_id);
+    }
+
+    Err(S3Error::access_denied(resource, request_id))
+}
+
+fn check_auth_with_policy(
+    state: &AppState,
+    action: &str,
+    bucket: Option<&str>,
+    key: Option<&str>,
+    input: &AuthInput<'_>,
+) -> Result<String, telecrate::s3::S3Error> {
+    use telecrate::s3::S3Error;
+    let auth_res = authenticate(state, input);
+
+    if let Some(bkt) = bucket {
+        if let Ok(conn) = telecrate::db::open(&state.config.db_path) {
+            let policy_opt = telecrate::db::get_bucket_policy(&conn, bkt).ok().flatten();
+            let bpa_opt = telecrate::db::get_bucket_bpa(&conn, bkt).ok();
+
+            let user_id = match &auth_res {
+                Ok(k) => k.as_str(),
+                Err(_) => "anonymous",
+            };
+
+            if let Some(policy_json) = policy_opt {
+                let eval_res = telecrate::policy::eval_policy(
+                    &policy_json,
+                    bkt,
+                    key,
+                    action,
+                    user_id,
+                    bpa_opt.as_ref(),
+                );
+                match eval_res {
+                    telecrate::policy::PolicyEvalResult::Deny => {
+                        return Err(S3Error::new(
+                            "AccessDenied",
+                            "Access Denied by Bucket Policy",
+                            StatusCode::FORBIDDEN,
+                            input.resource,
+                            input.request_id,
+                        ));
+                    }
+                    telecrate::policy::PolicyEvalResult::Allow => {
+                        return Ok(user_id.to_string());
+                    }
+                    telecrate::policy::PolicyEvalResult::NoMatch => {
+                        if user_id == "anonymous" {
+                            return Err(auth_res.unwrap_err());
+                        } else {
+                            return Ok(user_id.to_string());
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    auth_res
 }
 
 fn xml_response(status: StatusCode, xml: String, request_id: &str) -> Response {
@@ -147,6 +239,68 @@ fn xml_response(status: StatusCode, xml: String, request_id: &str) -> Response {
             .unwrap_or_else(|_| "invalid-request-id".parse().unwrap()),
     );
     (status, headers, xml).into_response()
+}
+
+fn empty_ok_response(request_id: &str) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-amz-request-id",
+        request_id
+            .parse()
+            .unwrap_or_else(|_| "invalid-request-id".parse().unwrap()),
+    );
+    (StatusCode::OK, headers, "").into_response()
+}
+
+fn no_content_response(request_id: &str) -> Response {
+    let mut headers = HeaderMap::new();
+    headers.insert(
+        "x-amz-request-id",
+        request_id
+            .parse()
+            .unwrap_or_else(|_| "invalid-request-id".parse().unwrap()),
+    );
+    (StatusCode::NO_CONTENT, headers, "").into_response()
+}
+
+fn apply_cors_headers(
+    mut resp: Response,
+    state: &AppState,
+    bucket: &str,
+    headers: &HeaderMap,
+    method: &str,
+) -> Response {
+    let origin = match headers.get("origin").and_then(|v| v.to_str().ok()) {
+        Some(o) if !o.is_empty() => o,
+        _ => return resp,
+    };
+
+    let conn = match telecrate::db::open(&state.config.db_path) {
+        Ok(c) => c,
+        Err(_) => return resp,
+    };
+
+    if let Ok(Some(cors_xml)) = telecrate::db::get_bucket_cors(&conn, bucket) {
+        if let Ok(cors_cfg) = telecrate::cors::parse_cors_xml(&cors_xml) {
+            let req_hdrs = headers
+                .get("access-control-request-headers")
+                .and_then(|v| v.to_str().ok());
+            if let Some(c_match) =
+                telecrate::cors::match_cors_rule(&cors_cfg, origin, method, req_hdrs)
+            {
+                let hdrs = resp.headers_mut();
+                if let Ok(val) = c_match.allow_origin.parse() {
+                    hdrs.insert("access-control-allow-origin", val);
+                }
+                if !c_match.expose_headers.is_empty() {
+                    if let Ok(val) = c_match.expose_headers.parse() {
+                        hdrs.insert("access-control-expose-headers", val);
+                    }
+                }
+            }
+        }
+    }
+    resp
 }
 
 fn open_db(state: &AppState) -> Result<rusqlite::Connection, telecrate::s3::S3Error> {
@@ -175,7 +329,7 @@ async fn root_get(
     let request_id = telecrate::s3::new_request_id();
     let query = raw_query.0.as_deref().unwrap_or("");
     match authenticate(
-        &state.config,
+        &state,
         &AuthInput {
             method: "GET",
             path: "/",
@@ -218,8 +372,25 @@ async fn bucket_get(
     let request_id = telecrate::s3::new_request_id();
     let resource = format!("/{bucket}");
     let query = raw_query.0.as_deref().unwrap_or("");
-    if let Err(e) = authenticate(
-        &state.config,
+    let qmap = query_map(query);
+
+    let action = if qmap.contains_key("cors") {
+        "s3:GetBucketCORS"
+    } else if qmap.contains_key("policy") {
+        "s3:GetBucketPolicy"
+    } else if qmap.contains_key("publicAccessBlock") {
+        "s3:GetBucketPublicAccessBlock"
+    } else if qmap.contains_key("object-lock") {
+        "s3:GetBucketObjectLockConfiguration"
+    } else {
+        "s3:ListBucket"
+    };
+
+    if let Err(e) = check_auth_with_policy(
+        &state,
+        action,
+        Some(&bucket),
+        None,
         &AuthInput {
             method: "GET",
             path: &resource,
@@ -232,23 +403,25 @@ async fn bucket_get(
     ) {
         return e.into_response();
     }
-    let qmap = query_map(query);
-    if qmap.contains_key("uploads") {
-        return list_multipart_uploads_handler(&state, &bucket, &resource, &request_id)
-            .into_response();
-    }
-    if qmap.contains_key("versioning") {
-        return get_bucket_versioning_handler(&state, &bucket, &resource, &request_id)
-            .into_response();
-    }
-    if qmap.contains_key("versions") {
-        return list_object_versions_handler(&state, &bucket, query, &resource, &request_id)
-            .into_response();
-    }
-    let is_location = query
+
+    let resp = if qmap.contains_key("cors") {
+        get_bucket_cors_handler(&state, &bucket, &resource, &request_id)
+    } else if qmap.contains_key("policy") {
+        get_bucket_policy_handler(&state, &bucket, &resource, &request_id)
+    } else if qmap.contains_key("publicAccessBlock") {
+        get_bucket_bpa_handler(&state, &bucket, &resource, &request_id)
+    } else if qmap.contains_key("object-lock") {
+        get_bucket_lock_config_handler(&state, &bucket, &resource, &request_id)
+    } else if qmap.contains_key("uploads") {
+        list_multipart_uploads_handler(&state, &bucket, &resource, &request_id)
+    } else if qmap.contains_key("versioning") {
+        get_bucket_versioning_handler(&state, &bucket, &resource, &request_id)
+    } else if qmap.contains_key("versions") {
+        list_object_versions_handler(&state, &bucket, query, &resource, &request_id)
+    } else if query
         .split('&')
-        .any(|p| p == "location" || p.starts_with("location="));
-    if is_location {
+        .any(|p| p == "location" || p.starts_with("location="))
+    {
         let region = match open_db(&state) {
             Ok(conn) => match telecrate::db::list_buckets(&conn) {
                 Ok(list) => list
@@ -271,8 +444,10 @@ async fn bucket_get(
             .into_response(),
         }
     } else {
-        list_objects_v2(&state, &bucket, query, &resource, &request_id).into_response()
-    }
+        list_objects_v2(&state, &bucket, query, &resource, &request_id)
+    };
+
+    apply_cors_headers(resp, &state, &bucket, &headers, "GET")
 }
 
 fn get_bucket_versioning_handler(
@@ -552,6 +727,335 @@ fn list_objects_v2(
     )
 }
 
+struct FormField {
+    pub name: String,
+    pub filename: Option<String>,
+    pub data: Vec<u8>,
+}
+
+fn parse_multipart_form_data(content_type: &str, body: &[u8]) -> Vec<FormField> {
+    let mut fields = Vec::new();
+    let boundary = match content_type.split(';').find_map(|p| {
+        let p = p.trim();
+        if p.starts_with("boundary=") {
+            Some(p.trim_start_matches("boundary=").trim_matches('"'))
+        } else {
+            None
+        }
+    }) {
+        Some(b) => b,
+        None => return fields,
+    };
+
+    let delimiter = format!("--{boundary}");
+    let delimiter_bytes = delimiter.as_bytes();
+
+    let mut cursor = 0;
+    while cursor < body.len() {
+        let rest = &body[cursor..];
+        let pos = match rest
+            .windows(delimiter_bytes.len())
+            .position(|w| w == delimiter_bytes)
+        {
+            Some(p) => p,
+            None => break,
+        };
+
+        let part_start = cursor + pos + delimiter_bytes.len();
+        cursor = part_start;
+
+        if cursor + 2 <= body.len() && &body[cursor..cursor + 2] == b"--" {
+            break;
+        }
+
+        if cursor + 2 <= body.len() && &body[cursor..cursor + 2] == b"\r\n" {
+            cursor += 2;
+        }
+
+        let next_pos = match body[cursor..]
+            .windows(delimiter_bytes.len())
+            .position(|w| w == delimiter_bytes)
+        {
+            Some(p) => cursor + p,
+            None => body.len(),
+        };
+
+        let part_bytes = &body[cursor..next_pos];
+        cursor = next_pos;
+
+        let header_end = match part_bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+            Some(p) => p,
+            None => continue,
+        };
+
+        let headers_str = String::from_utf8_lossy(&part_bytes[..header_end]);
+        let mut payload = &part_bytes[header_end + 4..];
+        if payload.ends_with(b"\r\n") {
+            payload = &payload[..payload.len() - 2];
+        }
+
+        let mut name = String::new();
+        let mut filename = None;
+
+        for line in headers_str.lines() {
+            if line
+                .to_ascii_lowercase()
+                .starts_with("content-disposition:")
+            {
+                for param in line.split(';') {
+                    let param = param.trim();
+                    if param.starts_with("name=") {
+                        name = param
+                            .trim_start_matches("name=")
+                            .trim_matches('"')
+                            .to_string();
+                    } else if param.starts_with("filename=") {
+                        filename = Some(
+                            param
+                                .trim_start_matches("filename=")
+                                .trim_matches('"')
+                                .to_string(),
+                        );
+                    }
+                }
+            }
+        }
+
+        if !name.is_empty() {
+            fields.push(FormField {
+                name,
+                filename,
+                data: payload.to_vec(),
+            });
+        }
+    }
+
+    fields
+}
+
+async fn post_policy_form_handler(
+    state: &AppState,
+    bucket: &str,
+    headers: &HeaderMap,
+    body: &[u8],
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    let fields = parse_multipart_form_data(content_type, body);
+
+    let find_field = |name: &str| -> Option<String> {
+        fields
+            .iter()
+            .find(|f| f.name.eq_ignore_ascii_case(name))
+            .map(|f| String::from_utf8_lossy(&f.data).to_string())
+    };
+
+    let key = match find_field("key") {
+        Some(k) if !k.is_empty() => k,
+        _ => {
+            return S3Error::new(
+                "InvalidArgument",
+                "Form field 'key' is required",
+                StatusCode::BAD_REQUEST,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+
+    let file_field = match fields
+        .iter()
+        .find(|f| f.name == "file" || f.filename.is_some())
+    {
+        Some(f) => f,
+        None => {
+            return S3Error::new(
+                "InvalidArgument",
+                "Form field 'file' is required",
+                StatusCode::BAD_REQUEST,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+
+    let policy_b64 = match find_field("policy") {
+        Some(p) => p,
+        None => {
+            return S3Error::new(
+                "AccessDenied",
+                "Form field 'policy' is required for POST upload",
+                StatusCode::FORBIDDEN,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+
+    let signature = match find_field("x-amz-signature").or_else(|| find_field("signature")) {
+        Some(s) => s,
+        None => {
+            return S3Error::new(
+                "AccessDenied",
+                "Form field 'x-amz-signature' is required",
+                StatusCode::FORBIDDEN,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+
+    let credential = match find_field("x-amz-credential").or_else(|| find_field("credential")) {
+        Some(c) => c,
+        None => {
+            return S3Error::new(
+                "AccessDenied",
+                "Form field 'x-amz-credential' is required",
+                StatusCode::FORBIDDEN,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+
+    let key_id = match credential.split('/').next() {
+        Some(k) if !k.is_empty() => k,
+        _ => {
+            return S3Error::new(
+                "InvalidAccessKeyId",
+                "The AWS Access Key Id you provided does not exist in our records.",
+                StatusCode::FORBIDDEN,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+
+    let secret = match find_secret_key(state, key_id) {
+        Some(s) => s,
+        None => {
+            return S3Error::new(
+                "InvalidAccessKeyId",
+                "The AWS Access Key Id you provided does not exist in our records.",
+                StatusCode::FORBIDDEN,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+
+    if let Err(e) = telecrate::sigv4::verify_post_policy(
+        &policy_b64,
+        &signature,
+        &credential,
+        &secret,
+        &state.config.region,
+    ) {
+        return telecrate::s3::sig_error_to_s3(e, resource, request_id).into_response();
+    }
+
+    if let Err(code) = telecrate::s3::parse_and_validate_post_policy(
+        &policy_b64,
+        bucket,
+        &key,
+        file_field.data.len() as u64,
+        now_secs(),
+    ) {
+        return S3Error::new(
+            code,
+            "Post Policy condition failed",
+            StatusCode::BAD_REQUEST,
+            resource,
+            request_id,
+        )
+        .into_response();
+    }
+
+    let version_id = uuid::Uuid::new_v4().simple().to_string();
+    let job_id = uuid::Uuid::new_v4().simple().to_string();
+    let etag = md5_hex(&file_field.data);
+
+    let chunk_path =
+        std::path::Path::new(&state.config.spool_dir).join(format!("{version_id}_0.chunk"));
+    let spool_str = chunk_path.to_str().unwrap().to_string();
+
+    if let Err(e) = telecrate::spool::write_durable(&chunk_path, &file_field.data) {
+        return S3Error::new(
+            "InternalError",
+            e.to_string(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            resource,
+            request_id,
+        )
+        .into_response();
+    }
+
+    let chunk_spec = telecrate::db::NewChunk {
+        offset: 0,
+        length: file_field.data.len() as i64,
+        plaintext_sha256: sha256_hex(&file_field.data),
+        ciphertext_sha256: sha256_hex(&file_field.data),
+        spool_path: spool_str,
+        mode: telecrate::crypto::MODE_NONE.to_string(),
+        key_ref: None,
+    };
+
+    let mut conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    let (old_spools, final_version_id) = match telecrate::db::put_object(
+        &mut conn,
+        bucket,
+        &key,
+        &version_id,
+        file_field.data.len() as i64,
+        &etag,
+        "application/octet-stream",
+        None,
+        None,
+        &[chunk_spec],
+        &job_id,
+    ) {
+        Ok(res) => res,
+        Err(e) => {
+            return S3Error::new(
+                "InternalError",
+                e,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+
+    for p in old_spools {
+        let _ = std::fs::remove_file(p);
+    }
+
+    let mut resp = xml_response(StatusCode::NO_CONTENT, String::new(), request_id);
+    if let Ok(hv) = final_version_id.parse() {
+        resp.headers_mut().insert("x-amz-version-id", hv);
+    }
+    resp.headers_mut().insert("etag", etag.parse().unwrap());
+    resp
+}
+
 /// POST /:bucket?delete = DeleteObjects (M2.2: tối đa 100 keys, chưa VersionId).
 async fn bucket_post(
     State(state): State<Arc<AppState>>,
@@ -564,8 +1068,19 @@ async fn bucket_post(
     let request_id = telecrate::s3::new_request_id();
     let resource = format!("/{bucket}");
     let raw_query = uri.query().unwrap_or("");
+
+    let content_type = headers
+        .get("content-type")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+
+    if content_type.starts_with("multipart/form-data") {
+        return post_policy_form_handler(&state, &bucket, &headers, &body, &resource, &request_id)
+            .await;
+    }
+
     if let Err(e) = authenticate(
-        &state.config,
+        &state,
         &AuthInput {
             method: "POST",
             path: &format!("/{bucket}"),
@@ -581,7 +1096,7 @@ async fn bucket_post(
     if !query_map(raw_query).contains_key("delete") {
         return S3Error::new(
             "InvalidRequest",
-            "POST bucket chỉ hỗ trợ ?delete ở M2.2.",
+            "POST bucket chỉ hỗ trợ ?delete hoặc multipart/form-data policy upload.",
             StatusCode::BAD_REQUEST,
             &resource,
             &request_id,
@@ -719,8 +1234,25 @@ async fn create_bucket(
     let request_id = telecrate::s3::new_request_id();
     let resource = format!("/{bucket}");
     let query = raw_query.0.as_deref().unwrap_or("");
-    if let Err(e) = authenticate(
-        &state.config,
+    let qmap = query_map(query);
+
+    let action = if qmap.contains_key("cors") {
+        "s3:PutBucketCORS"
+    } else if qmap.contains_key("policy") {
+        "s3:PutBucketPolicy"
+    } else if qmap.contains_key("publicAccessBlock") {
+        "s3:PutBucketPublicAccessBlock"
+    } else if qmap.contains_key("object-lock") {
+        "s3:PutBucketObjectLockConfiguration"
+    } else {
+        "s3:CreateBucket"
+    };
+
+    if let Err(e) = check_auth_with_policy(
+        &state,
+        action,
+        Some(&bucket),
+        None,
         &AuthInput {
             method: "PUT",
             path: &resource,
@@ -733,69 +1265,77 @@ async fn create_bucket(
     ) {
         return e.into_response();
     }
-    let qmap = query_map(query);
-    if qmap.contains_key("versioning") {
-        return put_bucket_versioning_handler(&state, &bucket, &body, &resource, &request_id)
-            .into_response();
-    }
 
-    let want_region = match telecrate::s3::parse_location_constraint(&body) {
-        Ok(v) => v,
-        Err(_) => {
-            return telecrate::s3::S3Error::new(
-                "InvalidLocationConstraint",
-                "The specified location constraint is not valid.",
+    let resp = if qmap.contains_key("cors") {
+        put_bucket_cors_handler(&state, &bucket, &body, &resource, &request_id)
+    } else if qmap.contains_key("policy") {
+        put_bucket_policy_handler(&state, &bucket, &body, &resource, &request_id)
+    } else if qmap.contains_key("publicAccessBlock") {
+        put_bucket_bpa_handler(&state, &bucket, &body, &resource, &request_id)
+    } else if qmap.contains_key("object-lock") {
+        put_bucket_lock_config_handler(&state, &bucket, &body, &resource, &request_id)
+    } else if qmap.contains_key("versioning") {
+        put_bucket_versioning_handler(&state, &bucket, &body, &resource, &request_id)
+    } else {
+        let want_region = match telecrate::s3::parse_location_constraint(&body) {
+            Ok(v) => v,
+            Err(_) => {
+                return telecrate::s3::S3Error::new(
+                    "InvalidLocationConstraint",
+                    "The specified location constraint is not valid.",
+                    StatusCode::BAD_REQUEST,
+                    &resource,
+                    &request_id,
+                )
+                .into_response()
+            }
+        };
+        if let Some(loc) = want_region {
+            if loc != state.config.region {
+                return telecrate::s3::S3Error::new(
+                    "InvalidLocationConstraint",
+                    format!(
+                        "Location constraint '{}' does not match server region '{}'.",
+                        loc, state.config.region
+                    ),
+                    StatusCode::BAD_REQUEST,
+                    &resource,
+                    &request_id,
+                )
+                .into_response();
+            }
+        }
+        let conn = match open_db(&state) {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+        match telecrate::db::create_bucket(&conn, &bucket, &state.config.region) {
+            Ok(telecrate::db::CreateBucketOutcome::Created) => {
+                xml_response(StatusCode::OK, String::new(), &request_id)
+            }
+            Ok(telecrate::db::CreateBucketOutcome::AlreadyOwned) => {
+                xml_response(StatusCode::OK, String::new(), &request_id)
+            }
+            Err(code) if code == "InvalidBucketName" => telecrate::s3::S3Error::new(
+                "InvalidBucketName",
+                "The specified bucket is not valid.",
                 StatusCode::BAD_REQUEST,
                 &resource,
                 &request_id,
             )
-            .into_response()
-        }
-    };
-    if let Some(loc) = want_region {
-        if loc != state.config.region {
-            return telecrate::s3::S3Error::new(
-                "InvalidLocationConstraint",
-                format!(
-                    "Location constraint '{}' does not match server region '{}'.",
-                    loc, state.config.region
-                ),
-                StatusCode::BAD_REQUEST,
+            .into_response(),
+            Err(e) => telecrate::s3::S3Error::new(
+                "InternalError",
+                e,
+                StatusCode::INTERNAL_SERVER_ERROR,
                 &resource,
                 &request_id,
             )
-            .into_response();
+            .into_response(),
         }
-    }
-    let conn = match open_db(&state) {
-        Ok(c) => c,
-        Err(e) => return e.into_response(),
     };
-    match telecrate::db::create_bucket(&conn, &bucket, &state.config.region) {
-        Ok(telecrate::db::CreateBucketOutcome::Created) => {
-            xml_response(StatusCode::OK, String::new(), &request_id)
-        }
-        // S3: tạo lại bucket mình sở hữu → 200 (không phải lỗi).
-        Ok(telecrate::db::CreateBucketOutcome::AlreadyOwned) => {
-            xml_response(StatusCode::OK, String::new(), &request_id)
-        }
-        Err(code) if code == "InvalidBucketName" => telecrate::s3::S3Error::new(
-            "InvalidBucketName",
-            "The specified bucket is not valid.",
-            StatusCode::BAD_REQUEST,
-            &resource,
-            &request_id,
-        )
-        .into_response(),
-        Err(e) => telecrate::s3::S3Error::new(
-            "InternalError",
-            e,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &resource,
-            &request_id,
-        )
-        .into_response(),
-    }
+
+    apply_cors_headers(resp, &state, &bucket, &headers, "PUT")
 }
 
 /// DELETE /{bucket}: 204 khi xóa; 404/409 đúng S3.
@@ -808,8 +1348,23 @@ async fn delete_bucket(
     let request_id = telecrate::s3::new_request_id();
     let resource = format!("/{bucket}");
     let query = raw_query.0.as_deref().unwrap_or("");
-    if let Err(e) = authenticate(
-        &state.config,
+    let qmap = query_map(query);
+
+    let action = if qmap.contains_key("cors") {
+        "s3:PutBucketCORS"
+    } else if qmap.contains_key("policy") {
+        "s3:DeleteBucketPolicy"
+    } else if qmap.contains_key("publicAccessBlock") {
+        "s3:PutBucketPublicAccessBlock"
+    } else {
+        "s3:DeleteBucket"
+    };
+
+    if let Err(e) = check_auth_with_policy(
+        &state,
+        action,
+        Some(&bucket),
+        None,
         &AuthInput {
             method: "DELETE",
             path: &resource,
@@ -822,39 +1377,50 @@ async fn delete_bucket(
     ) {
         return e.into_response();
     }
-    let conn = match open_db(&state) {
-        Ok(c) => c,
-        Err(e) => return e.into_response(),
-    };
-    match telecrate::db::delete_bucket(&conn, &bucket) {
-        Ok(telecrate::db::DeleteBucketOutcome::Deleted) => {
-            xml_response(StatusCode::NO_CONTENT, String::new(), &request_id)
+
+    let resp = if qmap.contains_key("cors") {
+        delete_bucket_cors_handler(&state, &bucket, &resource, &request_id)
+    } else if qmap.contains_key("policy") {
+        delete_bucket_policy_handler(&state, &bucket, &resource, &request_id)
+    } else if qmap.contains_key("publicAccessBlock") {
+        delete_bucket_bpa_handler(&state, &bucket, &resource, &request_id)
+    } else {
+        let conn = match open_db(&state) {
+            Ok(c) => c,
+            Err(e) => return e.into_response(),
+        };
+        match telecrate::db::delete_bucket(&conn, &bucket) {
+            Ok(telecrate::db::DeleteBucketOutcome::Deleted) => {
+                xml_response(StatusCode::NO_CONTENT, String::new(), &request_id)
+            }
+            Ok(telecrate::db::DeleteBucketOutcome::NoSuchBucket) => telecrate::s3::S3Error::new(
+                "NoSuchBucket",
+                "The specified bucket does not exist.",
+                StatusCode::NOT_FOUND,
+                &resource,
+                &request_id,
+            )
+            .into_response(),
+            Ok(telecrate::db::DeleteBucketOutcome::NotEmpty) => telecrate::s3::S3Error::new(
+                "BucketNotEmpty",
+                "The bucket you tried to delete is not empty.",
+                StatusCode::CONFLICT,
+                &resource,
+                &request_id,
+            )
+            .into_response(),
+            Err(e) => telecrate::s3::S3Error::new(
+                "InternalError",
+                e,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &resource,
+                &request_id,
+            )
+            .into_response(),
         }
-        Ok(telecrate::db::DeleteBucketOutcome::NoSuchBucket) => telecrate::s3::S3Error::new(
-            "NoSuchBucket",
-            "The specified bucket does not exist.",
-            StatusCode::NOT_FOUND,
-            &resource,
-            &request_id,
-        )
-        .into_response(),
-        Ok(telecrate::db::DeleteBucketOutcome::NotEmpty) => telecrate::s3::S3Error::new(
-            "BucketNotEmpty",
-            "The bucket you tried to delete is not empty.",
-            StatusCode::CONFLICT,
-            &resource,
-            &request_id,
-        )
-        .into_response(),
-        Err(e) => telecrate::s3::S3Error::new(
-            "InternalError",
-            e,
-            StatusCode::INTERNAL_SERVER_ERROR,
-            &resource,
-            &request_id,
-        )
-        .into_response(),
-    }
+    };
+
+    apply_cors_headers(resp, &state, &bucket, &headers, "DELETE")
 }
 
 /// HEAD /{bucket}: 200 tồn tại / 404 không (không body, giữ request id header).
@@ -868,7 +1434,7 @@ async fn head_bucket(
     let resource = format!("/{bucket}");
     let query = raw_query.0.as_deref().unwrap_or("");
     if let Err(e) = authenticate(
-        &state.config,
+        &state,
         &AuthInput {
             method: "HEAD",
             path: &resource,
@@ -1126,6 +1692,9 @@ fn extract_system_metadata(headers: &HeaderMap) -> Option<String> {
         "content-encoding",
         "cache-control",
         "expires",
+        "x-amz-server-side-encryption",
+        "x-amz-server-side-encryption-customer-algorithm",
+        "x-amz-server-side-encryption-customer-key-md5",
     ] {
         if let Some(v) = headers.get(*header_name) {
             if let Ok(val) = v.to_str() {
@@ -1249,8 +1818,11 @@ async fn put_object(
     let raw_path = uri.path().to_string();
     let resource = format!("/{bucket}/{key}");
     let raw_query = uri.query().unwrap_or("");
-    if let Err(e) = authenticate(
-        &state.config,
+    if let Err(e) = check_auth_with_policy(
+        &state,
+        "s3:PutObject",
+        Some(&bucket),
+        Some(&key),
         &AuthInput {
             method: "PUT",
             path: &raw_path,
@@ -1263,7 +1835,36 @@ async fn put_object(
     ) {
         return e.into_response();
     }
+    let _sse_cfg = match telecrate::crypto::parse_and_validate_sse_headers(&headers) {
+        Ok(cfg) => cfg,
+        Err((status, code, msg)) => {
+            return S3Error::new(code, msg, status, &resource, &request_id).into_response();
+        }
+    };
     let qmap = query_map(raw_query);
+    let vid = qmap.get("versionId").map(|s| s.as_str()).unwrap_or("null");
+    if qmap.contains_key("retention") {
+        return put_object_retention_handler(
+            &state,
+            &bucket,
+            &key,
+            vid,
+            &body,
+            &resource,
+            &request_id,
+        );
+    }
+    if qmap.contains_key("legal-hold") {
+        return put_object_legal_hold_handler(
+            &state,
+            &bucket,
+            &key,
+            vid,
+            &body,
+            &resource,
+            &request_id,
+        );
+    }
     if let (Some(upload_id), Some(part_num_str)) = (qmap.get("uploadId"), qmap.get("partNumber")) {
         return upload_part_handler(
             &state,
@@ -1588,8 +2189,11 @@ async fn get_object(
     let raw_path = uri.path().to_string();
     let resource = format!("/{bucket}/{key}");
     let raw_query = uri.query().unwrap_or("");
-    if let Err(e) = authenticate(
-        &state.config,
+    if let Err(e) = check_auth_with_policy(
+        &state,
+        "s3:GetObject",
+        Some(&bucket),
+        Some(&key),
         &AuthInput {
             method: "GET",
             path: &raw_path,
@@ -1603,6 +2207,13 @@ async fn get_object(
         return e.into_response();
     }
     let qmap = query_map(raw_query);
+    let vid = qmap.get("versionId").map(|s| s.as_str()).unwrap_or("null");
+    if qmap.contains_key("retention") {
+        return get_object_retention_handler(&state, &bucket, &key, vid, &resource, &request_id);
+    }
+    if qmap.contains_key("legal-hold") {
+        return get_object_legal_hold_handler(&state, &bucket, &key, vid, &resource, &request_id);
+    }
     if let Some(upload_id) = qmap.get("uploadId") {
         return list_parts_handler(&state, &bucket, &key, upload_id, &resource, &request_id)
             .into_response();
@@ -1688,6 +2299,39 @@ async fn get_object(
                 .insert("x-amz-version-id", vid.parse().unwrap());
         }
         return resp;
+    }
+
+    if let Some(sys_meta_json) = &version.system_metadata_json {
+        if sys_meta_json.contains("x-amz-server-side-encryption-customer-algorithm") {
+            let req_sse = match telecrate::crypto::parse_and_validate_sse_headers(&headers) {
+                Ok(cfg) => cfg,
+                Err((status, code, msg)) => {
+                    return S3Error::new(code, msg, status, &resource, &request_id).into_response();
+                }
+            };
+            match req_sse {
+                telecrate::crypto::SseConfig::SseC { key_md5_b64, .. } => {
+                    if !sys_meta_json.contains(&key_md5_b64) {
+                        return S3Error::new(
+                            "AccessDenied",
+                            "The calculated MD5 hash of the key does not match the stored MD5 hash.",
+                            StatusCode::FORBIDDEN,
+                            &resource,
+                            &request_id,
+                        ).into_response();
+                    }
+                }
+                _ => {
+                    return S3Error::new(
+                        "InvalidArgument",
+                        "The object was stored using SSE-C, but the request did not provide SSE-C headers.",
+                        StatusCode::BAD_REQUEST,
+                        &resource,
+                        &request_id,
+                    ).into_response();
+                }
+            }
+        }
     }
 
     let outcome = telecrate::s3::eval_conditional_headers(
@@ -1842,8 +2486,11 @@ async fn head_object(
     let raw_path = uri.path().to_string();
     let resource = format!("/{bucket}/{key}");
     let raw_query = uri.query().unwrap_or("");
-    if let Err(e) = authenticate(
-        &state.config,
+    if let Err(e) = check_auth_with_policy(
+        &state,
+        "s3:GetObject",
+        Some(&bucket),
+        Some(&key),
         &AuthInput {
             method: "HEAD",
             path: &raw_path,
@@ -1908,6 +2555,39 @@ async fn head_object(
         return resp;
     }
 
+    if let Some(sys_meta_json) = &version.system_metadata_json {
+        if sys_meta_json.contains("x-amz-server-side-encryption-customer-algorithm") {
+            let req_sse = match telecrate::crypto::parse_and_validate_sse_headers(&headers) {
+                Ok(cfg) => cfg,
+                Err((status, code, msg)) => {
+                    return S3Error::new(code, msg, status, &resource, &request_id).into_response();
+                }
+            };
+            match req_sse {
+                telecrate::crypto::SseConfig::SseC { key_md5_b64, .. } => {
+                    if !sys_meta_json.contains(&key_md5_b64) {
+                        return S3Error::new(
+                            "AccessDenied",
+                            "The calculated MD5 hash of the key does not match the stored MD5 hash.",
+                            StatusCode::FORBIDDEN,
+                            &resource,
+                            &request_id,
+                        ).into_response();
+                    }
+                }
+                _ => {
+                    return S3Error::new(
+                        "InvalidArgument",
+                        "The object was stored using SSE-C, but the request did not provide SSE-C headers.",
+                        StatusCode::BAD_REQUEST,
+                        &resource,
+                        &request_id,
+                    ).into_response();
+                }
+            }
+        }
+    }
+
     let outcome = telecrate::s3::eval_conditional_headers(
         "HEAD",
         &version.etag,
@@ -1950,8 +2630,11 @@ async fn delete_object(
     let raw_path = uri.path().to_string();
     let resource = format!("/{bucket}/{key}");
     let raw_query = uri.query().unwrap_or("");
-    if let Err(e) = authenticate(
-        &state.config,
+    if let Err(e) = check_auth_with_policy(
+        &state,
+        "s3:DeleteObject",
+        Some(&bucket),
+        Some(&key),
         &AuthInput {
             method: "DELETE",
             path: &raw_path,
@@ -1992,6 +2675,16 @@ async fn delete_object(
     }
 
     let vid_opt = qmap.get("versionId").cloned();
+    if let Err((status, code, msg)) = check_object_lock_for_delete(
+        &conn,
+        &bucket,
+        &key,
+        vid_opt.as_deref(),
+        &headers,
+        now_secs(),
+    ) {
+        return S3Error::new(code, msg, status, &resource, &request_id).into_response();
+    }
     if let Some(ref vid) = vid_opt {
         let deleted = match telecrate::db::delete_object_version(&mut conn, &bucket, &key, vid) {
             Ok(r) => r,
@@ -2106,8 +2799,11 @@ async fn post_object(
     let request_id = telecrate::s3::new_request_id();
     let resource = format!("/{bucket}/{key}");
     let raw_query = uri.query().unwrap_or("");
-    if let Err(e) = authenticate(
-        &state.config,
+    if let Err(e) = check_auth_with_policy(
+        &state,
+        "s3:PutObject",
+        Some(&bucket),
+        Some(&key),
         &AuthInput {
             method: "POST",
             path: &resource,
@@ -2446,4 +3142,962 @@ fn list_multipart_uploads_handler(
         telecrate::s3::list_multipart_uploads_xml(bucket, &uploads),
         request_id,
     )
+}
+
+async fn bucket_options(
+    State(state): State<Arc<AppState>>,
+    Path(bucket): Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    handle_preflight(&state, &bucket, &headers)
+}
+
+async fn object_options(
+    State(state): State<Arc<AppState>>,
+    Path((bucket, _key)): Path<(String, String)>,
+    headers: HeaderMap,
+) -> Response {
+    handle_preflight(&state, &bucket, &headers)
+}
+
+fn handle_preflight(state: &AppState, bucket: &str, headers: &HeaderMap) -> Response {
+    use telecrate::s3::S3Error;
+    let request_id = telecrate::s3::new_request_id();
+    let resource = format!("/{bucket}");
+
+    let origin = match headers.get("origin").and_then(|v| v.to_str().ok()) {
+        Some(o) if !o.is_empty() => o,
+        _ => {
+            return S3Error::new(
+                "InvalidRequest",
+                "Missing Origin header",
+                StatusCode::BAD_REQUEST,
+                &resource,
+                &request_id,
+            )
+            .into_response()
+        }
+    };
+    let method = match headers
+        .get("access-control-request-method")
+        .and_then(|v| v.to_str().ok())
+    {
+        Some(m) if !m.is_empty() => m,
+        _ => {
+            return S3Error::new(
+                "InvalidRequest",
+                "Missing Access-Control-Request-Method header",
+                StatusCode::BAD_REQUEST,
+                &resource,
+                &request_id,
+            )
+            .into_response()
+        }
+    };
+    let req_hdrs = headers
+        .get("access-control-request-headers")
+        .and_then(|v| v.to_str().ok());
+
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    let cors_xml = match telecrate::db::get_bucket_cors(&conn, bucket) {
+        Ok(Some(xml)) => xml,
+        _ => {
+            return S3Error::new(
+                "AccessDenied",
+                "CORS not configured on bucket",
+                StatusCode::FORBIDDEN,
+                &resource,
+                &request_id,
+            )
+            .into_response()
+        }
+    };
+
+    let cors_cfg = match telecrate::cors::parse_cors_xml(&cors_xml) {
+        Ok(cfg) => cfg,
+        Err(_) => {
+            return S3Error::new(
+                "InternalError",
+                "Corrupted CORS config",
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &resource,
+                &request_id,
+            )
+            .into_response()
+        }
+    };
+
+    let c_match = match telecrate::cors::match_cors_rule(&cors_cfg, origin, method, req_hdrs) {
+        Some(m) => m,
+        None => {
+            return S3Error::new(
+                "AccessDenied",
+                "CORS rule match failed",
+                StatusCode::FORBIDDEN,
+                &resource,
+                &request_id,
+            )
+            .into_response()
+        }
+    };
+
+    let mut res_headers = HeaderMap::new();
+    res_headers.insert(
+        "access-control-allow-origin",
+        c_match.allow_origin.parse().unwrap(),
+    );
+    res_headers.insert(
+        "access-control-allow-methods",
+        c_match.allow_methods.parse().unwrap(),
+    );
+    if !c_match.allow_headers.is_empty() {
+        if let Ok(v) = c_match.allow_headers.parse() {
+            res_headers.insert("access-control-allow-headers", v);
+        }
+    }
+    if let Some(max_age) = c_match.max_age_seconds {
+        res_headers.insert(
+            "access-control-max-age",
+            max_age.to_string().parse().unwrap(),
+        );
+    }
+    if !c_match.expose_headers.is_empty() {
+        if let Ok(v) = c_match.expose_headers.parse() {
+            res_headers.insert("access-control-expose-headers", v);
+        }
+    }
+    res_headers.insert("x-amz-request-id", request_id.parse().unwrap());
+
+    (StatusCode::OK, res_headers, "").into_response()
+}
+
+fn get_bucket_cors_handler(
+    state: &AppState,
+    bucket: &str,
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    match telecrate::db::get_bucket_cors(&conn, bucket) {
+        Ok(Some(cors_xml)) => xml_response(StatusCode::OK, cors_xml, request_id),
+        Ok(None) => S3Error::new(
+            "NoSuchCORSConfiguration",
+            "The CORS configuration does not exist.",
+            StatusCode::NOT_FOUND,
+            resource,
+            request_id,
+        )
+        .into_response(),
+        Err(e) => S3Error::new(
+            "InternalError",
+            e,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            resource,
+            request_id,
+        )
+        .into_response(),
+    }
+}
+
+fn put_bucket_cors_handler(
+    state: &AppState,
+    bucket: &str,
+    body: &[u8],
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let text = match std::str::from_utf8(body) {
+        Ok(t) => t,
+        Err(_) => {
+            return S3Error::new(
+                "MalformedXML",
+                "Invalid UTF-8 body",
+                StatusCode::BAD_REQUEST,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+    if let Err(e) = telecrate::cors::parse_cors_xml(text) {
+        return S3Error::new(
+            "MalformedXML",
+            e,
+            StatusCode::BAD_REQUEST,
+            resource,
+            request_id,
+        )
+        .into_response();
+    }
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = telecrate::db::set_bucket_cors(&conn, bucket, text) {
+        return S3Error::new(
+            "InternalError",
+            e,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            resource,
+            request_id,
+        )
+        .into_response();
+    }
+    empty_ok_response(request_id)
+}
+
+fn delete_bucket_cors_handler(
+    state: &AppState,
+    bucket: &str,
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = telecrate::db::delete_bucket_cors(&conn, bucket) {
+        return S3Error::new(
+            "InternalError",
+            e,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            resource,
+            request_id,
+        )
+        .into_response();
+    }
+    no_content_response(request_id)
+}
+
+fn get_bucket_policy_handler(
+    state: &AppState,
+    bucket: &str,
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    match telecrate::db::get_bucket_policy(&conn, bucket) {
+        Ok(Some(policy_json)) => {
+            let mut headers = HeaderMap::new();
+            headers.insert("content-type", "application/json".parse().unwrap());
+            headers.insert("x-amz-request-id", request_id.parse().unwrap());
+            (StatusCode::OK, headers, policy_json).into_response()
+        }
+        Ok(None) => S3Error::new(
+            "NoSuchBucketPolicy",
+            "The bucket policy does not exist.",
+            StatusCode::NOT_FOUND,
+            resource,
+            request_id,
+        )
+        .into_response(),
+        Err(e) => S3Error::new(
+            "InternalError",
+            e,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            resource,
+            request_id,
+        )
+        .into_response(),
+    }
+}
+
+fn put_bucket_policy_handler(
+    state: &AppState,
+    bucket: &str,
+    body: &[u8],
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let text = match std::str::from_utf8(body) {
+        Ok(t) => t,
+        Err(_) => {
+            return S3Error::new(
+                "MalformedPolicy",
+                "Invalid UTF-8 body",
+                StatusCode::BAD_REQUEST,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+    let doc: telecrate::policy::PolicyDocument = match serde_json::from_str(text) {
+        Ok(d) => d,
+        Err(e) => {
+            return S3Error::new(
+                "MalformedPolicy",
+                format!("Invalid policy JSON: {e}"),
+                StatusCode::BAD_REQUEST,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    if let Ok(bpa) = telecrate::db::get_bucket_bpa(&conn, bucket) {
+        if (bpa.block_public_policy || bpa.restrict_public_buckets) && doc.is_public() {
+            return S3Error::new(
+                "InvalidPolicy",
+                "Bucket and object access to this bucket is restricted by Block Public Access settings.",
+                StatusCode::BAD_REQUEST,
+                resource,
+                request_id,
+            )
+            .into_response();
+        }
+    }
+
+    if let Err(e) = telecrate::db::set_bucket_policy(&conn, bucket, text) {
+        return S3Error::new(
+            "InternalError",
+            e,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            resource,
+            request_id,
+        )
+        .into_response();
+    }
+    empty_ok_response(request_id)
+}
+
+fn delete_bucket_policy_handler(
+    state: &AppState,
+    bucket: &str,
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = telecrate::db::delete_bucket_policy(&conn, bucket) {
+        return S3Error::new(
+            "InternalError",
+            e,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            resource,
+            request_id,
+        )
+        .into_response();
+    }
+    no_content_response(request_id)
+}
+
+fn get_bucket_bpa_handler(
+    state: &AppState,
+    bucket: &str,
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    match telecrate::db::get_bucket_bpa(&conn, bucket) {
+        Ok(bpa) => match telecrate::policy::serialize_bpa_xml(&bpa) {
+            Ok(xml) => xml_response(StatusCode::OK, xml, request_id),
+            Err(e) => S3Error::new(
+                "InternalError",
+                e,
+                StatusCode::INTERNAL_SERVER_ERROR,
+                resource,
+                request_id,
+            )
+            .into_response(),
+        },
+        Err(e) if e == "NoSuchBucket" => S3Error::new(
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+            StatusCode::NOT_FOUND,
+            resource,
+            request_id,
+        )
+        .into_response(),
+        Err(e) => S3Error::new(
+            "InternalError",
+            e,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            resource,
+            request_id,
+        )
+        .into_response(),
+    }
+}
+
+fn put_bucket_bpa_handler(
+    state: &AppState,
+    bucket: &str,
+    body: &[u8],
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let text = match std::str::from_utf8(body) {
+        Ok(t) => t,
+        Err(_) => {
+            return S3Error::new(
+                "MalformedXML",
+                "Invalid UTF-8 body",
+                StatusCode::BAD_REQUEST,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+    let bpa = match telecrate::policy::parse_bpa_xml(text) {
+        Ok(b) => b,
+        Err(e) => {
+            return S3Error::new(
+                "MalformedXML",
+                e,
+                StatusCode::BAD_REQUEST,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = telecrate::db::set_bucket_bpa(&conn, bucket, &bpa) {
+        return S3Error::new(
+            "InternalError",
+            e,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            resource,
+            request_id,
+        )
+        .into_response();
+    }
+    empty_ok_response(request_id)
+}
+
+fn delete_bucket_bpa_handler(
+    state: &AppState,
+    bucket: &str,
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    if let Err(e) = telecrate::db::delete_bucket_bpa(&conn, bucket) {
+        return S3Error::new(
+            "InternalError",
+            e,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            resource,
+            request_id,
+        )
+        .into_response();
+    }
+    no_content_response(request_id)
+}
+
+fn check_object_lock_for_delete(
+    conn: &rusqlite::Connection,
+    bucket: &str,
+    key: &str,
+    vid_opt: Option<&str>,
+    headers: &HeaderMap,
+    now: u64,
+) -> Result<(), (StatusCode, &'static str, String)> {
+    let version = match vid_opt {
+        Some(vid) if vid != "null" && !vid.is_empty() => {
+            telecrate::db::get_version_by_id(conn, bucket, key, vid)
+                .ok()
+                .flatten()
+        }
+        _ => telecrate::db::latest_version(conn, bucket, key)
+            .ok()
+            .flatten(),
+    };
+    let v = match version {
+        Some(v) => v,
+        None => return Ok(()),
+    };
+    let version_id = &v.version_id;
+
+    if let Ok(on) = telecrate::db::get_object_legal_hold(conn, bucket, key, version_id) {
+        if on {
+            return Err((
+                StatusCode::FORBIDDEN,
+                "AccessDenied",
+                "Object is locked under Legal Hold.".to_string(),
+            ));
+        }
+    }
+
+    if let Ok(Some(retention)) = telecrate::db::get_object_retention(conn, bucket, key, version_id)
+    {
+        if let Some(until_secs) = telecrate::s3::parse_iso_date(&retention.retain_until_date) {
+            if until_secs > now {
+                if retention.mode == "COMPLIANCE" {
+                    return Err((
+                        StatusCode::FORBIDDEN,
+                        "AccessDenied",
+                        format!(
+                            "Object is locked under COMPLIANCE retention until {}.",
+                            retention.retain_until_date
+                        ),
+                    ));
+                } else if retention.mode == "GOVERNANCE" {
+                    let bypass = headers
+                        .get("x-amz-bypass-governance-retention")
+                        .and_then(|v| v.to_str().ok())
+                        .map(|s| s.trim().eq_ignore_ascii_case("true"))
+                        .unwrap_or(false);
+                    if !bypass {
+                        return Err((
+                            StatusCode::FORBIDDEN,
+                            "AccessDenied",
+                            format!(
+                                "Object is locked under GOVERNANCE retention until {}.",
+                                retention.retain_until_date
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn get_bucket_lock_config_handler(
+    state: &AppState,
+    bucket: &str,
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    match telecrate::db::get_bucket_object_lock_config(&conn, bucket) {
+        Ok(Some(cfg)) => {
+            let mode = cfg
+                .default_retention_mode
+                .as_deref()
+                .unwrap_or("GOVERNANCE");
+            let days = cfg.default_retention_days.unwrap_or(30);
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><ObjectLockConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><ObjectLockEnabled>{}</ObjectLockEnabled><Rule><DefaultRetention><Mode>{}</Mode><Days>{}</Days></DefaultRetention></Rule></ObjectLockConfiguration>",
+                telecrate::s3::xml_escape(&cfg.status),
+                telecrate::s3::xml_escape(mode),
+                days
+            );
+            xml_response(StatusCode::OK, xml, request_id)
+        }
+        Ok(None) => S3Error::new(
+            "ObjectLockConfigurationNotFoundError",
+            "Object Lock configuration does not exist for this bucket.",
+            StatusCode::NOT_FOUND,
+            resource,
+            request_id,
+        )
+        .into_response(),
+        Err(e) if e == "NoSuchBucket" => S3Error::new(
+            "NoSuchBucket",
+            "The specified bucket does not exist.",
+            StatusCode::NOT_FOUND,
+            resource,
+            request_id,
+        )
+        .into_response(),
+        Err(e) => S3Error::new(
+            "InternalError",
+            e,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            resource,
+            request_id,
+        )
+        .into_response(),
+    }
+}
+
+fn put_bucket_lock_config_handler(
+    state: &AppState,
+    bucket: &str,
+    body: &[u8],
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let text = match std::str::from_utf8(body) {
+        Ok(t) => t,
+        Err(_) => {
+            return S3Error::new(
+                "MalformedXML",
+                "Invalid UTF-8 body",
+                StatusCode::BAD_REQUEST,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+    let mode = if text.contains("<Mode>COMPLIANCE</Mode>") {
+        Some("COMPLIANCE".to_string())
+    } else if text.contains("<Mode>GOVERNANCE</Mode>") {
+        Some("GOVERNANCE".to_string())
+    } else {
+        None
+    };
+    let days = if let Some(start) = text.find("<Days>") {
+        let sub = &text[start + 6..];
+        sub.find("</Days>")
+            .and_then(|end| sub[..end].trim().parse::<i32>().ok())
+    } else {
+        None
+    };
+    let status = if text.contains("<ObjectLockEnabled>Enabled</ObjectLockEnabled>") {
+        "Enabled".to_string()
+    } else {
+        "Disabled".to_string()
+    };
+
+    let cfg = telecrate::db::ObjectLockConfig {
+        status,
+        default_retention_mode: mode,
+        default_retention_days: days,
+    };
+
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+
+    if let Err(e) = telecrate::db::set_bucket_object_lock_config(&conn, bucket, &cfg) {
+        return S3Error::new(
+            "InternalError",
+            e,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            resource,
+            request_id,
+        )
+        .into_response();
+    }
+    empty_ok_response(request_id)
+}
+
+fn get_object_retention_handler(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    vid_param: &str,
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    let version = if vid_param != "null" && !vid_param.is_empty() {
+        telecrate::db::get_version_by_id(&conn, bucket, key, vid_param)
+            .ok()
+            .flatten()
+    } else {
+        telecrate::db::latest_version(&conn, bucket, key)
+            .ok()
+            .flatten()
+    };
+    let v = match version {
+        Some(v) => v,
+        None => {
+            return S3Error::new(
+                "NoSuchKey",
+                "The specified key does not exist.",
+                StatusCode::NOT_FOUND,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+
+    match telecrate::db::get_object_retention(&conn, bucket, key, &v.version_id) {
+        Ok(Some(retention)) => {
+            let xml = format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?><Retention xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Mode>{}</Mode><RetainUntilDate>{}</RetainUntilDate></Retention>",
+                telecrate::s3::xml_escape(&retention.mode),
+                telecrate::s3::xml_escape(&retention.retain_until_date)
+            );
+            xml_response(StatusCode::OK, xml, request_id)
+        }
+        _ => S3Error::new(
+            "NoSuchObjectLockConfiguration",
+            "The specified object does not have a ObjectLock configuration.",
+            StatusCode::NOT_FOUND,
+            resource,
+            request_id,
+        )
+        .into_response(),
+    }
+}
+
+fn put_object_retention_handler(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    vid_param: &str,
+    body: &[u8],
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let text = match std::str::from_utf8(body) {
+        Ok(t) => t,
+        Err(_) => {
+            return S3Error::new(
+                "MalformedXML",
+                "Invalid UTF-8 body",
+                StatusCode::BAD_REQUEST,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+    let mode = if text.contains("<Mode>COMPLIANCE</Mode>")
+        || text.contains("<Mode>compliance</Mode>")
+    {
+        "COMPLIANCE"
+    } else if text.contains("<Mode>GOVERNANCE</Mode>") || text.contains("<Mode>governance</Mode>") {
+        "GOVERNANCE"
+    } else {
+        return S3Error::new(
+            "MalformedXML",
+            "Invalid Mode in Retention XML",
+            StatusCode::BAD_REQUEST,
+            resource,
+            request_id,
+        )
+        .into_response();
+    };
+
+    let start = match text.find("<RetainUntilDate>") {
+        Some(pos) => pos + "<RetainUntilDate>".len(),
+        None => {
+            return S3Error::new(
+                "MalformedXML",
+                "Missing RetainUntilDate",
+                StatusCode::BAD_REQUEST,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+    let end = match text[start..].find("</RetainUntilDate>") {
+        Some(pos) => start + pos,
+        None => {
+            return S3Error::new(
+                "MalformedXML",
+                "Malformed RetainUntilDate tag",
+                StatusCode::BAD_REQUEST,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+    let until_date = text[start..end].trim();
+
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    let version = if vid_param != "null" && !vid_param.is_empty() {
+        telecrate::db::get_version_by_id(&conn, bucket, key, vid_param)
+            .ok()
+            .flatten()
+    } else {
+        telecrate::db::latest_version(&conn, bucket, key)
+            .ok()
+            .flatten()
+    };
+    let v = match version {
+        Some(v) => v,
+        None => {
+            return S3Error::new(
+                "NoSuchKey",
+                "The specified key does not exist.",
+                StatusCode::NOT_FOUND,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+
+    if let Err(e) =
+        telecrate::db::set_object_retention(&conn, bucket, key, &v.version_id, mode, until_date)
+    {
+        return S3Error::new(
+            "InternalError",
+            e,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            resource,
+            request_id,
+        )
+        .into_response();
+    }
+    empty_ok_response(request_id)
+}
+
+fn get_object_legal_hold_handler(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    vid_param: &str,
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    let version = if vid_param != "null" && !vid_param.is_empty() {
+        telecrate::db::get_version_by_id(&conn, bucket, key, vid_param)
+            .ok()
+            .flatten()
+    } else {
+        telecrate::db::latest_version(&conn, bucket, key)
+            .ok()
+            .flatten()
+    };
+    let v = match version {
+        Some(v) => v,
+        None => {
+            return S3Error::new(
+                "NoSuchKey",
+                "The specified key does not exist.",
+                StatusCode::NOT_FOUND,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+
+    let on =
+        telecrate::db::get_object_legal_hold(&conn, bucket, key, &v.version_id).unwrap_or(false);
+    let status_str = if on { "ON" } else { "OFF" };
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?><LegalHold xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><Status>{}</Status></LegalHold>",
+        status_str
+    );
+    xml_response(StatusCode::OK, xml, request_id)
+}
+
+fn put_object_legal_hold_handler(
+    state: &AppState,
+    bucket: &str,
+    key: &str,
+    vid_param: &str,
+    body: &[u8],
+    resource: &str,
+    request_id: &str,
+) -> Response {
+    use telecrate::s3::S3Error;
+    let text = match std::str::from_utf8(body) {
+        Ok(t) => t,
+        Err(_) => {
+            return S3Error::new(
+                "MalformedXML",
+                "Invalid UTF-8 body",
+                StatusCode::BAD_REQUEST,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+    let on = if text.contains("<Status>ON</Status>") || text.contains("<Status>on</Status>") {
+        true
+    } else if text.contains("<Status>OFF</Status>") || text.contains("<Status>off</Status>") {
+        false
+    } else {
+        return S3Error::new(
+            "MalformedXML",
+            "Invalid Status in LegalHold XML",
+            StatusCode::BAD_REQUEST,
+            resource,
+            request_id,
+        )
+        .into_response();
+    };
+
+    let conn = match open_db(state) {
+        Ok(c) => c,
+        Err(e) => return e.into_response(),
+    };
+    let version = if vid_param != "null" && !vid_param.is_empty() {
+        telecrate::db::get_version_by_id(&conn, bucket, key, vid_param)
+            .ok()
+            .flatten()
+    } else {
+        telecrate::db::latest_version(&conn, bucket, key)
+            .ok()
+            .flatten()
+    };
+    let v = match version {
+        Some(v) => v,
+        None => {
+            return S3Error::new(
+                "NoSuchKey",
+                "The specified key does not exist.",
+                StatusCode::NOT_FOUND,
+                resource,
+                request_id,
+            )
+            .into_response()
+        }
+    };
+
+    if let Err(e) = telecrate::db::set_object_legal_hold(&conn, bucket, key, &v.version_id, on) {
+        return S3Error::new(
+            "InternalError",
+            e,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            resource,
+            request_id,
+        )
+        .into_response();
+    }
+    empty_ok_response(request_id)
 }

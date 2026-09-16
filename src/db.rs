@@ -1,6 +1,7 @@
 //! DB layer — SQLite WAL, migrations forward-only.
 
 use rusqlite::Connection;
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 /// Mở DB (tạo file + bật WAL + foreign keys). Không giữ txn mở suốt network upload.
@@ -45,6 +46,7 @@ pub fn apply_migration(conn: &mut Connection, version: i64, sql: &str) -> Result
 
 pub const MIGRATION_001: &str = include_str!("../migrations/0001_init.sql");
 pub const MIGRATION_002: &str = include_str!("../migrations/0002_m3_multipart_versioning.sql");
+pub const MIGRATION_003: &str = include_str!("../migrations/0003_m4_auth_policy_cors_lock.sql");
 
 /// Apply tất cả migrations chưa apply từ 0 lên head.
 pub fn apply_all_migrations(conn: &mut Connection) -> Result<i64, String> {
@@ -56,6 +58,10 @@ pub fn apply_all_migrations(conn: &mut Connection) -> Result<i64, String> {
     if current < 2 {
         apply_migration(conn, 2, MIGRATION_002)?;
         current = 2;
+    }
+    if current < 3 {
+        apply_migration(conn, 3, MIGRATION_003)?;
+        current = 3;
     }
     Ok(current)
 }
@@ -1114,6 +1120,402 @@ pub fn active_spool_paths(
     Ok(set)
 }
 
+// ==========================================
+// M4: Access Keys, Policy, CORS, BPA & Object Lock DAL
+// ==========================================
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AccessKeyRecord {
+    pub access_key_id: String,
+    pub secret_key: String,
+    pub status: String,
+    pub description: Option<String>,
+    pub created_at: String,
+}
+
+pub fn create_access_key(
+    conn: &Connection,
+    access_key_id: &str,
+    secret_key: &str,
+    description: Option<&str>,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO access_keys(access_key_id, secret_key, status, description) VALUES (?, ?, 'Active', ?)
+         ON CONFLICT(access_key_id) DO UPDATE SET secret_key=excluded.secret_key, status='Active', description=excluded.description",
+        rusqlite::params![access_key_id, secret_key, description],
+    )
+    .map_err(|e| format!("insert access_key: {e}"))?;
+    Ok(())
+}
+
+pub fn get_access_key(
+    conn: &Connection,
+    access_key_id: &str,
+) -> Result<Option<AccessKeyRecord>, String> {
+    let mut stmt = conn
+        .prepare("SELECT access_key_id, secret_key, status, description, created_at FROM access_keys WHERE access_key_id = ?")
+        .map_err(|e| format!("prepare get access_key: {e}"))?;
+    let mut rows = stmt
+        .query_map([access_key_id], |r| {
+            Ok(AccessKeyRecord {
+                access_key_id: r.get(0)?,
+                secret_key: r.get(1)?,
+                status: r.get(2)?,
+                description: r.get(3)?,
+                created_at: r.get(4)?,
+            })
+        })
+        .map_err(|e| format!("query get access_key: {e}"))?;
+    match rows.next() {
+        Some(Ok(k)) => Ok(Some(k)),
+        Some(Err(e)) => Err(format!("row access_key: {e}")),
+        None => Ok(None),
+    }
+}
+
+pub fn list_access_keys(conn: &Connection) -> Result<Vec<AccessKeyRecord>, String> {
+    let mut stmt = conn
+        .prepare("SELECT access_key_id, secret_key, status, description, created_at FROM access_keys ORDER BY created_at ASC")
+        .map_err(|e| format!("prepare list access_keys: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(AccessKeyRecord {
+                access_key_id: r.get(0)?,
+                secret_key: r.get(1)?,
+                status: r.get(2)?,
+                description: r.get(3)?,
+                created_at: r.get(4)?,
+            })
+        })
+        .map_err(|e| format!("query list access_keys: {e}"))?;
+    let mut list = Vec::new();
+    for r in rows {
+        list.push(r.map_err(|e| format!("row access_key: {e}"))?);
+    }
+    Ok(list)
+}
+
+pub fn delete_access_key(conn: &Connection, access_key_id: &str) -> Result<bool, String> {
+    let affected = conn
+        .execute(
+            "DELETE FROM access_keys WHERE access_key_id = ?",
+            [access_key_id],
+        )
+        .map_err(|e| format!("delete access_key: {e}"))?;
+    Ok(affected > 0)
+}
+
+// Bucket Policy
+pub fn set_bucket_policy(conn: &Connection, bucket: &str, policy_json: &str) -> Result<(), String> {
+    if !head_bucket(conn, bucket)? {
+        return Err("NoSuchBucket".to_string());
+    }
+    conn.execute(
+        "INSERT INTO bucket_policies(bucket, policy_json) VALUES (?, ?)
+         ON CONFLICT(bucket) DO UPDATE SET policy_json=excluded.policy_json, updated_at=datetime('now')",
+        rusqlite::params![bucket, policy_json],
+    )
+    .map_err(|e| format!("set bucket policy: {e}"))?;
+    Ok(())
+}
+
+pub fn get_bucket_policy(conn: &Connection, bucket: &str) -> Result<Option<String>, String> {
+    if !head_bucket(conn, bucket)? {
+        return Err("NoSuchBucket".to_string());
+    }
+    let mut stmt = conn
+        .prepare("SELECT policy_json FROM bucket_policies WHERE bucket = ?")
+        .map_err(|e| format!("prepare get bucket policy: {e}"))?;
+    let mut rows = stmt
+        .query_map([bucket], |r| r.get(0))
+        .map_err(|e| format!("query get bucket policy: {e}"))?;
+    match rows.next() {
+        Some(Ok(p)) => Ok(Some(p)),
+        Some(Err(e)) => Err(format!("row bucket policy: {e}")),
+        None => Ok(None),
+    }
+}
+
+pub fn delete_bucket_policy(conn: &Connection, bucket: &str) -> Result<bool, String> {
+    if !head_bucket(conn, bucket)? {
+        return Err("NoSuchBucket".to_string());
+    }
+    let affected = conn
+        .execute("DELETE FROM bucket_policies WHERE bucket = ?", [bucket])
+        .map_err(|e| format!("delete bucket policy: {e}"))?;
+    Ok(affected > 0)
+}
+
+// Bucket CORS
+pub fn set_bucket_cors(conn: &Connection, bucket: &str, cors_json: &str) -> Result<(), String> {
+    if !head_bucket(conn, bucket)? {
+        return Err("NoSuchBucket".to_string());
+    }
+    conn.execute(
+        "INSERT INTO bucket_cors(bucket, cors_json) VALUES (?, ?)
+         ON CONFLICT(bucket) DO UPDATE SET cors_json=excluded.cors_json, updated_at=datetime('now')",
+        rusqlite::params![bucket, cors_json],
+    )
+    .map_err(|e| format!("set bucket cors: {e}"))?;
+    Ok(())
+}
+
+pub fn get_bucket_cors(conn: &Connection, bucket: &str) -> Result<Option<String>, String> {
+    if !head_bucket(conn, bucket)? {
+        return Err("NoSuchBucket".to_string());
+    }
+    let mut stmt = conn
+        .prepare("SELECT cors_json FROM bucket_cors WHERE bucket = ?")
+        .map_err(|e| format!("prepare get bucket cors: {e}"))?;
+    let mut rows = stmt
+        .query_map([bucket], |r| r.get(0))
+        .map_err(|e| format!("query get bucket cors: {e}"))?;
+    match rows.next() {
+        Some(Ok(c)) => Ok(Some(c)),
+        Some(Err(e)) => Err(format!("row bucket cors: {e}")),
+        None => Ok(None),
+    }
+}
+
+pub fn delete_bucket_cors(conn: &Connection, bucket: &str) -> Result<bool, String> {
+    if !head_bucket(conn, bucket)? {
+        return Err("NoSuchBucket".to_string());
+    }
+    let affected = conn
+        .execute("DELETE FROM bucket_cors WHERE bucket = ?", [bucket])
+        .map_err(|e| format!("delete bucket cors: {e}"))?;
+    Ok(affected > 0)
+}
+
+// Block Public Access (BPA)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename = "PublicAccessBlockConfiguration", rename_all = "PascalCase")]
+pub struct BucketBpa {
+    #[serde(rename = "BlockPublicAcls", default)]
+    pub block_public_acls: bool,
+    #[serde(rename = "IgnorePublicAcls", default)]
+    pub ignore_public_acls: bool,
+    #[serde(rename = "BlockPublicPolicy", default)]
+    pub block_public_policy: bool,
+    #[serde(rename = "RestrictPublicBuckets", default)]
+    pub restrict_public_buckets: bool,
+}
+
+pub fn set_bucket_bpa(conn: &Connection, bucket: &str, bpa: &BucketBpa) -> Result<(), String> {
+    if !head_bucket(conn, bucket)? {
+        return Err("NoSuchBucket".to_string());
+    }
+    conn.execute(
+        "INSERT INTO bucket_bpa(bucket, block_public_acls, ignore_public_acls, block_public_policy, restrict_public_buckets)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(bucket) DO UPDATE SET
+            block_public_acls=excluded.block_public_acls,
+            ignore_public_acls=excluded.ignore_public_acls,
+            block_public_policy=excluded.block_public_policy,
+            restrict_public_buckets=excluded.restrict_public_buckets,
+            updated_at=datetime('now')",
+        rusqlite::params![
+            bucket,
+            if bpa.block_public_acls { 1 } else { 0 },
+            if bpa.ignore_public_acls { 1 } else { 0 },
+            if bpa.block_public_policy { 1 } else { 0 },
+            if bpa.restrict_public_buckets { 1 } else { 0 },
+        ],
+    )
+    .map_err(|e| format!("set bucket bpa: {e}"))?;
+    Ok(())
+}
+
+pub fn get_bucket_bpa(conn: &Connection, bucket: &str) -> Result<BucketBpa, String> {
+    if !head_bucket(conn, bucket)? {
+        return Err("NoSuchBucket".to_string());
+    }
+    let mut stmt = conn
+        .prepare("SELECT block_public_acls, ignore_public_acls, block_public_policy, restrict_public_buckets FROM bucket_bpa WHERE bucket = ?")
+        .map_err(|e| format!("prepare get bucket bpa: {e}"))?;
+    let mut rows = stmt
+        .query_map([bucket], |r| {
+            let b1: i32 = r.get(0)?;
+            let b2: i32 = r.get(1)?;
+            let b3: i32 = r.get(2)?;
+            let b4: i32 = r.get(3)?;
+            Ok(BucketBpa {
+                block_public_acls: b1 != 0,
+                ignore_public_acls: b2 != 0,
+                block_public_policy: b3 != 0,
+                restrict_public_buckets: b4 != 0,
+            })
+        })
+        .map_err(|e| format!("query get bucket bpa: {e}"))?;
+    match rows.next() {
+        Some(Ok(b)) => Ok(b),
+        Some(Err(e)) => Err(format!("row bucket bpa: {e}")),
+        None => Ok(BucketBpa::default()),
+    }
+}
+
+pub fn delete_bucket_bpa(conn: &Connection, bucket: &str) -> Result<bool, String> {
+    if !head_bucket(conn, bucket)? {
+        return Err("NoSuchBucket".to_string());
+    }
+    let affected = conn
+        .execute("DELETE FROM bucket_bpa WHERE bucket = ?", [bucket])
+        .map_err(|e| format!("delete bucket bpa: {e}"))?;
+    Ok(affected > 0)
+}
+
+// Object Lock Config
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectLockConfig {
+    pub status: String,
+    pub default_retention_mode: Option<String>,
+    pub default_retention_days: Option<i32>,
+}
+
+pub fn set_bucket_object_lock_config(
+    conn: &Connection,
+    bucket: &str,
+    cfg: &ObjectLockConfig,
+) -> Result<(), String> {
+    if !head_bucket(conn, bucket)? {
+        return Err("NoSuchBucket".to_string());
+    }
+    conn.execute(
+        "INSERT INTO bucket_lock_configs(bucket, status, default_retention_mode, default_retention_days)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(bucket) DO UPDATE SET
+            status=excluded.status,
+            default_retention_mode=excluded.default_retention_mode,
+            default_retention_days=excluded.default_retention_days,
+            updated_at=datetime('now')",
+        rusqlite::params![bucket, cfg.status, cfg.default_retention_mode, cfg.default_retention_days],
+    )
+    .map_err(|e| format!("set bucket object lock config: {e}"))?;
+    Ok(())
+}
+
+pub fn get_bucket_object_lock_config(
+    conn: &Connection,
+    bucket: &str,
+) -> Result<Option<ObjectLockConfig>, String> {
+    if !head_bucket(conn, bucket)? {
+        return Err("NoSuchBucket".to_string());
+    }
+    let mut stmt = conn
+        .prepare("SELECT status, default_retention_mode, default_retention_days FROM bucket_lock_configs WHERE bucket = ?")
+        .map_err(|e| format!("prepare get bucket lock config: {e}"))?;
+    let mut rows = stmt
+        .query_map([bucket], |r| {
+            Ok(ObjectLockConfig {
+                status: r.get(0)?,
+                default_retention_mode: r.get(1)?,
+                default_retention_days: r.get(2)?,
+            })
+        })
+        .map_err(|e| format!("query get bucket lock config: {e}"))?;
+    match rows.next() {
+        Some(Ok(c)) => Ok(Some(c)),
+        Some(Err(e)) => Err(format!("row bucket lock config: {e}")),
+        None => Ok(None),
+    }
+}
+
+// Object Retention & Legal Hold
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectRetention {
+    pub mode: String,
+    pub retain_until_date: String,
+}
+
+pub fn set_object_retention(
+    conn: &Connection,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    mode: &str,
+    retain_until_date: &str,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO object_locks(bucket, key, version_id, retain_until_date, mode, legal_hold)
+         VALUES (?, ?, ?, ?, ?, 0)
+         ON CONFLICT(bucket, key, version_id) DO UPDATE SET
+            retain_until_date=excluded.retain_until_date,
+            mode=excluded.mode,
+            updated_at=datetime('now')",
+        rusqlite::params![bucket, key, version_id, retain_until_date, mode],
+    )
+    .map_err(|e| format!("set object retention: {e}"))?;
+    Ok(())
+}
+
+pub fn get_object_retention(
+    conn: &Connection,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<Option<ObjectRetention>, String> {
+    let mut stmt = conn
+        .prepare("SELECT mode, retain_until_date FROM object_locks WHERE bucket = ? AND key = ? AND version_id = ? AND mode IS NOT NULL")
+        .map_err(|e| format!("prepare get object retention: {e}"))?;
+    let mut rows = stmt
+        .query_map(rusqlite::params![bucket, key, version_id], |r| {
+            let m: Option<String> = r.get(0)?;
+            let d: Option<String> = r.get(1)?;
+            Ok((m, d))
+        })
+        .map_err(|e| format!("query get object retention: {e}"))?;
+    match rows.next() {
+        Some(Ok((Some(mode), Some(retain_until_date)))) => Ok(Some(ObjectRetention {
+            mode,
+            retain_until_date,
+        })),
+        _ => Ok(None),
+    }
+}
+
+pub fn set_object_legal_hold(
+    conn: &Connection,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+    on: bool,
+) -> Result<(), String> {
+    let legal_hold_val = if on { 1 } else { 0 };
+    conn.execute(
+        "INSERT INTO object_locks(bucket, key, version_id, retain_until_date, mode, legal_hold)
+         VALUES (?, ?, ?, NULL, NULL, ?)
+         ON CONFLICT(bucket, key, version_id) DO UPDATE SET
+            legal_hold=excluded.legal_hold,
+            updated_at=datetime('now')",
+        rusqlite::params![bucket, key, version_id, legal_hold_val],
+    )
+    .map_err(|e| format!("set object legal hold: {e}"))?;
+    Ok(())
+}
+
+pub fn get_object_legal_hold(
+    conn: &Connection,
+    bucket: &str,
+    key: &str,
+    version_id: &str,
+) -> Result<bool, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT legal_hold FROM object_locks WHERE bucket = ? AND key = ? AND version_id = ?",
+        )
+        .map_err(|e| format!("prepare get object legal hold: {e}"))?;
+    let mut rows = stmt
+        .query_map(rusqlite::params![bucket, key, version_id], |r| {
+            let lh: i32 = r.get(0)?;
+            Ok(lh != 0)
+        })
+        .map_err(|e| format!("query get object legal hold: {e}"))?;
+    match rows.next() {
+        Some(Ok(on)) => Ok(on),
+        _ => Ok(false),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1128,6 +1530,68 @@ mod tests {
         assert_eq!(schema_version(&conn).unwrap(), 1);
         apply_migration(&mut conn, 2, MIGRATION_002).unwrap();
         assert_eq!(schema_version(&conn).unwrap(), 2);
+        apply_migration(&mut conn, 3, MIGRATION_003).unwrap();
+        assert_eq!(schema_version(&conn).unwrap(), 3);
+    }
+
+    #[test]
+    fn test_m4_dal_crud() {
+        let (_dir, conn) = test_db();
+        create_bucket(&conn, "m4-bkt", "telecrate-1").unwrap();
+
+        // Access Keys CRUD
+        create_access_key(&conn, "AKIA123", "secret123", Some("test key")).unwrap();
+        let key = get_access_key(&conn, "AKIA123").unwrap().unwrap();
+        assert_eq!(key.access_key_id, "AKIA123");
+        assert_eq!(key.secret_key, "secret123");
+        assert_eq!(key.status, "Active");
+        let keys = list_access_keys(&conn).unwrap();
+        assert_eq!(keys.len(), 1);
+        assert!(delete_access_key(&conn, "AKIA123").unwrap());
+        assert!(get_access_key(&conn, "AKIA123").unwrap().is_none());
+
+        // Bucket Policy CRUD
+        set_bucket_policy(&conn, "m4-bkt", "{\"Version\":\"2012-10-17\"}").unwrap();
+        assert_eq!(
+            get_bucket_policy(&conn, "m4-bkt").unwrap().unwrap(),
+            "{\"Version\":\"2012-10-17\"}"
+        );
+        assert!(delete_bucket_policy(&conn, "m4-bkt").unwrap());
+        assert!(get_bucket_policy(&conn, "m4-bkt").unwrap().is_none());
+
+        // Bucket CORS CRUD
+        set_bucket_cors(&conn, "m4-bkt", "{\"CORSRules\":[]}").unwrap();
+        assert_eq!(
+            get_bucket_cors(&conn, "m4-bkt").unwrap().unwrap(),
+            "{\"CORSRules\":[]}"
+        );
+        assert!(delete_bucket_cors(&conn, "m4-bkt").unwrap());
+        assert!(get_bucket_cors(&conn, "m4-bkt").unwrap().is_none());
+
+        // BPA CRUD
+        let bpa = BucketBpa {
+            block_public_acls: true,
+            ignore_public_acls: true,
+            block_public_policy: true,
+            restrict_public_buckets: true,
+        };
+        set_bucket_bpa(&conn, "m4-bkt", &bpa).unwrap();
+        assert_eq!(get_bucket_bpa(&conn, "m4-bkt").unwrap(), bpa);
+        assert!(delete_bucket_bpa(&conn, "m4-bkt").unwrap());
+
+        // Object Lock Config CRUD
+        let cfg = ObjectLockConfig {
+            status: "Enabled".to_string(),
+            default_retention_mode: Some("GOVERNANCE".to_string()),
+            default_retention_days: Some(30),
+        };
+        set_bucket_object_lock_config(&conn, "m4-bkt", &cfg).unwrap();
+        assert_eq!(
+            get_bucket_object_lock_config(&conn, "m4-bkt")
+                .unwrap()
+                .unwrap(),
+            cfg
+        );
     }
 
     fn test_db() -> (tempfile::TempDir, Connection) {

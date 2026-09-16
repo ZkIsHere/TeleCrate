@@ -122,6 +122,115 @@ pub fn decrypt_chunk(
     Ok(buf)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SseConfig {
+    None,
+    SseS3 {
+        algorithm: String,
+    },
+    SseC {
+        algorithm: String,
+        key_b64: String,
+        key_md5_b64: String,
+        key_bytes: [u8; 32],
+    },
+}
+
+pub fn parse_and_validate_sse_headers(
+    headers: &axum::http::HeaderMap,
+) -> Result<SseConfig, (axum::http::StatusCode, &'static str, &'static str)> {
+    use axum::http::StatusCode;
+
+    let sse_s3 = headers
+        .get("x-amz-server-side-encryption")
+        .and_then(|v| v.to_str().ok());
+    let sse_c_algo = headers
+        .get("x-amz-server-side-encryption-customer-algorithm")
+        .and_then(|v| v.to_str().ok());
+    let sse_c_key = headers
+        .get("x-amz-server-side-encryption-customer-key")
+        .and_then(|v| v.to_str().ok());
+    let sse_c_key_md5 = headers
+        .get("x-amz-server-side-encryption-customer-key-md5")
+        .and_then(|v| v.to_str().ok());
+
+    if sse_s3.is_some() && sse_c_algo.is_some() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "The request cannot contain both SSE and SSE-C headers.",
+        ));
+    }
+
+    if let Some(algo) = sse_s3 {
+        if algo != "AES256" && algo != "aws:kms" {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "InvalidEncryptionAlgorithmError",
+                "The encryption algorithm supplied is not supported. Only AES256 is supported.",
+            ));
+        }
+        return Ok(SseConfig::SseS3 {
+            algorithm: algo.to_string(),
+        });
+    }
+
+    if let Some(algo) = sse_c_algo {
+        if algo != "AES256" {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "InvalidEncryptionAlgorithmError",
+                "The customer-provided encryption algorithm of the request is not supported.",
+            ));
+        }
+        let key_b64 = sse_c_key.ok_or((
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "The secret key was not provided.",
+        ))?;
+        let key_md5_b64 = sse_c_key_md5.ok_or((
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "The secret key MD5 was not provided.",
+        ))?;
+
+        let decoded = crate::s3::base64_decode(key_b64).ok_or((
+            StatusCode::BAD_REQUEST,
+            "InvalidArgument",
+            "The secret key is invalid base64.",
+        ))?;
+        if decoded.len() != 32 {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "InvalidArgument",
+                "The secret key is invalid. Key must be 256 bits (32 bytes).",
+            ));
+        }
+        let mut key_bytes = [0u8; 32];
+        key_bytes.copy_from_slice(&decoded);
+
+        let computed_md5 = md5::compute(key_bytes);
+        let computed_md5_b64 = crate::s3::base64_encode(computed_md5.as_ref());
+
+        if computed_md5_b64.trim() != key_md5_b64.trim() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                "InvalidDigest",
+                "The calculated MD5 hash of the key does not match the provided MD5 hash.",
+            ));
+        }
+
+        return Ok(SseConfig::SseC {
+            algorithm: algo.to_string(),
+            key_b64: key_b64.to_string(),
+            key_md5_b64: key_md5_b64.to_string(),
+            key_bytes,
+        });
+    }
+
+    Ok(SseConfig::None)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
