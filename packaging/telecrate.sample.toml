@@ -19,8 +19,8 @@ region = "us-east-1"
 admin_password = "123456"
 
 # Cấu hình kết nối Telegram Bot API làm backend lưu trữ bền vững
-telegram_bot_token = "8561102435:AAFiIJVS-MvhV6laVCOeZbLhlCUpQIqEDeg"
-telegram_chat_id = -5318349928
+telegram_bot_token = ""
+telegram_chat_id = 0
 telegram_base_url = "https://api.telegram.org"
 
 # Kích thước chunk upload Telegram (mặc định 8 MiB)
