@@ -14,8 +14,8 @@
   <!-- Đăng nhập -->
   <div id="auth-view" class="auth-wrap">
     <form id="login-form" class="auth-card" autocomplete="off">
-      <h1>TeleCrate</h1>
-      <p class="muted">Đăng nhập quản trị instance self-hosted</p>
+      <div class="auth-brand"><span class="auth-mark">T</span><h1>TeleCrate</h1></div>
+      <p class="muted small">Đăng nhập quản trị instance self-hosted</p>
       <label class="field">
         <span>Mật khẩu quản trị</span>
         <input type="password" id="admin-password" autocomplete="current-password" required>
@@ -29,6 +29,7 @@
   <div id="main-view" class="app hidden">
     <aside class="side">
       <div class="brand">TeleCrate <span class="ver" id="app-version"></span></div>
+      <div class="nav-label">Quản trị</div>
       <nav class="nav" aria-label="Điều hướng">
         <button class="nav-item active" data-tab="overview">Tổng quan</button>
         <button class="nav-item" data-tab="storage">Buckets</button>
@@ -56,19 +57,17 @@
       <!-- TỔNG QUAN -->
       <section id="tab-overview" class="tab active" aria-label="Tổng quan">
         <div id="ov-error" class="alert-error hidden"></div>
-        <table class="kv" id="ov-table">
-          <tbody>
-            <tr><th>Buckets</th><td id="ov-buckets">—</td></tr>
-            <tr><th>Objects</th><td id="ov-objects">—</td></tr>
-            <tr><th>Access keys</th><td id="ov-keys">—</td></tr>
-            <tr><th>Spool đang chờ</th><td id="ov-spool">—</td></tr>
-            <tr><th>Jobs chờ / đang chạy</th><td id="ov-jobs">—</td></tr>
-            <tr><th>Workers</th><td id="ov-workers">—</td></tr>
-            <tr><th>Dung lượng DB</th><td id="ov-db">—</td></tr>
-            <tr><th>Uptime</th><td id="ov-uptime">—</td></tr>
-          </tbody>
-        </table>
-        <p class="muted small">Số liệu thật từ daemon. Không có quota Telegram — bảng chỉ hiện bytes TeleCrate đã index/đang chờ.</p>
+        <div class="stats">
+          <div class="stat"><div class="k">Buckets</div><div class="v" id="ov-buckets">—</div></div>
+          <div class="stat"><div class="k">Objects</div><div class="v" id="ov-objects">—</div></div>
+          <div class="stat"><div class="k">Access keys</div><div class="v" id="ov-keys">—</div></div>
+          <div class="stat"><div class="k">Spool đang chờ</div><div class="v" id="ov-spool">—</div></div>
+          <div class="stat"><div class="k">Jobs chờ / chạy</div><div class="v" id="ov-jobs">—</div></div>
+          <div class="stat"><div class="k">Workers</div><div class="v" id="ov-workers">—</div></div>
+          <div class="stat"><div class="k">Dung lượng DB</div><div class="v" id="ov-db">—</div></div>
+          <div class="stat"><div class="k">Uptime</div><div class="v" id="ov-uptime">—</div></div>
+        </div>
+        <p class="note muted small" style="border:0;padding:0">Số liệu thật từ daemon. Không có quota Telegram — chỉ hiện bytes TeleCrate đã index/đang chờ.</p>
       </section>
 
       <!-- BUCKETS -->
@@ -78,16 +77,16 @@
           <button id="btn-new-bucket" class="btn primary sm">Tạo bucket</button>
         </div>
         <div id="bucket-error" class="alert-error hidden"></div>
-        <table class="data" id="bucket-table">
+        <div class="card"><table class="data" id="bucket-table">
           <thead><tr><th>Tên</th><th>Region</th><th>Versioning</th><th>Tạo lúc</th><th></th></tr></thead>
           <tbody id="bucket-tbody"><tr><td colspan="5" class="muted">Đang nạp…</td></tr></tbody>
-        </table>
-        <div id="object-panel" class="panel hidden">
-          <div class="panel-head">
+        </table></div>
+        <div id="object-panel" class="card hidden">
+          <div class="card-head">
             <h3 id="object-title">Objects</h3>
             <button class="btn ghost sm" id="btn-close-objects">Đóng</button>
           </div>
-          <div id="object-error" class="alert-error hidden"></div>
+          <div id="object-error" class="alert-error hidden" style="margin:10px 14px 0"></div>
           <table class="data">
             <thead><tr><th>Key</th><th>Kích thước</th><th>Đồng bộ</th><th>ETag</th><th>Tạo lúc</th></tr></thead>
             <tbody id="object-tbody"></tbody>
@@ -103,10 +102,10 @@
         </div>
         <p class="muted small">Secret chỉ hiện <strong>đúng một lần</strong> lúc tạo. Bảng này không bao giờ render secret.</p>
         <div id="key-error" class="alert-error hidden"></div>
-        <table class="data">
+        <div class="card"><table class="data">
           <thead><tr><th>Key ID</th><th>User</th><th>Trạng thái</th><th>Tạo lúc</th><th></th></tr></thead>
           <tbody id="key-tbody"><tr><td colspan="5" class="muted">Đang nạp…</td></tr></tbody>
-        </table>
+        </table></div>
         <div id="new-secret" class="alert-warn hidden" role="alert"></div>
       </section>
 
@@ -137,11 +136,11 @@
 
       <!-- BẢO TRÌ -->
       <section id="tab-maintenance" class="tab" aria-label="Bảo trì">
-        <div class="ops">
+        <div class="card"><div class="ops">
           <div class="op"><div><h3>Garbage Collection</h3><p class="muted">Dọn spool mồ côi, parts bỏ dở.</p></div><button class="btn sm" data-op="/admin/api/gc" data-out="out-gc">Chạy GC</button></div>
           <div class="op"><div><h3>Doctor</h3><p class="muted">Kiểm tra sức khỏe index/spool.</p></div><button class="btn sm" data-op="/admin/api/doctor" data-out="out-doctor">Chạy Doctor</button></div>
           <div class="op"><div><h3>Backup DB</h3><p class="muted">Sao lưu database index.</p></div><button class="btn sm" data-op="/admin/api/backup" data-out="out-backup">Sao lưu</button></div>
-        </div>
+        </div></div>
         <pre id="out-gc" class="output hidden"></pre>
         <pre id="out-doctor" class="output hidden"></pre>
         <pre id="out-backup" class="output hidden"></pre>
@@ -163,10 +162,10 @@
         </div>
         <div id="log-error" class="alert-error hidden"></div>
         <div id="log-count" class="muted small"></div>
-        <table class="data logs">
+        <div class="card"><table class="data logs">
           <thead><tr><th>Thời gian</th><th>Mức</th><th>Actor</th><th>Hành động</th><th>Chi tiết</th></tr></thead>
           <tbody id="log-tbody"><tr><td colspan="5" class="muted">Đang nạp…</td></tr></tbody>
-        </table>
+        </table></div>
         <div class="pager">
           <button id="log-prev" class="btn ghost sm">← Trước</button>
           <span id="log-page" class="muted small"></span>
