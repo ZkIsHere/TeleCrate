@@ -97,7 +97,7 @@ jobs:
           export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
           command -v aws && aws --version
           command -v rclone && rclone version | head -1
-          command -v mc && mc --version
+          command -v mc && mc --version || echo "mc optional, skipped"
       - name: dựng daemon tạm + chạy conformance
         run: |
           export PATH="$HOME/.local/bin:$PATH"
