@@ -88,8 +88,11 @@ jobs:
             fi
           fi
           if ! command -v mc >/dev/null 2>&1; then
-            curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc
-            chmod +x /usr/local/bin/mc
+            # dl.min.io cũ đã 410; thử host mới, thất bại thì bỏ qua (mc tùy chọn).
+            curl -fsSL https://dl.minio.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc 2>/dev/null \
+              || curl -fsSL https://dl.min.io/client/mc/release/linux-amd64/mc -o /usr/local/bin/mc 2>/dev/null \
+              || echo "mc install skipped (optional)"
+            chmod +x /usr/local/bin/mc 2>/dev/null || true
           fi
           export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
           command -v aws && aws --version

@@ -21,12 +21,17 @@ export AWS_DEFAULT_REGION="${AWS_REGION}"
 export AWS_EC2_METADATA_DISABLED=true
 
 need() {
+  # Tool bắt buộc (aws): thiếu là FAIL luôn.
   if ! command -v "$1" >/dev/null 2>&1; then
-    if [ "$STRICT" = "1" ]; then
-      echo "FAIL: thiếu tool bắt buộc '$1' (STRICT=1)" >&2
-      exit 1
-    fi
-    echo "SKIP: '$1' chưa cài (STRICT=0)"
+    echo "FAIL: thiếu tool bắt buộc '$1'" >&2
+    exit 1
+  fi
+}
+
+optional() {
+  # Tool tùy chọn (rclone/mc): thiếu thì skip, kể cả STRICT.
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "SKIP: '$1' chưa cài"
     return 1
   fi
   return 0
@@ -86,12 +91,12 @@ echo "[aws] head-object OK"
 echo "== S3 conformance PASS (aws) =="
 
 # 7. rclone / mc: tùy chọn, skip khi thiếu (kể cả STRICT).
-if need rclone; then
+if optional rclone; then
   R=":s3,provider=Other,endpoint=${ENDPOINT},access_key_id=${AWS_ACCESS_KEY_ID},secret_access_key=${AWS_SECRET_ACCESS_KEY},region=${AWS_REGION}:tc-conf-rclone"
   rclone mkdir "$R" && rclone rmdir "$R"
   echo "== rclone PASS (optional) =="
 fi
-if need mc; then
+if optional mc; then
   mc alias set telecrate "${ENDPOINT}" "${AWS_ACCESS_KEY_ID}" "${AWS_SECRET_ACCESS_KEY}" >/dev/null
   mc mb telecrate/tc-conf-mc && mc rb telecrate/tc-conf-mc
   echo "== mc PASS (optional) =="
