@@ -10,12 +10,18 @@ use crate::telegram::{RemoteLocator, Transport, TransportError};
 
 /// Claim 1 job sẵn sàng bằng lease. Lấy job `pending` tới hạn, hoặc job `uploading`
 /// mà lease đã hết (worker cũ chết giữa chừng — reclaim, chống kẹt hàng đợi).
+///
+/// `now` so sánh chuỗi với cột datetime SQLite (`YYYY-MM-DD HH:MM:SS`); hàm chấp nhận
+/// cả ISO-8601 (`YYYY-MM-DDTHH:MM:SSZ`) và chuẩn hóa trước khi so sánh để caller
+/// khác format không claim sai lặng lẽ.
 fn claim_job(
     conn: &Connection,
     owner: &str,
     lease_secs: i64,
     now: &str,
 ) -> Result<Option<Claimed>, String> {
+    let normalized = now.replace('T', " ").trim_end_matches('Z').to_string();
+    let now = normalized.as_str();
     let mut stmt = conn
         .prepare("SELECT job_id, version_id, retry_count FROM upload_jobs WHERE next_attempt <= ? AND ((state = 'pending') OR (state = 'uploading' AND lease_expires IS NOT NULL AND lease_expires <= ?)) ORDER BY next_attempt LIMIT 1")
         .map_err(|e| format!("poll prepare: {e}"))?;

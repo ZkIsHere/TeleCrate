@@ -17,6 +17,13 @@ fn setup_test_env() -> (TempDir, String, String) {
     (dir, db_path, spool_dir)
 }
 
+/// Giờ DB hiện tại — truyền cho worker thay vì hardcode ngày (hardcode làm test
+/// thối theo thời gian vì `next_attempt` so sánh chuỗi với giờ thật).
+fn db_now(conn: &rusqlite::Connection) -> String {
+    conn.query_row("SELECT datetime('now')", [], |r| r.get(0))
+        .unwrap()
+}
+
 /// Crash Point 1: Dở dang khi ghi file `.tmp` trước khi rename.
 /// Phục hồi: `reconcile_spool` dọn sạch file `.tmp` mồ côi.
 #[test]
@@ -180,15 +187,8 @@ fn crash_point_4_accepted_local_readable_and_worker_resumes() {
 
     // Giả lập worker chạy: claim job, upload mock transport, commit remote
     let mock_transport = telecrate::telegram::MockTransport::default();
-    telecrate::worker::process_one_job(
-        &conn,
-        &mock_transport,
-        100,
-        true,
-        "w1",
-        "2026-09-16T14:00:00Z",
-    )
-    .unwrap();
+    telecrate::worker::process_one_job(&conn, &mock_transport, 100, true, "w1", &db_now(&conn))
+        .unwrap();
 
     let chunks_after = db::chunks_of(&conn, "v-local-1").unwrap();
     assert_eq!(chunks_after[0].state, "remote");
@@ -244,7 +244,7 @@ fn crash_point_5_worker_crash_before_remote_db_commit() {
         200,
         true,
         "worker-alive",
-        "2026-09-16T14:00:00Z",
+        &db_now(&conn),
     )
     .unwrap();
     assert!(processed);
@@ -289,15 +289,8 @@ fn crash_point_6_remote_committed_before_spool_gc() {
     .unwrap();
 
     let mock_transport = telecrate::telegram::MockTransport::default();
-    telecrate::worker::process_one_job(
-        &conn,
-        &mock_transport,
-        300,
-        true,
-        "w-gc",
-        "2026-09-16T14:00:00Z",
-    )
-    .unwrap();
+    telecrate::worker::process_one_job(&conn, &mock_transport, 300, true, "w-gc", &db_now(&conn))
+        .unwrap();
 
     // Sau khi process_one_job thành công, spool file đã được dọn dẹp an toàn qua GC
     assert!(!chunk_file.exists());
@@ -506,7 +499,7 @@ fn crash_point_10_complete_multipart_crash_recovery() {
         1000,
         true,
         "w-mp-10",
-        "2026-09-16T14:00:00Z",
+        &db_now(&conn),
     )
     .unwrap();
     assert!(processed);
