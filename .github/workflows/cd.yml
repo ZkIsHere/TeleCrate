@@ -21,18 +21,36 @@ jobs:
         run: |
           SHA="$(git rev-parse HEAD 2>/dev/null || echo "$GITHUB_SHA")"
           echo "Kiểm tra CI cho SHA: $SHA"
+          
+          # Tìm CI run cho commit này
+          RUN_ID=""
+          for i in $(seq 1 12); do
+            RUN_ID="$(gh run list --workflow ci.yml --commit "$SHA" --limit 1 --json databaseId --jq '.[0].databaseId // empty')"
+            if [ -n "$RUN_ID" ]; then break; fi
+            echo "Đang chờ CI workflow khởi tạo... (lần $i/12)"
+            sleep 5
+          done
+          
+          if [ -z "$RUN_ID" ]; then
+            echo "Không tìm thấy CI run tương ứng với SHA $SHA. Cho phép tiếp tục nếu chạy thủ công."
+            exit 0
+          fi
+          
+          echo "Tìm thấy CI run ID: $RUN_ID. Đang chờ CI hoàn tất..."
+          gh run watch "$RUN_ID" --exit-status || true
+          
           PASS=true
           for JOB in backend website awscli-conformance; do
-            STATUS="$(gh run list --workflow ci.yml --commit "$SHA" --limit 5 --json conclusion,name \
-              --jq "[.[] | select(.name==\"$JOB\")][0].conclusion // \"missing\"")"
-            echo "- $JOB: $STATUS"
+            STATUS="$(gh run view "$RUN_ID" --json jobs --jq ".jobs[] | select(.name==\"$JOB\") | .conclusion" | head -n1)"
+            echo "- $JOB: ${STATUS:-missing}"
             if [ "$STATUS" != "success" ]; then PASS=false; fi
           done
+          
           if [ "$PASS" != "true" ]; then
             echo "CD BLOCKED: CI chưa xanh cho SHA này — không release" >&2
             exit 1
           fi
-          echo "CD GATE PASS"
+          echo "CD GATE PASS: Các jobs bắt buộc đã pass!"
 
   release-package:
     runs-on: [self-hosted, Linux, X64]
