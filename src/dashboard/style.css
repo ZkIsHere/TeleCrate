@@ -216,8 +216,8 @@ html[data-theme="dark"] .btn.danger:hover { color: #0d1117; }
 .state[data-state="up"]::before { background: var(--ok); }
 .state[data-state="down"]::before { background: var(--danger); }
 
-/* ---------- Main Content Area ---------- */
-.main { padding: 18px 24px 60px; min-width: 0; max-width: 1200px; }
+/* ---------- Main Content Area (Fluid full-width layout) ---------- */
+.main { padding: 18px 30px 60px; min-width: 0; width: 100%; }
 .topbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; margin-bottom: 14px; }
 .topbar h2 { margin: 0; font-size: 18px; font-weight: 650; letter-spacing: -0.01em; }
 .topbar-actions { display: flex; gap: 8px; align-items: center; }
@@ -242,7 +242,7 @@ html[data-theme="dark"] .btn.danger:hover { color: #0d1117; }
 .state-dot.warn { background: var(--warn-fg); }
 .state-dot.err { background: var(--danger); }
 
-.stats { display: grid; grid-template-columns: repeat(auto-fill, minmax(135px, 1fr)); gap: 10px; margin-bottom: 14px; }
+.stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 10px; margin-bottom: 14px; }
 .stat {
   background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
   padding: 10px 12px; box-shadow: var(--shadow-sm);
@@ -261,14 +261,14 @@ html[data-theme="dark"] .btn.danger:hover { color: #0d1117; }
 .progress-fill.warn { background: var(--warn-fg); }
 .progress-fill.err { background: var(--danger); }
 
-/* ---------- Charts Grid ---------- */
-.chart-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); gap: 14px; margin-bottom: 16px; }
+/* ---------- Charts Grid (Balanced 2x2 grid) ---------- */
+.chart-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; margin-bottom: 16px; }
 .chart-card {
   background: var(--bg); border: 1px solid var(--border); border-radius: var(--radius);
   padding: 12px 14px 10px; box-shadow: var(--shadow-sm);
 }
 .chart-title { font-size: 12px; font-weight: 650; text-transform: uppercase; letter-spacing: 0.04em; color: var(--muted); margin-bottom: 8px; }
-.chart-card canvas { width: 100%; height: 150px; display: block; }
+.chart-card canvas { width: 100%; height: 180px; display: block; }
 
 /* ---------- Toolbars & Cards ---------- */
 .toolbar { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; align-items: center; }

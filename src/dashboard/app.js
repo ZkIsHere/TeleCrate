@@ -1304,8 +1304,16 @@ $('modal-form')?.addEventListener('submit', async (e) => {
 });
 
 /* ==========================================================================
-   Start
+   Start & Viewport Handling
    ========================================================================== */
+let resizeTimer = null;
+window.addEventListener('resize', () => {
+  clearTimeout(resizeTimer);
+  resizeTimer = setTimeout(() => {
+    if (state.tab === 'overview') drawAllCharts();
+  }, 100);
+});
+
 initTheme();
 checkSession();
 })();
