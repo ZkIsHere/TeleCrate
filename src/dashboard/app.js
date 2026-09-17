@@ -416,7 +416,7 @@ async function loadOverview() {
     if (hsDot) hsDot.className = 'state-dot' + (spoolPct > 90 ? ' err' : spoolPct > 75 ? ' warn' : '');
     $('hs-status').textContent = 'Hệ thống sẵn sàng';
     $('hs-uptime').textContent = fmtUptime(d.uptime_secs ?? d.uptime_seconds);
-    $('hs-version').textContent = d.version ? 'v' + d.version : 'v0.1.0';
+    $('hs-version').textContent = d.version ? 'v' + d.version : 'v0.2.0';
     $('app-version').textContent = d.version ? 'v' + d.version : '';
 
     // Badges in sidebar

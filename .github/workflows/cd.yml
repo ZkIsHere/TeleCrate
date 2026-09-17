@@ -68,6 +68,6 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="${GITHUB_REF_NAME:-v0.1.0}"
+          TAG="${GITHUB_REF_NAME:-v0.2.0}"
           echo "Uploading release assets for tag $TAG..."
           gh release upload "$TAG" dist/* --clobber || gh release create "$TAG" dist/* --title "TeleCrate $TAG" --notes "Automated CD Build for TeleCrate $TAG"
