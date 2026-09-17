@@ -217,10 +217,12 @@ pub fn canonical_request(
         _ => sha256_hex(req.body),
     };
     let (canon_headers, signed_list) = canonical_headers(req.headers, signed)?;
+    // Path dùng NGUYÊN BẢN như trên request line (đã percent-encoded bởi client).
+    // Tự encode lại sẽ double-encode (%20 -> %2520) và lệch chữ ký với key có ký tự đặc biệt.
     let c = format!(
         "{}\n{}\n{}\n{}\n{}\n{}",
         req.method,
-        encode(req.path, true),
+        req.path,
         canonical_query(req.query),
         canon_headers,
         signed_list,
@@ -642,18 +644,24 @@ mod tests {
     }
 
     #[test]
-    fn unicode_path_and_query_canonicalization() {
+    fn encoded_path_used_verbatim_no_double_encode() {
+        // Path trên request line đã encoded — canonical giữ nguyên, không encode lại.
+        // Encode lại sẽ biến %20 thành %2520 và lệch chữ ký với AWS CLI thật.
         let headers = vec![h("host", "x"), h("x-amz-date", "20260915T120000Z")];
         let req = SignableRequest {
             method: "GET",
-            path: "/b/cà-phê",
+            path: "/b/c%C3%A0-ph%C3%AA/a%20b%2B100%25.txt",
             query: "prefix=a/b&max-keys=2",
             headers: &headers,
             authorization: "",
             body: b"",
         };
         let (canon, _, _) = canonical_request(&req, &["host", "x-amz-date"]).unwrap();
-        assert!(canon.contains("/b/c%C3%A0-ph%C3%AA"), "{canon}");
+        assert!(
+            canon.contains("/b/c%C3%A0-ph%C3%AA/a%20b%2B100%25.txt"),
+            "{canon}"
+        );
+        assert!(!canon.contains("%252"), "double-encode: {canon}");
         assert!(canon.contains("max-keys=2&prefix=a%2Fb"), "{canon}");
     }
 
