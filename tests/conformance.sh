@@ -90,10 +90,26 @@ echo "[aws] head-object OK"
 
 echo "== S3 conformance PASS (aws) =="
 
-# 7. rclone / mc: tùy chọn, skip khi thiếu (kể cả STRICT).
+# 7. rclone / mc: tùy chọn, skip khi thiếu (kể cả STRICT). Khi có thì test nghiêm.
 if optional rclone; then
-  R=":s3,provider=Other,endpoint=${ENDPOINT},access_key_id=${AWS_ACCESS_KEY_ID},secret_access_key=${AWS_SECRET_ACCESS_KEY},region=${AWS_REGION}:tc-conf-rclone"
-  rclone mkdir "$R" && rclone rmdir "$R"
+  # Connection-string inline parse sai endpoint chứa '://' -> dùng file config.
+  RCONF="$(mktemp)"
+  cat > "$RCONF" <<EOF
+[tc]
+type = s3
+provider = Other
+endpoint = ${ENDPOINT}
+access_key_id = ${AWS_ACCESS_KEY_ID}
+secret_access_key = ${AWS_SECRET_ACCESS_KEY}
+region = ${AWS_REGION}
+EOF
+  rclone --config "$RCONF" mkdir "tc:tc-conf-rclone"
+  rclone --config "$RCONF" ls "tc:tc-conf-rclone"
+  echo "hello-rclone" > /tmp/tc_rclone.txt
+  rclone --config "$RCONF" copyto /tmp/tc_rclone.txt "tc:tc-conf-rclone/f.txt"
+  rclone --config "$RCONF" cat "tc:tc-conf-rclone/f.txt" | cmp - /tmp/tc_rclone.txt
+  rclone --config "$RCONF" purge "tc:tc-conf-rclone"
+  rm -f "$RCONF"
   echo "== rclone PASS (optional) =="
 fi
 if optional mc; then

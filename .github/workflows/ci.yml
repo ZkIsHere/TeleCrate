@@ -11,6 +11,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: telecrate-ci
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo build
@@ -32,6 +35,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: telecrate-ci
       - name: live telegram probe (ignored test)
         env:
           TELECRATE_BOT_TOKEN: ${{ secrets.TELECRATE_BOT_TOKEN }}
@@ -50,6 +56,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: telecrate-ci
       - run: cargo build
       - run: bash tests/website.sh
 
@@ -60,6 +69,9 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: telecrate-ci
       - run: cargo build
       - name: cài AWS CLI / rclone / mc nếu thiếu
         run: |
@@ -115,6 +127,7 @@ jobs:
           ./target/debug/telecrate --config "$WORK/telecrate.toml" init
           ./target/debug/telecrate --config "$WORK/telecrate.toml" serve &>/tmp/tc-ci.log &
           DAEMON=$!
+          trap 'kill "$DAEMON" 2>/dev/null; echo "--- daemon log (tail) ---"; tail -30 /tmp/tc-ci.log' EXIT
           for _ in $(seq 1 50); do
             curl -fsS http://127.0.0.1:18081/health >/dev/null 2>&1 && break
             sleep 0.2
@@ -122,5 +135,4 @@ jobs:
           export ENDPOINT="http://127.0.0.1:18081"
           export STRICT=1
           bash tests/conformance.sh
-          kill "$DAEMON"
           rm -rf "$WORK"

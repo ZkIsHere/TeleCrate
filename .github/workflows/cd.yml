@@ -5,12 +5,44 @@ on:
       - 'v*'
   workflow_dispatch:
 
+permissions:
+  contents: write # tạo/sửa GitHub Release
+  actions: read # gate-ci đọc trạng thái CI
+
 jobs:
+  # Cổng bắt buộc: chỉ release khi CI của đúng SHA đã pass toàn bộ (backend + website + awscli).
+  # live-telegram được miễn (cần secrets, có thể UNVERIFIED) — release notes ghi rõ.
+  gate-ci:
+    runs-on: [self-hosted, Linux, X64]
+    steps:
+      - name: kiểm tra CI pass cho commit hiện tại
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          SHA="$(git rev-parse HEAD 2>/dev/null || echo "$GITHUB_SHA")"
+          echo "Kiểm tra CI cho SHA: $SHA"
+          PASS=true
+          for JOB in backend website awscli-conformance; do
+            STATUS="$(gh run list --workflow ci.yml --commit "$SHA" --limit 5 --json conclusion,name \
+              --jq "[.[] | select(.name==\"$JOB\")][0].conclusion // \"missing\"")"
+            echo "- $JOB: $STATUS"
+            if [ "$STATUS" != "success" ]; then PASS=false; fi
+          done
+          if [ "$PASS" != "true" ]; then
+            echo "CD BLOCKED: CI chưa xanh cho SHA này — không release" >&2
+            exit 1
+          fi
+          echo "CD GATE PASS"
+
   release-package:
     runs-on: [self-hosted, Linux, X64]
+    needs: gate-ci
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: telecrate-ci
 
       - name: Build Release Binary & Dev Binary
         run: |
