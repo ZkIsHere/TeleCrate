@@ -57,8 +57,12 @@ pub fn router(
             get(telecrate::admin::api_get_status).with_state(admin_state.clone()),
         )
         .route(
+            "/admin/api/metrics-history",
+            get(telecrate::admin::api_get_metrics_history).with_state(admin_state.clone()),
+        )
+        .route(
             "/admin/api/buckets",
-            get(telecrate::admin::api_list_buckets)
+            get(telecrate::admin::api_list_buckets_v2)
                 .post(telecrate::admin::api_create_bucket)
                 .with_state(admin_state.clone()),
         )
@@ -69,17 +73,66 @@ pub fn router(
         )
         .route(
             "/admin/api/buckets/:name/objects",
-            get(telecrate::admin::api_list_bucket_objects).with_state(admin_state.clone()),
+            get(telecrate::admin::api_list_bucket_objects_v2).with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/buckets/:name/objects-detail/*key",
+            get(telecrate::admin::api_get_object_detail)
+                .delete(telecrate::admin::api_delete_object)
+                .with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/buckets/:name/settings",
+            get(telecrate::admin::api_get_bucket_settings).with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/buckets/:name/versioning",
+            axum::routing::put(telecrate::admin::api_set_bucket_versioning)
+                .with_state(admin_state.clone()),
         )
         .route(
             "/admin/api/access-keys",
-            get(telecrate::admin::api_list_access_keys)
+            get(telecrate::admin::api_list_access_keys_v2)
                 .post(telecrate::admin::api_create_access_key)
                 .with_state(admin_state.clone()),
         )
         .route(
             "/admin/api/access-keys/:id",
-            axum::routing::delete(telecrate::admin::api_revoke_access_key)
+            axum::routing::put(telecrate::admin::api_update_access_key)
+                .patch(telecrate::admin::api_update_access_key)
+                .delete(telecrate::admin::api_revoke_access_key)
+                .with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/jobs",
+            get(telecrate::admin::api_list_jobs).with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/telegram-test",
+            axum::routing::post(telecrate::admin::api_telegram_test)
+                .with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/telegram/test",
+            axum::routing::post(telecrate::admin::api_telegram_test)
+                .with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/multipart-uploads",
+            get(telecrate::admin::api_list_multipart_uploads).with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/multipart/uploads",
+            get(telecrate::admin::api_list_multipart_uploads).with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/multipart-uploads/:id/abort",
+            axum::routing::post(telecrate::admin::api_abort_multipart_upload)
+                .with_state(admin_state.clone()),
+        )
+        .route(
+            "/admin/api/multipart/:id/abort",
+            axum::routing::post(telecrate::admin::api_abort_multipart_upload)
                 .with_state(admin_state.clone()),
         )
         .route(

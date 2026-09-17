@@ -49,6 +49,7 @@ pub fn apply_migration(conn: &mut Connection, version: i64, sql: &str) -> Result
 pub const MIGRATION_001: &str = include_str!("../migrations/0001_init.sql");
 pub const MIGRATION_002: &str = include_str!("../migrations/0002_m3_multipart_versioning.sql");
 pub const MIGRATION_003: &str = include_str!("../migrations/0003_m4_auth_policy_cors_lock.sql");
+pub const MIGRATION_004: &str = include_str!("../migrations/0004_dashboard_enhancements.sql");
 
 /// Apply tất cả migrations chưa apply từ 0 lên head.
 pub fn apply_all_migrations(conn: &mut Connection) -> Result<i64, String> {
@@ -64,6 +65,10 @@ pub fn apply_all_migrations(conn: &mut Connection) -> Result<i64, String> {
     if current < 3 {
         apply_migration(conn, 3, MIGRATION_003)?;
         current = 3;
+    }
+    if current < 4 {
+        apply_migration(conn, 4, MIGRATION_004)?;
+        current = 4;
     }
     Ok(current)
 }
@@ -1362,6 +1367,170 @@ pub fn delete_access_key(conn: &Connection, access_key_id: &str) -> Result<bool,
     Ok(affected > 0)
 }
 
+pub fn update_access_key_status(
+    conn: &Connection,
+    access_key_id: &str,
+    status: &str,
+) -> Result<bool, String> {
+    let canonical_status = if status.eq_ignore_ascii_case("active") {
+        "Active"
+    } else if status.eq_ignore_ascii_case("inactive") {
+        "Inactive"
+    } else {
+        return Err("status must be Active or Inactive".to_string());
+    };
+    let affected = conn
+        .execute(
+            "UPDATE access_keys SET status = ? WHERE access_key_id = ?",
+            rusqlite::params![canonical_status, access_key_id],
+        )
+        .map_err(|e| format!("update access_key status: {e}"))?;
+    Ok(affected > 0)
+}
+
+pub fn update_access_key_description(
+    conn: &Connection,
+    access_key_id: &str,
+    description: &str,
+) -> Result<bool, String> {
+    let affected = conn
+        .execute(
+            "UPDATE access_keys SET description = ? WHERE access_key_id = ?",
+            rusqlite::params![description, access_key_id],
+        )
+        .map_err(|e| format!("update access_key description: {e}"))?;
+    Ok(affected > 0)
+}
+
+pub fn update_access_key_allowed_buckets(
+    conn: &Connection,
+    access_key_id: &str,
+    allowed_buckets: Option<&str>,
+) -> Result<bool, String> {
+    let affected = conn
+        .execute(
+            "UPDATE access_keys SET allowed_buckets = ? WHERE access_key_id = ?",
+            rusqlite::params![allowed_buckets, access_key_id],
+        )
+        .map_err(|e| format!("update access_key allowed_buckets: {e}"))?;
+    Ok(affected > 0)
+}
+
+pub fn touch_access_key_last_used(conn: &Connection, access_key_id: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE access_keys SET last_used_at = datetime('now') WHERE access_key_id = ?",
+        [access_key_id],
+    )
+    .map_err(|e| format!("touch access_key last_used: {e}"))?;
+    Ok(())
+}
+
+/// Per-bucket stats: object count + total size.
+#[derive(Debug, Clone)]
+pub struct BucketStats {
+    pub name: String,
+    pub object_count: i64,
+    pub total_size_bytes: i64,
+}
+
+pub fn bucket_stats(conn: &Connection) -> Result<Vec<BucketStats>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT b.name, \
+             COALESCE((SELECT COUNT(*) FROM objects o WHERE o.bucket = b.name AND o.is_delete_marker = 0), 0), \
+             COALESCE((SELECT SUM(o.size) FROM objects o WHERE o.bucket = b.name AND o.is_delete_marker = 0), 0) \
+             FROM buckets b ORDER BY b.name",
+        )
+        .map_err(|e| format!("prepare bucket_stats: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(BucketStats {
+                name: r.get(0)?,
+                object_count: r.get(1)?,
+                total_size_bytes: r.get(2)?,
+            })
+        })
+        .map_err(|e| format!("query bucket_stats: {e}"))?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("rows bucket_stats: {e}"))
+}
+
+/// Upload job record for dashboard jobs viewer.
+#[derive(Debug, Clone)]
+pub struct JobRecord {
+    pub job_id: String,
+    pub version_id: String,
+    pub bucket: String,
+    pub key: String,
+    pub state: String,
+    pub retry_count: i64,
+    pub next_attempt: String,
+    pub lease_owner: Option<String>,
+    pub lease_expires: Option<String>,
+    pub last_error: Option<String>,
+    pub generation: i64,
+}
+
+/// Job summary counts.
+#[derive(Debug, Clone)]
+pub struct JobSummary {
+    pub pending: i64,
+    pub uploading: i64,
+    pub completed: i64,
+    pub failed: i64,
+}
+
+pub fn list_jobs(conn: &Connection) -> Result<(Vec<JobRecord>, JobSummary), String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT j.job_id, j.version_id, o.bucket, o.key, j.state, j.retry_count, \
+             j.next_attempt, j.lease_owner, j.lease_expires, j.last_error, j.generation \
+             FROM upload_jobs j LEFT JOIN objects o ON j.version_id = o.version_id \
+             ORDER BY j.next_attempt DESC LIMIT 200",
+        )
+        .map_err(|e| format!("prepare list_jobs: {e}"))?;
+    let rows = stmt
+        .query_map([], |r| {
+            Ok(JobRecord {
+                job_id: r.get(0)?,
+                version_id: r.get(1)?,
+                bucket: r.get::<_, Option<String>>(2)?.unwrap_or_default(),
+                key: r.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                state: r.get(4)?,
+                retry_count: r.get(5)?,
+                next_attempt: r.get(6)?,
+                lease_owner: r.get(7)?,
+                lease_expires: r.get(8)?,
+                last_error: r.get(9)?,
+                generation: r.get(10)?,
+            })
+        })
+        .map_err(|e| format!("query list_jobs: {e}"))?;
+    let jobs: Vec<JobRecord> = rows
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|e| format!("rows list_jobs: {e}"))?;
+
+    let summary = job_summary(conn)?;
+    Ok((jobs, summary))
+}
+
+pub fn job_summary(conn: &Connection) -> Result<JobSummary, String> {
+    let count = |state: &str| -> Result<i64, String> {
+        conn.query_row(
+            "SELECT COUNT(*) FROM upload_jobs WHERE state = ?",
+            [state],
+            |r| r.get(0),
+        )
+        .map_err(|e| format!("count jobs {state}: {e}"))
+    };
+    Ok(JobSummary {
+        pending: count("pending")?,
+        uploading: count("uploading")?,
+        completed: count("completed").unwrap_or(0),
+        failed: count("failed").unwrap_or(0),
+    })
+}
+
 // Bucket Policy
 pub fn set_bucket_policy(conn: &Connection, bucket: &str, policy_json: &str) -> Result<(), String> {
     if !head_bucket(conn, bucket)? {
@@ -1522,7 +1691,7 @@ pub fn delete_bucket_bpa(conn: &Connection, bucket: &str) -> Result<bool, String
 }
 
 // Object Lock Config
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ObjectLockConfig {
     pub status: String,
     pub default_retention_mode: Option<String>,

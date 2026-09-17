@@ -336,3 +336,100 @@ async fn test_admin_auth_session_and_csrf_flow() {
         }
     }
 }
+
+#[tokio::test]
+async fn test_admin_enhanced_api_features() {
+    let (url, _cfg, _dir) = spawn_test_app().await;
+    let client = reqwest::Client::new();
+
+    // Login
+    let res_login = client
+        .post(format!("{}/admin/api/login", url))
+        .json(&serde_json::json!({ "password": "test-admin-secret" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_login.status(), 200);
+    let cookie_hdr = res_login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let session_cookie = cookie_hdr.split(';').next().unwrap().to_string();
+    let login_json: serde_json::Value = res_login.json().await.unwrap();
+    let csrf_token = login_json["csrf_token"].as_str().unwrap().to_string();
+
+    // 1. GET /admin/api/metrics-history
+    let res_metrics = client
+        .get(format!("{}/admin/api/metrics-history", url))
+        .header("cookie", &session_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_metrics.status(), 200);
+    let metrics_json: serde_json::Value = res_metrics.json().await.unwrap();
+    assert!(metrics_json["metrics"].is_array());
+
+    // 2. Access key creation with policy and status update
+    let res_key = client
+        .post(format!("{}/admin/api/access-keys", url))
+        .header("cookie", &session_cookie)
+        .header("x-csrf-token", &csrf_token)
+        .json(&serde_json::json!({
+            "user_id": "operator",
+            "policy": "read-write",
+            "allowed_buckets": "*"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_key.status(), 200);
+    let key_json: serde_json::Value = res_key.json().await.unwrap();
+    let key_id = key_json["access_key_id"].as_str().unwrap();
+
+    // PATCH status to inactive
+    let res_patch = client
+        .patch(format!("{}/admin/api/access-keys/{}", url, key_id))
+        .header("cookie", &session_cookie)
+        .header("x-csrf-token", &csrf_token)
+        .json(&serde_json::json!({ "status": "inactive" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_patch.status(), 200);
+
+    // 3. GET /admin/api/jobs
+    let res_jobs = client
+        .get(format!("{}/admin/api/jobs", url))
+        .header("cookie", &session_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_jobs.status(), 200);
+    let jobs_json: serde_json::Value = res_jobs.json().await.unwrap();
+    assert!(jobs_json["counts"].is_object());
+    assert!(jobs_json["jobs"].is_array());
+
+    // 4. GET /admin/api/multipart/uploads
+    let res_mp = client
+        .get(format!("{}/admin/api/multipart/uploads", url))
+        .header("cookie", &session_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_mp.status(), 200);
+    let mp_json: serde_json::Value = res_mp.json().await.unwrap();
+    assert!(mp_json["uploads"].is_array());
+
+    // 5. POST /admin/api/telegram/test (dummy bot token in test will return error or ok)
+    let res_tg = client
+        .post(format!("{}/admin/api/telegram/test", url))
+        .header("cookie", &session_cookie)
+        .header("x-csrf-token", &csrf_token)
+        .send()
+        .await
+        .unwrap();
+    assert!(res_tg.status() == 200 || res_tg.status() == 502);
+}
