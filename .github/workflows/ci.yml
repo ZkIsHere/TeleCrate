@@ -42,3 +42,54 @@ jobs:
             exit 0
           fi
           cargo test -- --ignored live_
+
+  # Website smoke: daemon thật + curl kiểm assets/auth/API shapes (không cần browser).
+  website:
+    runs-on: [self-hosted, Linux, X64]
+    needs: backend
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build
+      - run: bash tests/website.sh
+
+  # S3 conformance bằng AWS CLI thật (STRICT: thiếu aws là fail).
+  awscli-conformance:
+    runs-on: [self-hosted, Linux, X64]
+    needs: backend
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build
+      - name: cài AWS CLI nếu thiếu
+        run: |
+          if ! command -v aws >/dev/null 2>&1; then
+            (pip3 install --user awscli || sudo apt-get install -y awscli) 2>&1 | tail -2
+          fi
+          command -v aws && aws --version
+      - name: dựng daemon tạm + chạy conformance
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          WORK="$(mktemp -d)"
+          cat > "$WORK/telecrate.toml" <<EOF
+          db_path = "$WORK/index.db"
+          spool_dir = "$WORK/spool"
+          listen_port = 18081
+          encryption = "off"
+          admin_password = "ci-test"
+          [[access_keys]]
+          access_key_id = "AKIAEXAMPLE12345"
+          secret_key = "secret1234567890secret1234567890"
+          EOF
+          ./target/debug/telecrate --config "$WORK/telecrate.toml" init
+          ./target/debug/telecrate --config "$WORK/telecrate.toml" serve &>/tmp/tc-ci.log &
+          DAEMON=$!
+          for _ in $(seq 1 50); do
+            curl -fsS http://127.0.0.1:18081/health >/dev/null 2>&1 && break
+            sleep 0.2
+          done
+          export ENDPOINT="http://127.0.0.1:18081"
+          export STRICT=1
+          bash tests/conformance.sh
+          kill "$DAEMON"
+          rm -rf "$WORK"
