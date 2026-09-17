@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>TeleCrate — Quản trị</title>
   <!-- Không font CDN: self-hosted, chạy offline. Font hệ thống. -->
-  <link rel="stylesheet" href="/dashboard/style.css">
+  <link rel="stylesheet" href="/dashboard/style.css?v=2">
 </head>
 <body>
   <div id="toast-region" class="toasts" aria-live="polite"></div>
@@ -14,8 +14,10 @@
   <!-- Đăng nhập -->
   <div id="auth-view" class="auth-wrap">
     <form id="login-form" class="auth-card" autocomplete="off">
-      <div class="auth-brand"><span class="auth-mark">T</span><h1>TeleCrate</h1></div>
-      <p class="muted small">Đăng nhập quản trị instance self-hosted</p>
+      <div class="auth-brand"><span class="auth-mark">T</span>
+        <div><h1>TeleCrate</h1><p class="muted small" style="margin:0">Object storage S3 · Telegram backend</p></div>
+      </div>
+      <p class="muted small">Đăng nhập quản trị instance self-hosted này. Không có tài khoản trung tâm.</p>
       <label class="field">
         <span>Mật khẩu quản trị</span>
         <input type="password" id="admin-password" autocomplete="current-password" required>
@@ -114,7 +116,6 @@
         <div id="config-error" class="alert-error hidden"></div>
         <form id="config-form" class="form">
           <label class="field"><span>Port <em>(cần restart)</em></span><input id="cfg-port" inputmode="numeric"></label>
-          <label class="field"><span>Region <em>(cần restart)</em></span><input id="cfg-region"></label>
           <label class="field"><span>Mã hóa nội dung</span>
             <select id="cfg-encryption"><option value="off">off</option><option value="on">on</option></select>
           </label>
@@ -126,7 +127,6 @@
           <label class="field"><span>Thư mục log <em>(cần restart)</em></span><input id="cfg-logdir"></label>
           <label class="field"><span>Giữ log (ngày)</span><input id="cfg-logret" inputmode="numeric"></label>
           <label class="field"><span>Telegram chat ID</span><input id="cfg-chat" inputmode="numeric"></label>
-          <label class="field"><span>Telegram base URL <em>(cần restart)</em></span><input id="cfg-baseurl"></label>
           <label class="field"><span>Bot token mới <em>(để trống = giữ nguyên)</em></span><input id="cfg-token" type="password" autocomplete="new-password"></label>
           <label class="field"><span>Mật khẩu quản trị mới <em>(để trống = giữ nguyên)</em></span><input id="cfg-adminpwd" type="password" autocomplete="new-password"></label>
           <div class="form-actions"><button type="submit" class="btn primary">Lưu cấu hình</button></div>
@@ -188,6 +188,6 @@
     </form>
   </div>
 
-  <script src="/dashboard/app.js"></script>
+  <script src="/dashboard/app.js?v=2"></script>
 </body>
 </html>

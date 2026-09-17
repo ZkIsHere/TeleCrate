@@ -74,18 +74,18 @@ body {
 /* ---------- auth ---------- */
 .auth-wrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; }
 .auth-card {
-  width: 100%; max-width: 380px;
+  width: 100%; max-width: 400px;
   background: var(--bg); border: 1px solid var(--border);
-  border-radius: 12px; padding: 28px 28px 24px; box-shadow: var(--shadow);
+  border-radius: 12px; padding: 30px 30px 26px; box-shadow: var(--shadow);
 }
-.auth-brand { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.auth-brand { display: flex; align-items: center; gap: 12px; margin-bottom: 10px; }
 .auth-mark {
-  width: 32px; height: 32px; border-radius: 8px;
+  width: 40px; height: 40px; border-radius: 10px; flex: none;
   background: var(--accent); color: var(--on-accent);
   display: inline-flex; align-items: center; justify-content: center;
-  font-weight: 700; font-size: 17px;
+  font-weight: 700; font-size: 21px;
 }
-.auth-card h1 { margin: 0; font-size: 18px; font-weight: 650; }
+.auth-card h1 { margin: 0; font-size: 19px; font-weight: 650; letter-spacing: -0.01em; }
 
 /* ---------- forms ---------- */
 .field { display: block; margin: 14px 0; }

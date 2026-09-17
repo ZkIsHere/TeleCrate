@@ -5,8 +5,7 @@ listen_port = 7070
 # Mã hóa nội dung OPTIONAL: "off" | "on". Chỉ áp dụng ghi mới; dữ liệu cũ giữ chế độ cũ.
 # "off" nghĩa là nội dung có thể đọc được tại nơi lưu nếu nguồn chưa mã hóa.
 encryption = "off"
-# Region cho SigV4 scope (ví dụ "telecrate-1"). Client ký với region này.
-region = "telecrate-1"
+# SigV4 auto-region: mọi region trong credential scope đều được chấp nhận.
 # Access keys S3 (M2: danh sách tĩnh; phân quyền prefix ở M4). Đặt secret thật khi triển khai.
 [[access_keys]]
 access_key_id = "TELECRATE-EXAMPLE-KEY"
@@ -15,7 +14,6 @@ secret_key = "thay-secret-that-o-day"
 # Token chỉ nằm ở file này (0600) và Actions Secrets khi test — không commit secret thật.
 telegram_bot_token = ""
 telegram_chat_id = 0
-# telegram_base_url = "https://api.telegram.org"
 # Chunk upload Telegram (256 KiB..16 MiB, mặc định 8 MiB) + số worker đồng thời (1..8).
 # chunk_size_bytes = 8388608
 # worker_concurrency = 2

@@ -20,7 +20,7 @@
 
 | Operation | Trạng thái | Ghi chú |
 |---|---|---|
-| CreateBucket (LocationConstraint khớp region) / HeadBucket / DeleteBucket (409 khi không rỗng) / ListBuckets | implemented-and-tested | SigV4 header-auth + unit/integration tests qua HTTP thật |
+| CreateBucket (LocationConstraint bất kỳ → nhãn bucket) / HeadBucket / DeleteBucket (409 khi không rỗng) / ListBuckets | implemented-and-tested | SigV4 header-auth + unit/integration tests qua HTTP thật |
 | GetBucketLocation | implemented-and-tested | integration test |
 | Bucket naming rules | implemented-and-tested | 3-63 ký tự, lowercase/số/`.-` |
 | Bucket Versioning (`PUT/GET /{bucket}?versioning`) | implemented-and-tested | Hỗ trợ `Enabled` và `Suspended` |
@@ -51,7 +51,7 @@
 | ListObjectsV2 (prefix/delimiter/max-keys/continuation/encoding-type=url) | implemented-and-tested | integration test |
 | ListObjectVersions (`GET /{bucket}?versions`) | implemented-and-tested | Đánh dấu `IsLatest` chính xác theo version mới nhất |
 | S3 Multipart Upload API (Create, UploadPart, ListParts, Complete, Abort, ListUploads) | implemented-and-tested | 6 endpoints tương thích chuẩn XML S3, multipart ETag |
-| SigV4 header auth / Unsigned payload | implemented-and-tested | integration tests qua HTTP thật |
+| SigV4 header auth / Unsigned payload | implemented-and-tested | auto-region: mọi region trong scope đều chấp nhận; integration tests qua HTTP thật |
 | Presigned URL / POST Policy Upload | implemented-and-tested | Query parameter authentication & HTML Form POST upload validation |
 | Multi-Access Keys / Clock Skew | implemented-and-tested | SQLite `access_keys` active check & ±15m timestamp window |
 

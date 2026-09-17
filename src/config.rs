@@ -30,9 +30,6 @@ pub struct Config {
     pub listen_port: u16,
     /// Mã hóa nội dung: "off" | "on". Chỉ áp dụng ghi mới; dữ liệu cũ giữ chế độ cũ.
     pub encryption: String,
-    /// Region phục vụ SigV4 scope. Thay đổi cần restart.
-    #[serde(default = "default_region")]
-    pub region: String,
     /// Access keys tĩnh (M2). Thay đổi cần restart/reload.
     #[serde(default)]
     pub access_keys: Vec<AccessKey>,
@@ -42,9 +39,6 @@ pub struct Config {
     /// Chat id nhận blob (group/channel test). 0 = worker idle.
     #[serde(default)]
     pub telegram_chat_id: i64,
-    /// Base URL Bot API (mặc định hosted; Local Bot API tự host khi cần).
-    #[serde(default = "default_telegram_base")]
-    pub telegram_base_url: String,
     /// Kích thước chunk upload Telegram (bytes). Mặc định 8 MiB (dưới ngưỡng download 20 MB).
     #[serde(default = "default_chunk_size")]
     pub chunk_size_bytes: usize,
@@ -89,13 +83,12 @@ fn default_worker_concurrency() -> usize {
     2
 }
 
-fn default_telegram_base() -> String {
-    "https://api.telegram.org".to_string()
-}
+/// Nhãn region mặc định cho bucket tạo không kèm LocationConstraint.
+/// Server SigV4 chấp nhận mọi region (auto-region); nhãn này chỉ để hiển thị/GetBucketLocation.
+pub const DEFAULT_REGION: &str = "us-east-1";
 
-fn default_region() -> String {
-    "*".to_string()
-}
+/// Base URL Bot API Telegram (cố định hosted; Local Bot API tính sau, không cấu hình).
+pub const TELEGRAM_API_BASE: &str = "https://api.telegram.org";
 
 fn default_log_level() -> String {
     "info".to_string()
@@ -116,11 +109,9 @@ impl fmt::Debug for Config {
             .field("spool_dir", &self.spool_dir)
             .field("listen_port", &self.listen_port)
             .field("encryption", &self.encryption)
-            .field("region", &self.region)
             .field("access_keys", &self.access_keys)
             .field("telegram_bot_token", &"***")
             .field("telegram_chat_id", &self.telegram_chat_id)
-            .field("telegram_base_url", &self.telegram_base_url)
             .field("chunk_size_bytes", &self.chunk_size_bytes)
             .field("worker_concurrency", &self.worker_concurrency)
             // content_keys chỉ chứa id + đường dẫn file (không có key material).
@@ -141,11 +132,9 @@ impl Default for Config {
             spool_dir: "/var/lib/telecrate/spool".to_string(),
             listen_port: 7070,
             encryption: "off".to_string(),
-            region: default_region(),
             access_keys: Vec::new(),
             telegram_bot_token: String::new(),
             telegram_chat_id: 0,
-            telegram_base_url: default_telegram_base(),
             chunk_size_bytes: default_chunk_size(),
             worker_concurrency: default_worker_concurrency(),
             content_keys: Vec::new(),
@@ -174,13 +163,6 @@ impl Config {
                 }
                 self.encryption = val.to_string();
             }
-            "region" => {
-                self.region = if val.is_empty() {
-                    "*".to_string()
-                } else {
-                    val.to_string()
-                };
-            }
             "admin_password" => {
                 self.admin_password = if val.is_empty() {
                     None
@@ -195,9 +177,6 @@ impl Config {
                 self.telegram_chat_id = val
                     .parse::<i64>()
                     .map_err(|_| "invalid telegram_chat_id".to_string())?;
-            }
-            "telegram_base_url" => {
-                self.telegram_base_url = val.to_string();
             }
             "chunk_size_bytes" => {
                 self.chunk_size_bytes = val
@@ -398,7 +377,7 @@ mod tests {
         let text = std::fs::read_to_string("configs/telecrate.example.toml").unwrap();
         let cfg: Config = toml::from_str(&text).unwrap();
         validate(&cfg).unwrap();
-        assert!(!cfg.region.is_empty());
+        assert_eq!(DEFAULT_REGION, "us-east-1");
     }
 
     #[test]

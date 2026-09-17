@@ -231,17 +231,12 @@ pub fn run_loop_dynamic(
     use std::sync::atomic::Ordering;
     let mut cached_token = String::new();
     let mut cached_chat_id = 0i64;
-    let mut cached_base_url = String::new();
     let mut cached_transport: Option<crate::telegram::BotApiHttpTransport> = None;
 
     while !shutdown.load(Ordering::Relaxed) {
-        let (bot_token, chat_id, base_url) = {
+        let (bot_token, chat_id) = {
             let cfg = config_lock.read().unwrap_or_else(|e| e.into_inner());
-            (
-                cfg.telegram_bot_token.clone(),
-                cfg.telegram_chat_id,
-                cfg.telegram_base_url.clone(),
-            )
+            (cfg.telegram_bot_token.clone(), cfg.telegram_chat_id)
         };
 
         if bot_token.is_empty() || chat_id == 0 {
@@ -249,16 +244,15 @@ pub fn run_loop_dynamic(
             continue;
         }
 
-        if cached_transport.is_none()
-            || cached_token != bot_token
-            || cached_chat_id != chat_id
-            || cached_base_url != base_url
-        {
-            match crate::telegram::BotApiHttpTransport::new(&base_url, &bot_token, "telecrate") {
+        if cached_transport.is_none() || cached_token != bot_token || cached_chat_id != chat_id {
+            match crate::telegram::BotApiHttpTransport::new(
+                crate::config::TELEGRAM_API_BASE,
+                &bot_token,
+                "telecrate",
+            ) {
                 Ok(t) => {
                     cached_token = bot_token;
                     cached_chat_id = chat_id;
-                    cached_base_url = base_url;
                     cached_transport = Some(t);
                     if let Ok(conn) = crate::db::open(db_path) {
                         let _ = conn.execute(

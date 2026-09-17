@@ -266,21 +266,14 @@ fn parse_amzdate(s: &str) -> Option<u64> {
 }
 
 /// Verify request với secret tra từ config. `now_secs` truyền vào để test được.
+/// Auto-region: chấp nhận mọi region trong credential scope (single instance, path-style).
 pub fn verify(
     req: &SignableRequest<'_>,
     secret: &str,
-    expected_region: &str,
     now_secs: u64,
 ) -> Result<Verified, SigError> {
     let p = parse_auth(req.authorization)?;
-    let effective_region = if expected_region == "*" || expected_region.is_empty() {
-        p.region
-    } else {
-        expected_region
-    };
-    if p.service != "s3"
-        || (expected_region != "*" && !expected_region.is_empty() && p.region != expected_region)
-    {
+    if p.service != "s3" || p.region.is_empty() {
         return Err(SigError::BadScope);
     }
     if p.date.len() != 8 || p.date.parse::<u32>().is_err() {
@@ -294,9 +287,9 @@ pub fn verify(
     if t.abs_diff(now_secs) > MAX_SKEW_SECS {
         return Err(SigError::Expired);
     }
-    let scope = format!("{}/{effective_region}/s3/aws4_request", p.date);
+    let scope = format!("{}/{}/s3/aws4_request", p.date, p.region);
     let sts = string_to_sign(&canon, &amzdate, &scope);
-    let key = derive_signing_key(secret, p.date, effective_region, "s3");
+    let key = derive_signing_key(secret, p.date, p.region, "s3");
     let expect = hex::encode(hmac_sha256(&key, sts.as_bytes()));
     // So sánh hằng thời gian thủ công (tránh thêm dep subtle ở M2).
     if expect.len() != p.signature.len()
@@ -361,7 +354,6 @@ fn canonical_query_presigned(query: &str) -> String {
 pub fn verify_presigned(
     req: &SignableRequest<'_>,
     secret: &str,
-    expected_region: &str,
     now_secs: u64,
 ) -> Result<Verified, SigError> {
     let mut algo = None;
@@ -409,14 +401,7 @@ pub fn verify_presigned(
         return Err(SigError::MalformedAuth);
     }
     let (access_key_id, date_stamp, region, service) = (c[0], c[1], c[2], c[3]);
-    let effective_region = if expected_region == "*" || expected_region.is_empty() {
-        region
-    } else {
-        expected_region
-    };
-    if service != "s3"
-        || (expected_region != "*" && !expected_region.is_empty() && region != expected_region)
-    {
+    if service != "s3" || region.is_empty() {
         return Err(SigError::BadScope);
     }
 
@@ -440,9 +425,9 @@ pub fn verify_presigned(
         signed_list
     );
 
-    let scope = format!("{date_stamp}/{effective_region}/s3/aws4_request");
+    let scope = format!("{date_stamp}/{region}/s3/aws4_request");
     let sts = string_to_sign(&canon, &amzdate, &scope);
-    let key = derive_signing_key(secret, date_stamp, effective_region, "s3");
+    let key = derive_signing_key(secret, date_stamp, region, "s3");
     let expect = hex::encode(hmac_sha256(&key, sts.as_bytes()));
 
     if expect.len() != signature.len()
@@ -465,25 +450,17 @@ pub fn verify_post_policy(
     signature: &str,
     credential: &str,
     secret: &str,
-    expected_region: &str,
 ) -> Result<Verified, SigError> {
     let c: Vec<&str> = credential.split('/').collect();
     if c.len() != 5 || c[4] != "aws4_request" {
         return Err(SigError::MalformedAuth);
     }
     let (access_key_id, date, region, service) = (c[0], c[1], c[2], c[3]);
-    let effective_region = if expected_region == "*" || expected_region.is_empty() {
-        region
-    } else {
-        expected_region
-    };
-    if service != "s3"
-        || (expected_region != "*" && !expected_region.is_empty() && region != expected_region)
-    {
+    if service != "s3" || region.is_empty() {
         return Err(SigError::BadScope);
     }
 
-    let key = derive_signing_key(secret, date, effective_region, "s3");
+    let key = derive_signing_key(secret, date, region, "s3");
     let expect = hex::encode(hmac_sha256(&key, policy_b64.as_bytes()));
 
     if expect.len() != signature.len()
@@ -618,21 +595,39 @@ mod tests {
             authorization: &auth,
             body: b"",
         };
-        let v = verify(&req, secret, "telecrate-1", now).unwrap();
+        let v = verify(&req, secret, now).unwrap();
         assert_eq!(v.access_key_id, "AKID");
         // Sai secret → BadSignature.
         assert_eq!(
-            verify(&req, "wrong", "telecrate-1", now).unwrap_err(),
+            verify(&req, "wrong", now).unwrap_err(),
             SigError::BadSignature
         );
-        // Sai region scope → BadScope.
-        assert_eq!(
-            verify(&req, secret, "other-region", now).unwrap_err(),
-            SigError::BadScope
+        // Auto-region: region nào trong scope cũng chấp nhận (ký bằng region khác vẫn pass).
+        let auth_eu = sign(
+            "PUT",
+            "/my-bucket",
+            "",
+            &headers,
+            &signed,
+            b"",
+            "AKID",
+            secret,
+            "eu-west-1",
+            amzdate,
+            &sha256_hex(b""),
         );
+        let req_eu = SignableRequest {
+            method: "PUT",
+            path: "/my-bucket",
+            query: "",
+            headers: &full,
+            authorization: &auth_eu,
+            body: b"",
+        };
+        assert_eq!(verify(&req_eu, secret, now).unwrap().access_key_id, "AKID");
         // Hết hạn → Expired.
         assert_eq!(
-            verify(&req, secret, "telecrate-1", now + MAX_SKEW_SECS + 1).unwrap_err(),
+            verify(&req, secret, now + MAX_SKEW_SECS + 1).unwrap_err(),
             SigError::Expired
         );
         // Đổi method sau khi ký → BadSignature.
@@ -641,7 +636,7 @@ mod tests {
             ..req
         };
         assert_eq!(
-            verify(&tampered, secret, "telecrate-1", now).unwrap_err(),
+            verify(&tampered, secret, now).unwrap_err(),
             SigError::BadSignature
         );
     }

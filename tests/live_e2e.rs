@@ -133,7 +133,6 @@ fn live_config(dir: &tempfile::TempDir, token: &str, chat: i64) -> Config {
         spool_dir: dir.path().join("spool").to_str().unwrap().to_string(),
         listen_port: 1,
         encryption: "off".to_string(),
-        region: REGION.to_string(),
         access_keys: vec![AccessKey {
             access_key_id: KEY.to_string(),
             secret_key: SECRET.to_string(),

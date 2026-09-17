@@ -222,7 +222,7 @@ fn authenticate(state: &AppState, input: &AuthInput<'_>) -> Result<String, telec
             authorization: auth,
             body,
         };
-        let v = telecrate::sigv4::verify(&req, &secret, &state.config.region, now_secs())
+        let v = telecrate::sigv4::verify(&req, &secret, now_secs())
             .map_err(|e| sig_error_to_s3(e, resource, request_id))?;
         return Ok(v.access_key_id);
     }
@@ -241,7 +241,7 @@ fn authenticate(state: &AppState, input: &AuthInput<'_>) -> Result<String, telec
             authorization: "",
             body,
         };
-        let v = telecrate::sigv4::verify_presigned(&req, &secret, &state.config.region, now_secs())
+        let v = telecrate::sigv4::verify_presigned(&req, &secret, now_secs())
             .map_err(|e| sig_error_to_s3(e, resource, request_id))?;
         return Ok(v.access_key_id);
     }
@@ -1034,13 +1034,9 @@ async fn post_policy_form_handler(
         }
     };
 
-    if let Err(e) = telecrate::sigv4::verify_post_policy(
-        &policy_b64,
-        &signature,
-        &credential,
-        &secret,
-        &state.config.region,
-    ) {
+    if let Err(e) =
+        telecrate::sigv4::verify_post_policy(&policy_b64, &signature, &credential, &secret)
+    {
         return telecrate::s3::sig_error_to_s3(e, resource, request_id).into_response();
     }
 
@@ -1354,8 +1350,10 @@ async fn create_bucket(
     } else if qmap.contains_key("versioning") {
         put_bucket_versioning_handler(&state, &bucket, &body, &resource, &request_id)
     } else {
-        let want_region = match telecrate::s3::parse_location_constraint(&body) {
-            Ok(v) => v,
+        // Auto-region: chấp nhận mọi LocationConstraint, lưu làm nhãn bucket.
+        // Không constraint → nhãn mặc định. Không bao giờ từ chối vì region.
+        let bucket_region = match telecrate::s3::parse_location_constraint(&body) {
+            Ok(v) => v.unwrap_or_else(|| telecrate::config::DEFAULT_REGION.to_string()),
             Err(_) => {
                 return telecrate::s3::S3Error::new(
                     "InvalidLocationConstraint",
@@ -1367,26 +1365,11 @@ async fn create_bucket(
                 .into_response()
             }
         };
-        if let Some(loc) = want_region {
-            if state.config.region != "*" && loc != "aws-global" && loc != state.config.region {
-                return telecrate::s3::S3Error::new(
-                    "InvalidLocationConstraint",
-                    format!(
-                        "Location constraint '{}' does not match server region '{}'.",
-                        loc, state.config.region
-                    ),
-                    StatusCode::BAD_REQUEST,
-                    &resource,
-                    &request_id,
-                )
-                .into_response();
-            }
-        }
         let conn = match open_db(&state) {
             Ok(c) => c,
             Err(e) => return e.into_response(),
         };
-        match telecrate::db::create_bucket(&conn, &bucket, &state.config.region) {
+        match telecrate::db::create_bucket(&conn, &bucket, &bucket_region) {
             Ok(telecrate::db::CreateBucketOutcome::Created) => {
                 xml_response(StatusCode::OK, String::new(), &request_id)
             }
@@ -1563,7 +1546,7 @@ fn telegram_transport(
         return None;
     }
     telecrate::telegram::BotApiHttpTransport::new(
-        &cfg.telegram_base_url,
+        telecrate::config::TELEGRAM_API_BASE,
         &cfg.telegram_bot_token,
         "telecrate",
     )

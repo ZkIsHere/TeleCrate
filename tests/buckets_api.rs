@@ -47,7 +47,6 @@ fn spawn_server() -> (tempfile::TempDir, String) {
         spool_dir: dir.path().join("spool").to_str().unwrap().to_string(),
         listen_port: 1,
         encryption: "off".to_string(),
-        region: REGION.to_string(),
         access_keys: vec![AccessKey {
             access_key_id: KEY.to_string(),
             secret_key: SECRET.to_string(),
@@ -204,7 +203,8 @@ fn bucket_lifecycle_signed() {
         &now,
     );
     assert_eq!(s, 200);
-    assert!(body.contains(REGION), "{body}");
+    // Nhãn mặc định us-east-1 (tạo không kèm constraint). Ký bằng region khác vẫn pass (auto-region).
+    assert!(body.contains("us-east-1"), "{body}");
     let (s, body, rid) = signed(
         &client,
         "GET",
@@ -293,7 +293,7 @@ fn auth_failures_map_to_s3_errors() {
     assert_eq!(s, 400);
     assert!(body.contains("InvalidBucketName"), "{body}");
 
-    // LocationConstraint khác region → 400.
+    // Auto-region: LocationConstraint nào cũng được chấp nhận và lưu làm nhãn bucket.
     let xml = "<CreateBucketConfiguration><LocationConstraint>other-region</LocationConstraint></CreateBucketConfiguration>";
     let (s, body, _) = signed(
         &client,
@@ -305,22 +305,21 @@ fn auth_failures_map_to_s3_errors() {
         SECRET,
         &now,
     );
-    assert_eq!(s, 400);
-    assert!(body.contains("InvalidLocationConstraint"), "{body}");
-
-    // LocationConstraint đúng region → 200.
-    let xml = format!(
-        r#"<CreateBucketConfiguration><LocationConstraint>{REGION}</LocationConstraint></CreateBucketConfiguration>"#
-    );
-    let (s, _, _) = signed(
+    assert_eq!(s, 200, "{body}");
+    let (s, body, _) = signed(
         &client,
-        "PUT",
+        "GET",
         &base,
-        "/loc-bucket",
-        xml.as_bytes(),
+        "/loc-bucket?location",
+        b"",
         KEY,
         SECRET,
         &now,
     );
+    assert_eq!(s, 200);
+    assert!(body.contains("other-region"), "{body}");
+
+    // Tạo lại bucket đã tồn tại (cùng owner) → 200.
+    let (s, _, _) = signed(&client, "PUT", &base, "/loc-bucket", b"", KEY, SECRET, &now);
     assert_eq!(s, 200);
 }

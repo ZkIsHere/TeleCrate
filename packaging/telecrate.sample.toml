@@ -12,8 +12,7 @@ listen_port = 7070
 # Mã hóa dữ liệu nội dung: "off" | "on" (ChaCha20-Poly1305 AEAD)
 encryption = "off"
 
-# Vùng phục vụ S3 SigV4 region
-region = "us-east-1"
+# SigV4 auto-region: mọi region trong credential scope đều được chấp nhận.
 
 # Mật khẩu quản trị Web Dashboard & Admin API (khuyên dùng đổi mật khẩu khi vận hành)
 admin_password = "123456"
@@ -21,7 +20,6 @@ admin_password = "123456"
 # Cấu hình kết nối Telegram Bot API làm backend lưu trữ bền vững
 telegram_bot_token = ""
 telegram_chat_id = 0
-telegram_base_url = "https://api.telegram.org"
 
 # Kích thước chunk upload Telegram (mặc định 8 MiB)
 chunk_size_bytes = 8388608

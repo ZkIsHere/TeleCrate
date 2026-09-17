@@ -598,7 +598,9 @@ pub async fn api_create_bucket(
     }
 
     let config = read_config(&config_lock);
-    let region = payload.region.unwrap_or_else(|| config.region.clone());
+    let region = payload
+        .region
+        .unwrap_or_else(|| telecrate::config::DEFAULT_REGION.to_string());
     let conn = match telecrate::db::open(&config.db_path) {
         Ok(c) => c,
         Err(e) => {

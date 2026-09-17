@@ -287,14 +287,13 @@ $('btn-new-bucket').addEventListener('click', () => openModal({
   title: 'Tạo bucket',
   fields: [
     { id: 'm-name', label: 'Tên bucket', value: '' },
-    { id: 'm-region', label: 'Region', value: 'us-east-1' },
   ],
   onOk: async () => {
-    const name = $('m-name').value.trim(), region = $('m-region').value.trim() || 'us-east-1';
+    const name = $('m-name').value.trim();
     if (!name) return 'Tên bucket bắt buộc';
     const r = await api('/admin/api/buckets', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, region }),
+      body: JSON.stringify({ name }),
     });
     const d = await r.json();
     if (r.ok && d.ok) { toast(`Đã tạo bucket '${name}'`, 'ok'); loadBuckets(); return null; }
@@ -379,7 +378,6 @@ async function loadConfig() {
     if (!(r.ok && d.ok && d.config)) throw new Error((d && d.error) || 'HTTP ' + r.status);
     const c = d.config;
     $('cfg-port').value = c.listen_port ?? 7070;
-    $('cfg-region').value = c.region ?? '*';
     $('cfg-encryption').value = c.encryption || 'off';
     $('cfg-workers').value = c.worker_concurrency ?? 2;
     $('cfg-loglevel').value = c.log_level || 'info';
@@ -387,7 +385,6 @@ async function loadConfig() {
     $('cfg-logdir').value = c.log_dir || '/var/lib/telecrate/logs';
     $('cfg-logret').value = c.log_retention_days ?? 14;
     $('cfg-chat').value = c.telegram_chat_id ?? '';
-    $('cfg-baseurl').value = c.telegram_base_url || 'https://api.telegram.org';
     $('cfg-token').value = '';
     $('cfg-adminpwd').value = '';
   } catch (e) {
@@ -399,7 +396,6 @@ $('config-form').addEventListener('submit', async (e) => {
   e.preventDefault();
   const items = [
     ['listen_port', $('cfg-port').value],
-    ['region', $('cfg-region').value],
     ['encryption', $('cfg-encryption').value],
     ['worker_concurrency', $('cfg-workers').value],
     ['log_level', $('cfg-loglevel').value],
@@ -407,7 +403,6 @@ $('config-form').addEventListener('submit', async (e) => {
     ['log_dir', $('cfg-logdir').value],
     ['log_retention_days', $('cfg-logret').value],
     ['telegram_chat_id', $('cfg-chat').value],
-    ['telegram_base_url', $('cfg-baseurl').value],
   ];
   if ($('cfg-token').value) items.push(['telegram_bot_token', $('cfg-token').value]);
   if ($('cfg-adminpwd').value) items.push(['admin_password', $('cfg-adminpwd').value]);

@@ -94,7 +94,6 @@ db_path = "/var/lib/telecrate/index.db"
 spool_dir = "/var/lib/telecrate/spool"
 listen_port = 7070
 encryption = "off"
-region = "us-east-1"
 admin_password = "mat-khau-quan-tri-secure"
 
 # Telegram Bot API Credentials
