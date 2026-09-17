@@ -105,10 +105,22 @@ enum RecoveryOp {
 
 #[tokio::main]
 async fn main() {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env())
-        .init();
     let cli = Cli::parse();
+    // Khởi tạo logging từ config (fallback default nếu chưa có file — vd. lần init đầu).
+    // Guard giữ worker file sống đến khi process thoát.
+    let cfg_for_log =
+        telecrate::config::load(&resolve_config_path(&cli.config)).unwrap_or_default();
+    let _log_guard = match telecrate::logging::init(&cfg_for_log) {
+        Ok(g) => g,
+        Err(e) => {
+            eprintln!("telecrate: logging init failed ({e}), tiếp tục với stdout mặc định");
+            tracing_subscriber::fmt()
+                .with_env_filter(EnvFilter::from_default_env())
+                .try_init()
+                .ok();
+            None
+        }
+    };
     let code = match run(cli).await {
         Ok(()) => 0,
         Err(e) => {

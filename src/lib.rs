@@ -9,6 +9,7 @@ pub mod crypto;
 pub mod db;
 pub mod doctor;
 pub mod gc;
+pub mod logging;
 pub mod policy;
 pub mod recovery;
 pub mod s3;

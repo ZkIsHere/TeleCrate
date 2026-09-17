@@ -63,3 +63,16 @@
 - `docs/architecture.md`, `docs/data-model.md`, `docs/threat-model.md`, `docs/compatibility-matrix.md`, `docs/milestones.md` luôn cập nhật theo code.
 - Quyết định quan trọng ghi ADR tại `docs/adr/NNNN-*.md`.
 - Giao tiếp và tài liệu hướng dẫn bằng tiếng Việt.
+
+## 8. Quy tắc UI dashboard và logging
+
+- Dashboard là giao diện vận hành: typography rõ, spacing nhất quán, màu tiết chế, mật độ hợp lý.
+  Cấm landing hero, gradient rực rỡ, glassmorphism, card KPI khổng lồ, icon trang trí dày đặc,
+  animation gây chậm. Không font/CDN ngoài — chạy offline hoàn toàn.
+- Mọi màn hình có trạng thái loading/empty/error/offline/permission. Không nút chết, chart mock,
+  metric hardcode. Số liệu phải ghi rõ nguồn và đơn vị; không gọi bytes đã index là quota Telegram.
+- Secret (S3 secret, bot token, password) chỉ hiện đúng 1 lần lúc tạo, không render ra bảng/DOM lưu lâu.
+- Daemon log: mức qua config, stdout cho journald + file daily-rotation tùy chọn có retention.
+  Không log secret/token/key material. Export log luôn redact.
+- Audit log có cấu trúc (ts/level/actor/action/detail), ring-buffer giới hạn, API lọc/phân trang.
+  Không fabricate log mẫu. Login sai nhiều lần phải rate-limit + audit.

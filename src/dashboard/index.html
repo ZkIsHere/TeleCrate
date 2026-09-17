@@ -1,537 +1,192 @@
 <!DOCTYPE html>
-<html lang="vi">
+<html lang="vi" data-theme="dark">
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>TeleCrate — S3 Gateway Control Center</title>
-  <!-- Google Fonts: Outfit & Plus Jakarta Sans & Fira Code -->
-  <link rel="preconnect" href="https://fonts.googleapis.com">
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Outfit:wght@300;400;500;600;700&family=Plus+Jakarta+Sans:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <title>TeleCrate — Quản trị</title>
+  <!-- Không font CDN: self-hosted, chạy offline. Font hệ thống. -->
   <link rel="stylesheet" href="/dashboard/style.css">
 </head>
 <body>
-  <!-- Toast Notification System -->
-  <div id="toast-container" class="toast-container"></div>
+  <div id="toast-region" class="toasts" aria-live="polite"></div>
+  <div id="offline-banner" class="offline-banner hidden" role="alert">Mất kết nối daemon — đang thử lại…</div>
 
-  <!-- Authentication View -->
-  <div id="auth-view" class="auth-wrapper">
-    <div class="auth-card glass-panel">
-      <div class="auth-header">
-        <div class="brand-badge">
-          <svg width="28" height="28" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>
-        </div>
-        <h2>TeleCrate Control Center</h2>
-        <p>Đăng nhập Bảng điều khiển Quản trị S3 Gateway</p>
-      </div>
-      <form id="login-form">
-        <div class="form-group">
-          <label for="admin-password">Mật khẩu Quản trị (Admin Password)</label>
-          <div class="password-input-wrapper">
-            <input type="password" id="admin-password" placeholder="Nhập admin_password..." required autocomplete="current-password">
-            <button type="button" class="btn-toggle-pwd" id="btn-toggle-login-pwd">
-              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
-            </button>
-          </div>
-        </div>
-        <div id="login-error" class="error-banner hidden"></div>
-        <button type="submit" class="btn btn-primary btn-block" id="btn-login-submit">
-          <span>Đăng Nhập Control Center</span>
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="5" y1="12" x2="19" y2="12"></line><polyline points="12 5 19 12 12 19"></polyline></svg>
-        </button>
-      </form>
-    </div>
+  <!-- Đăng nhập -->
+  <div id="auth-view" class="auth-wrap">
+    <form id="login-form" class="auth-card" autocomplete="off">
+      <h1>TeleCrate</h1>
+      <p class="muted">Đăng nhập quản trị instance self-hosted</p>
+      <label class="field">
+        <span>Mật khẩu quản trị</span>
+        <input type="password" id="admin-password" autocomplete="current-password" required>
+      </label>
+      <div id="login-error" class="alert-error hidden" role="alert"></div>
+      <button type="submit" class="btn primary block" id="btn-login">Đăng nhập</button>
+    </form>
   </div>
 
-  <!-- Main Application View -->
-  <div id="main-view" class="main-layout hidden">
-    <!-- Sidebar Navigation -->
-    <aside class="sidebar">
-      <div class="sidebar-header">
-        <div class="logo-box">
-          <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path><polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline><line x1="12" y1="22.08" x2="12" y2="12"></line></svg>
-        </div>
-        <div class="logo-text">
-          <h1>TeleCrate</h1>
-          <span class="version-tag">v0.1.0</span>
-        </div>
-      </div>
-
-      <nav class="nav-menu">
-        <button class="nav-item active" data-tab="overview">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"></rect><rect x="14" y="3" width="7" height="7"></rect><rect x="14" y="14" width="7" height="7"></rect><rect x="3" y="14" width="7" height="7"></rect></svg>
-          <span>Tổng Quan (Overview)</span>
-        </button>
-        <button class="nav-item" data-tab="storage">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
-          <span>Buckets & Objects</span>
-        </button>
-        <button class="nav-item" data-tab="keys">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.778-7.778zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"></path></svg>
-          <span>S3 Access Keys</span>
-        </button>
-        <button class="nav-item" data-tab="config">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
-          <span>Cấu Hình Động</span>
-        </button>
-        <button class="nav-item" data-tab="maintenance">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z"></path></svg>
-          <span>Bảo Trị & GC Engine</span>
-        </button>
-        <button class="nav-item" data-tab="audit">
-          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="4 17 10 11 4 5"></polyline><line x1="12" y1="19" x2="20" y2="19"></line></svg>
-          <span>Nhật Ký Terminal</span>
-        </button>
+  <!-- Chính -->
+  <div id="main-view" class="app hidden">
+    <aside class="side">
+      <div class="brand">TeleCrate <span class="ver" id="app-version"></span></div>
+      <nav class="nav" aria-label="Điều hướng">
+        <button class="nav-item active" data-tab="overview">Tổng quan</button>
+        <button class="nav-item" data-tab="storage">Buckets</button>
+        <button class="nav-item" data-tab="keys">Access keys</button>
+        <button class="nav-item" data-tab="config">Cấu hình</button>
+        <button class="nav-item" data-tab="maintenance">Bảo trì</button>
+        <button class="nav-item" data-tab="logs">Nhật ký</button>
       </nav>
-
-      <div class="sidebar-footer">
-        <div class="system-status-indicator">
-          <span class="pulse-dot"></span>
-          <span class="status-label">Daemon Active</span>
-        </div>
-        <button id="btn-logout" class="btn-logout" title="Đăng Xuất">
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"></path><polyline points="16 17 21 12 16 7"></polyline><line x1="21" y1="12" x2="9" y2="12"></line></svg>
-        </button>
+      <div class="side-foot">
+        <span id="daemon-state" class="state" data-state="unknown">—</span>
+        <button id="btn-logout" class="btn ghost sm">Đăng xuất</button>
       </div>
     </aside>
 
-    <!-- Main Content Area -->
-    <main class="content-body">
-      <!-- Header Bar -->
-      <header class="top-bar">
-        <div class="page-title-box">
-          <h2 id="current-tab-title">Tổng Quan Hệ Thống</h2>
-          <p id="current-tab-subtitle">Theo dõi trạng thái và số liệu lưu trữ S3 Gateway thời gian thực</p>
-        </div>
-        <div class="top-bar-actions">
-          <button id="btn-refresh-all" class="btn btn-secondary btn-icon" title="Tải lại dữ liệu">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
-            <span>Làm Mới</span>
-          </button>
-          <div class="user-chip">
-            <span class="user-avatar">AD</span>
-            <span class="user-name">Admin Node</span>
-          </div>
+    <main class="main">
+      <header class="topbar">
+        <h2 id="tab-title">Tổng quan</h2>
+        <div class="topbar-actions">
+          <button id="btn-theme" class="btn ghost sm" title="Đổi giao diện sáng/tối">Sáng/tối</button>
+          <button id="btn-refresh" class="btn sm">Làm mới</button>
+          <span id="user-chip" class="user-chip">admin</span>
         </div>
       </header>
 
-      <!-- TAB 1: OVERVIEW -->
-      <section id="tab-overview" class="tab-pane active">
-        <!-- Hero Metric Cards Grid -->
-        <div class="metrics-grid">
-          <div class="metric-card glass-panel cyan-glow">
-            <div class="metric-icon">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"></path></svg>
-            </div>
-            <div class="metric-data">
-              <span class="metric-label">Tổng Số Buckets</span>
-              <h3 id="stat-buckets" class="metric-value">0</h3>
-              <span class="metric-trend text-cyan">S3 Storage Containers</span>
-            </div>
-          </div>
-
-          <div class="metric-card glass-panel purple-glow">
-            <div class="metric-icon">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"></path><polyline points="14 2 14 8 20 8"></polyline></svg>
-            </div>
-            <div class="metric-data">
-              <span class="metric-label">Tổng Số Objects</span>
-              <h3 id="stat-objects" class="metric-value">0</h3>
-              <span class="metric-trend text-purple">Phiên bản tập tin lưu trữ</span>
-            </div>
-          </div>
-
-          <div class="metric-card glass-panel emerald-glow">
-            <div class="metric-icon">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><ellipse cx="12" cy="5" rx="9" ry="3"></ellipse><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"></path><path d="M21 19c0 1.66-4 3-9 3s-9-1.34-9-3"></path></svg>
-            </div>
-            <div class="metric-data">
-              <span class="metric-label">Kích Thước Spool Local</span>
-              <h3 id="stat-spool-size" class="metric-value">0 B</h3>
-              <div class="progress-bar-bg"><div id="spool-progress" class="progress-bar-fill" style="width: 5%;"></div></div>
-            </div>
-          </div>
-
-          <div class="metric-card glass-panel rose-glow">
-            <div class="metric-icon">
-              <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.778-7.778zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"></path></svg>
-            </div>
-            <div class="metric-data">
-              <span class="metric-label">S3 Access Keys</span>
-              <h3 id="stat-keys" class="metric-value">0</h3>
-              <span class="metric-trend text-rose">Active Credentials</span>
-            </div>
-          </div>
-        </div>
-
-        <!-- System Gauges & Live Info Grid -->
-        <div class="dashboard-grid">
-          <!-- Left Column: Daemon & Worker Status -->
-          <div class="glass-panel panel-card">
-            <div class="panel-header">
-              <h3>
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"></circle><polyline points="12 6 12 12 16 14"></polyline></svg>
-                Trạng Thái Daemon & Worker Upload
-              </h3>
-              <span id="badge-daemon-status" class="badge badge-success">RUNNING</span>
-            </div>
-            <div class="panel-body">
-              <div class="info-list">
-                <div class="info-item">
-                  <span class="info-label">Thời Gian Hoạt Động (Uptime)</span>
-                  <span id="info-uptime" class="info-val font-mono">0s</span>
-                </div>
-                <div class="info-item">
-                  <span class="info-label">Dung Lượng File Chỉ Mục Index.db</span>
-                  <span id="info-db-size" class="info-val font-mono">0 B</span>
-                </div>
-                <div class="info-item">
-                  <span class="info-label">Số Worker Upload Nền (Concurrency)</span>
-                  <span id="info-workers" class="info-val font-mono">0 workers</span>
-                </div>
-                <div class="info-item">
-                  <span class="info-label">Jobs Chờ Tải Lên Telegram (Pending)</span>
-                  <span id="info-pending-jobs" class="info-val font-mono">0 jobs</span>
-                </div>
-                <div class="info-item">
-                  <span class="info-label">Jobs Đang Tải Lên Telegram (Uploading)</span>
-                  <span id="info-uploading-jobs" class="info-val font-mono">0 jobs</span>
-                </div>
-              </div>
-            </div>
-          </div>
-
-          <!-- Right Column: Quick Operation Controls -->
-          <div class="glass-panel panel-card">
-            <div class="panel-header">
-              <h3>
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"></polygon></svg>
-                Thao Tác Nhanh (Quick Actions)
-              </h3>
-            </div>
-            <div class="panel-body quick-actions-body">
-              <button id="quick-btn-gc" class="btn btn-outline btn-block align-left">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"></path><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
-                <div>
-                  <strong>Chạy Garbage Collection (GC)</strong>
-                  <span>Dọn dẹp spool rác & sync deletion với Telegram</span>
-                </div>
-              </button>
-
-              <button id="quick-btn-doctor" class="btn btn-outline btn-block align-left">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg>
-                <div>
-                  <strong>Kiểm Tra Sức Khỏe (Integrity Doctor)</strong>
-                  <span>Xác minh toàn vẹn DB index & Spool checksum</span>
-                </div>
-              </button>
-
-              <button id="quick-btn-backup" class="btn btn-outline btn-block align-left">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg>
-                <div>
-                  <strong>Sao Lưu Cơ Sở Dữ Liệu (Backup DB)</strong>
-                  <span>Tạo bản sao lưu SQLite an toàn không gây khóa DB</span>
-                </div>
-              </button>
-            </div>
-          </div>
-        </div>
+      <!-- TỔNG QUAN -->
+      <section id="tab-overview" class="tab active" aria-label="Tổng quan">
+        <div id="ov-error" class="alert-error hidden"></div>
+        <table class="kv" id="ov-table">
+          <tbody>
+            <tr><th>Buckets</th><td id="ov-buckets">—</td></tr>
+            <tr><th>Objects</th><td id="ov-objects">—</td></tr>
+            <tr><th>Access keys</th><td id="ov-keys">—</td></tr>
+            <tr><th>Spool đang chờ</th><td id="ov-spool">—</td></tr>
+            <tr><th>Jobs chờ / đang chạy</th><td id="ov-jobs">—</td></tr>
+            <tr><th>Workers</th><td id="ov-workers">—</td></tr>
+            <tr><th>Dung lượng DB</th><td id="ov-db">—</td></tr>
+            <tr><th>Uptime</th><td id="ov-uptime">—</td></tr>
+          </tbody>
+        </table>
+        <p class="muted small">Số liệu thật từ daemon. Không có quota Telegram — bảng chỉ hiện bytes TeleCrate đã index/đang chờ.</p>
       </section>
 
-      <!-- TAB 2: STORAGE & OBJECT EXPLORER -->
-      <section id="tab-storage" class="tab-pane">
-        <div class="tab-actions-bar">
-          <div class="search-box">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
-            <input type="text" id="search-bucket-input" placeholder="Tìm kiếm bucket...">
-          </div>
-          <button id="btn-modal-create-bucket" class="btn btn-primary">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-            <span>Tạo Bucket Mới</span>
-          </button>
+      <!-- BUCKETS -->
+      <section id="tab-storage" class="tab" aria-label="Buckets">
+        <div class="toolbar">
+          <input id="q-bucket" type="search" placeholder="Lọc theo tên bucket… ( / )" aria-label="Lọc bucket">
+          <button id="btn-new-bucket" class="btn primary sm">Tạo bucket</button>
         </div>
-
-        <!-- Bucket List Table -->
-        <div class="glass-panel table-wrapper">
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th>Tên Bucket</th>
-                <th>Region</th>
-                <th>Versioning</th>
-                <th>Encryption</th>
-                <th>Thời Gian Tạo</th>
-                <th>Hành Động</th>
-              </tr>
-            </thead>
-            <tbody id="bucket-list-tbody">
-              <tr><td colspan="6" class="text-center text-muted">Đang tải danh sách bucket...</td></tr>
-            </tbody>
+        <div id="bucket-error" class="alert-error hidden"></div>
+        <table class="data" id="bucket-table">
+          <thead><tr><th>Tên</th><th>Region</th><th>Versioning</th><th>Tạo lúc</th><th></th></tr></thead>
+          <tbody id="bucket-tbody"><tr><td colspan="5" class="muted">Đang nạp…</td></tr></tbody>
+        </table>
+        <div id="object-panel" class="panel hidden">
+          <div class="panel-head">
+            <h3 id="object-title">Objects</h3>
+            <button class="btn ghost sm" id="btn-close-objects">Đóng</button>
+          </div>
+          <div id="object-error" class="alert-error hidden"></div>
+          <table class="data">
+            <thead><tr><th>Key</th><th>Kích thước</th><th>Đồng bộ</th><th>ETag</th><th>Tạo lúc</th></tr></thead>
+            <tbody id="object-tbody"></tbody>
           </table>
         </div>
       </section>
 
-      <!-- TAB 3: ACCESS KEYS (IAM) -->
-      <section id="tab-keys" class="tab-pane">
-        <div class="tab-actions-bar">
-          <div class="search-box">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg>
-            <input type="text" id="search-key-input" placeholder="Tìm kiếm Access Key ID...">
-          </div>
-          <button id="btn-modal-create-key" class="btn btn-primary">
-            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>
-            <span>Tạo Access Key Mới</span>
-          </button>
+      <!-- KEYS -->
+      <section id="tab-keys" class="tab" aria-label="Access keys">
+        <div class="toolbar">
+          <input id="q-key" type="search" placeholder="Lọc theo key id…" aria-label="Lọc key">
+          <button id="btn-new-key" class="btn primary sm">Tạo key</button>
         </div>
-
-        <div class="glass-panel table-wrapper">
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th>Access Key ID</th>
-                <th>Secret Access Key</th>
-                <th>Mô Tả / Ghi Chú</th>
-                <th>Ngày Tạo</th>
-                <th>Thao Tác</th>
-              </tr>
-            </thead>
-            <tbody id="key-list-tbody">
-              <tr><td colspan="5" class="text-center text-muted">Đang tải danh sách khóa S3...</td></tr>
-            </tbody>
-          </table>
-        </div>
+        <p class="muted small">Secret chỉ hiện <strong>đúng một lần</strong> lúc tạo. Bảng này không bao giờ render secret.</p>
+        <div id="key-error" class="alert-error hidden"></div>
+        <table class="data">
+          <thead><tr><th>Key ID</th><th>User</th><th>Trạng thái</th><th>Tạo lúc</th><th></th></tr></thead>
+          <tbody id="key-tbody"><tr><td colspan="5" class="muted">Đang nạp…</td></tr></tbody>
+        </table>
+        <div id="new-secret" class="alert-warn hidden" role="alert"></div>
       </section>
 
-      <!-- TAB 4: DYNAMIC CONFIG MANAGER -->
-      <section id="tab-config" class="tab-pane">
-        <div class="glass-panel config-form-wrapper">
-          <form id="config-form">
-            <div class="form-section-title">
-              <h3>Cấu Hình Động Daemon (Không Cần Rebuild Binary)</h3>
-              <p>Mọi thay đổi thông số ở đây sẽ được lưu trực tiếp vào file cấu hình TOML và áp dụng ngay lập tức.</p>
-            </div>
-
-            <div class="form-grid">
-              <div class="form-group">
-                <label for="cfg-port">Cổng Phục Vụ HTTP (listen_port)</label>
-                <input type="number" id="cfg-port" name="listen_port" required min="1" max="65535">
-              </div>
-
-              <div class="form-group">
-                <label for="cfg-encryption">Mã Hóa Dữ Liệu Nội Dung (encryption)</label>
-                <select id="cfg-encryption" name="encryption">
-                  <option value="off">off — Plaintext Local Spool</option>
-                  <option value="on">on — ChaCha20-Poly1305 AEAD</option>
-                </select>
-              </div>
-
-              <div class="form-group">
-                <label for="cfg-region">S3 SigV4 Region (region)</label>
-                <input type="text" id="cfg-region" name="region" placeholder="* (Wildcard - chấp nhận mọi region)">
-              </div>
-
-              <div class="form-group">
-                <label for="cfg-workers">Số Worker Upload Nền (worker_concurrency)</label>
-                <input type="number" id="cfg-workers" name="worker_concurrency" min="1" max="8">
-              </div>
-
-              <div class="form-group full-width">
-                <label for="cfg-bot-token">Telegram Bot API Token (telegram_bot_token)</label>
-                <div class="password-input-wrapper">
-                  <input type="password" id="cfg-bot-token" name="telegram_bot_token" placeholder="123456789:ABCdefGHIjklMNOpqrsTUVwxyz...">
-                  <button type="button" class="btn-toggle-pwd" id="btn-toggle-token">
-                    <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path><circle cx="12" cy="12" r="3"></circle></svg>
-                  </button>
-                </div>
-              </div>
-
-              <div class="form-group">
-                <label for="cfg-chat-id">Telegram Target Chat ID (telegram_chat_id)</label>
-                <input type="number" id="cfg-chat-id" name="telegram_chat_id" placeholder="-1001234567890">
-              </div>
-
-              <div class="form-group">
-                <label for="cfg-base-url">Telegram API Base URL (telegram_base_url)</label>
-                <input type="text" id="cfg-base-url" name="telegram_base_url" placeholder="https://api.telegram.org">
-              </div>
-
-              <div class="form-group full-width">
-                <label for="cfg-admin-pwd">Mật Khẩu Quản Trị Control Center (admin_password)</label>
-                <input type="password" id="cfg-admin-pwd" name="admin_password" placeholder="Nhập mật khẩu quản trị mới...">
-              </div>
-            </div>
-
-            <div class="form-footer">
-              <button type="submit" class="btn btn-primary" id="btn-save-config">
-                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg>
-                <span>Lưu Cấu Hình Động</span>
-              </button>
-            </div>
-          </form>
-        </div>
+      <!-- CONFIG -->
+      <section id="tab-config" class="tab" aria-label="Cấu hình">
+        <div id="config-error" class="alert-error hidden"></div>
+        <form id="config-form" class="form">
+          <label class="field"><span>Port <em>(cần restart)</em></span><input id="cfg-port" inputmode="numeric"></label>
+          <label class="field"><span>Region <em>(cần restart)</em></span><input id="cfg-region"></label>
+          <label class="field"><span>Mã hóa nội dung</span>
+            <select id="cfg-encryption"><option value="off">off</option><option value="on">on</option></select>
+          </label>
+          <label class="field"><span>Workers <em>(cần restart)</em></span><input id="cfg-workers" inputmode="numeric"></label>
+          <label class="field"><span>Mức log</span>
+            <select id="cfg-loglevel"><option value="error">error</option><option value="warn">warn</option><option value="info">info</option><option value="debug">debug</option><option value="trace">trace</option></select>
+          </label>
+          <label class="field check"><input type="checkbox" id="cfg-logfile"><span>Ghi log ra file daily-rotation <em>(giữ stdout cho journald)</em></span></label>
+          <label class="field"><span>Thư mục log <em>(cần restart)</em></span><input id="cfg-logdir"></label>
+          <label class="field"><span>Giữ log (ngày)</span><input id="cfg-logret" inputmode="numeric"></label>
+          <label class="field"><span>Telegram chat ID</span><input id="cfg-chat" inputmode="numeric"></label>
+          <label class="field"><span>Telegram base URL <em>(cần restart)</em></span><input id="cfg-baseurl"></label>
+          <label class="field"><span>Bot token mới <em>(để trống = giữ nguyên)</em></span><input id="cfg-token" type="password" autocomplete="new-password"></label>
+          <label class="field"><span>Mật khẩu quản trị mới <em>(để trống = giữ nguyên)</em></span><input id="cfg-adminpwd" type="password" autocomplete="new-password"></label>
+          <div class="form-actions"><button type="submit" class="btn primary">Lưu cấu hình</button></div>
+        </form>
+        <p class="muted small">Validate trước khi apply. Trường cần restart được đánh dấu — đổi các trường đó yêu cầu restart daemon.</p>
       </section>
 
-      <!-- TAB 5: MAINTENANCE & GC ENGINE -->
-      <section id="tab-maintenance" class="tab-pane">
-        <div class="maintenance-grid">
-          <!-- Garbage Collection Card -->
-          <div class="glass-panel op-card">
-            <div class="op-header">
-              <div class="op-icon cyan-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M3 6h18"></path><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path></svg>
-              </div>
-              <div>
-                <h3>Physical Garbage Collection (GC)</h3>
-                <p>Quét và xóa các chunk spool local đã commit an toàn, dọn dẹp multipart dở dang và sync deletion với Telegram.</p>
-              </div>
-            </div>
-            <button id="btn-run-gc" class="btn btn-primary">Chạy GC Engine</button>
-            <pre id="output-gc" class="terminal-output hidden"></pre>
-          </div>
-
-          <!-- Integrity Doctor Card -->
-          <div class="glass-panel op-card">
-            <div class="op-header">
-              <div class="op-icon purple-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"></path></svg>
-              </div>
-              <div>
-                <h3>Integrity Doctor & Scrubbing</h3>
-                <p>Kiểm tra toàn vẹn SQLite database index, kiểm tra checksum SHA256 spool local và sự hiện diện remote Telegram.</p>
-              </div>
-            </div>
-            <button id="btn-run-doctor" class="btn btn-secondary">Chạy Integrity Doctor</button>
-            <pre id="output-doctor" class="terminal-output hidden"></pre>
-          </div>
-
-          <!-- Online DB Backup Card -->
-          <div class="glass-panel op-card">
-            <div class="op-header">
-              <div class="op-icon emerald-icon">
-                <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"></path><polyline points="17 21 17 13 7 13 7 21"></polyline><polyline points="7 3 7 8 15 8"></polyline></svg>
-              </div>
-              <div>
-                <h3>Online Database Backup</h3>
-                <p>Tạo bản sao lưu SQLite chỉ mục hoàn chỉnh không tạm dừng server (Sử dụng SQLite Online Backup API).</p>
-              </div>
-            </div>
-            <button id="btn-run-backup" class="btn btn-secondary">Tạo Bản Sao Lưu DB</button>
-            <pre id="output-backup" class="terminal-output hidden"></pre>
-          </div>
+      <!-- BẢO TRÌ -->
+      <section id="tab-maintenance" class="tab" aria-label="Bảo trì">
+        <div class="ops">
+          <div class="op"><div><h3>Garbage Collection</h3><p class="muted">Dọn spool mồ côi, parts bỏ dở.</p></div><button class="btn sm" data-op="/admin/api/gc" data-out="out-gc">Chạy GC</button></div>
+          <div class="op"><div><h3>Doctor</h3><p class="muted">Kiểm tra sức khỏe index/spool.</p></div><button class="btn sm" data-op="/admin/api/doctor" data-out="out-doctor">Chạy Doctor</button></div>
+          <div class="op"><div><h3>Backup DB</h3><p class="muted">Sao lưu database index.</p></div><button class="btn sm" data-op="/admin/api/backup" data-out="out-backup">Sao lưu</button></div>
         </div>
+        <pre id="out-gc" class="output hidden"></pre>
+        <pre id="out-doctor" class="output hidden"></pre>
+        <pre id="out-backup" class="output hidden"></pre>
       </section>
 
-      <!-- TAB 6: AUDIT LOG TERMINAL -->
-      <section id="tab-audit" class="tab-pane">
-        <div class="glass-panel terminal-wrapper">
-          <div class="terminal-bar">
-            <div class="terminal-dots">
-              <span class="dot red"></span>
-              <span class="dot yellow"></span>
-              <span class="dot green"></span>
-            </div>
-            <div class="terminal-title">telecrate-daemon.log</div>
-            <div class="terminal-actions">
-              <input type="text" id="log-filter-input" placeholder="Lọc log..." class="terminal-search">
-              <button id="btn-copy-logs" class="btn btn-sm btn-outline">Copy Log</button>
-            </div>
-          </div>
-          <div id="terminal-body" class="terminal-content font-mono">
-            <div class="log-line text-muted">[SYSTEM] Đang nạp nhật ký hệ thống...</div>
-          </div>
+      <!-- NHẬT KÝ -->
+      <section id="tab-logs" class="tab" aria-label="Nhật ký">
+        <div class="toolbar">
+          <select id="log-level" aria-label="Lọc mức">
+            <option value="">Mọi mức</option>
+            <option value="info">info</option>
+            <option value="warn">warn</option>
+            <option value="error">error</option>
+          </select>
+          <input id="log-q" type="search" placeholder="Tìm actor/action/nội dung…" aria-label="Tìm log">
+          <label class="check small"><input type="checkbox" id="log-auto" checked><span>Tự làm mới (5s)</span></label>
+          <button id="btn-log-reload" class="btn sm">Nạp</button>
+          <button id="btn-log-export" class="btn ghost sm">Xuất JSON</button>
+        </div>
+        <div id="log-error" class="alert-error hidden"></div>
+        <div id="log-count" class="muted small"></div>
+        <table class="data logs">
+          <thead><tr><th>Thời gian</th><th>Mức</th><th>Actor</th><th>Hành động</th><th>Chi tiết</th></tr></thead>
+          <tbody id="log-tbody"><tr><td colspan="5" class="muted">Đang nạp…</td></tr></tbody>
+        </table>
+        <div class="pager">
+          <button id="log-prev" class="btn ghost sm">← Trước</button>
+          <span id="log-page" class="muted small"></span>
+          <button id="log-next" class="btn ghost sm">Sau →</button>
         </div>
       </section>
     </main>
   </div>
 
-  <!-- Modal: Create Bucket -->
-  <div id="modal-create-bucket" class="modal-overlay hidden">
-    <div class="modal-card glass-panel">
-      <div class="modal-header">
-        <h3>Tạo S3 Bucket Mới</h3>
-        <button class="btn-close-modal" data-modal="modal-create-bucket">&times;</button>
+  <!-- Modal -->
+  <div id="modal" class="modal hidden" role="dialog" aria-modal="true">
+    <form id="modal-form" class="modal-card">
+      <h3 id="modal-title"></h3>
+      <div id="modal-fields"></div>
+      <div id="modal-error" class="alert-error hidden"></div>
+      <div class="form-actions">
+        <button type="button" class="btn ghost" id="modal-cancel">Hủy</button>
+        <button type="submit" class="btn primary" id="modal-ok">Xác nhận</button>
       </div>
-      <form id="form-create-bucket">
-        <div class="form-group">
-          <label for="new-bucket-name">Tên Bucket (Bucket Name)</label>
-          <input type="text" id="new-bucket-name" placeholder="my-new-bucket" required pattern="[a-z0-9.-]{3,63}">
-          <span class="form-hint">Chỉ chứa ký tự thường, số, dấu gạch ngang (-) và từ 3-63 ký tự.</span>
-        </div>
-        <div class="form-group">
-          <label for="new-bucket-region">Region</label>
-          <input type="text" id="new-bucket-region" value="us-east-1">
-        </div>
-        <div class="modal-footer">
-          <button type="button" class="btn btn-secondary btn-close-modal" data-modal="modal-create-bucket">Hủy</button>
-          <button type="submit" class="btn btn-primary">Xác Nhận Tạo Bucket</button>
-        </div>
-      </form>
-    </div>
-  </div>
-
-  <!-- Modal: Create Access Key -->
-  <div id="modal-create-key" class="modal-overlay hidden">
-    <div class="modal-card glass-panel">
-      <div class="modal-header">
-        <h3>Tạo S3 Access Key Mới</h3>
-        <button class="btn-close-modal" data-modal="modal-create-key">&times;</button>
-      </div>
-      <form id="form-create-key">
-        <div class="form-group">
-          <label for="new-access-key-id">Access Key ID</label>
-          <div class="input-with-action">
-            <input type="text" id="new-access-key-id" required placeholder="AKIAEXAMPLE...">
-            <button type="button" id="btn-gen-key-id" class="btn btn-secondary btn-sm">Tự Động Tạo</button>
-          </div>
-        </div>
-        <div class="form-group">
-          <label for="new-secret-key">Secret Access Key</label>
-          <div class="input-with-action">
-            <input type="text" id="new-secret-key" required placeholder="secret1234567890...">
-            <button type="button" id="btn-gen-secret" class="btn btn-secondary btn-sm">Tự Động Tạo</button>
-          </div>
-        </div>
-        <div class="form-group">
-          <label for="new-key-desc">Mô Tả Khóa (Description)</label>
-          <input type="text" id="new-key-desc" placeholder="Khóa dùng cho Rclone Backup Server">
-        </div>
-        <div class="modal-footer">
-          <button type="button" class="btn btn-secondary btn-close-modal" data-modal="modal-create-key">Hủy</button>
-          <button type="submit" class="btn btn-primary">Lưu Khóa Mới</button>
-        </div>
-      </form>
-    </div>
-  </div>
-
-  <!-- Modal: View Bucket Objects -->
-  <div id="modal-view-objects" class="modal-overlay hidden">
-    <div class="modal-card modal-lg glass-panel">
-      <div class="modal-header">
-        <h3 id="view-objects-title">Danh Sách Objects Trong Bucket</h3>
-        <button class="btn-close-modal" data-modal="modal-view-objects">&times;</button>
-      </div>
-      <div class="modal-body" style="padding: 1.5rem; max-height: 60vh; overflow-y: auto;">
-        <div class="table-wrapper">
-          <table class="data-table">
-            <thead>
-              <tr>
-                <th>Key (Tên File)</th>
-                <th>Kích Thước</th>
-                <th>Trạng Thái Chốt (Storage State)</th>
-                <th>ETag / MD5</th>
-                <th>Ngày Tạo</th>
-              </tr>
-            </thead>
-            <tbody id="object-list-tbody">
-              <tr><td colspan="5" class="text-center text-muted">Đang tải objects...</td></tr>
-            </tbody>
-          </table>
-        </div>
-      </div>
-      <div class="modal-footer">
-        <button type="button" class="btn btn-secondary btn-close-modal" data-modal="modal-view-objects">Đóng</button>
-      </div>
-    </div>
+    </form>
   </div>
 
   <script src="/dashboard/app.js"></script>

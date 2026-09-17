@@ -35,6 +35,10 @@ async fn spawn_test_app() -> (String, Config, tempfile::TempDir) {
         content_keys: Vec::new(),
         content_key_id: String::new(),
         admin_password: None,
+        log_level: "info".to_string(),
+        log_to_file: false,
+        log_dir: "/tmp/telecrate-test-logs".to_string(),
+        log_retention_days: 7,
     };
 
     let keys = KeyStore::load(&[]).unwrap();

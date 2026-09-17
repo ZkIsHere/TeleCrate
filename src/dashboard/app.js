@@ -1,668 +1,543 @@
-// TeleCrate Control Center — Interactive Frontend Application Logic
+/* TeleCrate admin — vanilla JS, không dependency, không CDN.
+   Mọi endpoint lỗi đều có trạng thái rõ; secret không bao giờ render ra bảng. */
+(() => {
+'use strict';
 
-(function () {
-  'use strict';
+const $ = (id) => document.getElementById(id);
+const state = {
+  csrf: null,
+  tab: 'overview',
+  buckets: [],
+  keys: [],
+  refreshTimer: null,
+  logTimer: null,
+  logOffset: 0,
+  logLimit: 50,
+  logTotal: 0,
+};
 
-  // State Management
-  let state = {
-    csrfToken: '',
-    currentTab: 'overview',
-    refreshInterval: null,
-    buckets: [],
-    accessKeys: [],
-    logs: []
-  };
+const TITLES = {
+  overview: 'Tổng quan',
+  storage: 'Buckets',
+  keys: 'Access keys',
+  config: 'Cấu hình',
+  maintenance: 'Bảo trì',
+  logs: 'Nhật ký',
+};
 
-  // DOM Elements
-  const el = {
-    authView: document.getElementById('auth-view'),
-    mainView: document.getElementById('main-view'),
-    loginForm: document.getElementById('login-form'),
-    adminPassword: document.getElementById('admin-password'),
-    loginError: document.getElementById('login-error'),
-    toastContainer: document.getElementById('toast-container'),
-    navItems: document.querySelectorAll('.nav-item'),
-    tabPanes: document.querySelectorAll('.tab-pane'),
-    currentTabTitle: document.getElementById('current-tab-title'),
-    currentTabSubtitle: document.getElementById('current-tab-subtitle'),
-    btnRefreshAll: document.getElementById('btn-refresh-all'),
-    btnLogout: document.getElementById('btn-logout'),
+/* ---------- helpers ---------- */
+function esc(s) {
+  return String(s ?? '').replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]));
+}
+function fmtBytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + ' B';
+  const u = ['KB', 'MB', 'GB', 'TB'];
+  let i = -1;
+  do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
+  return n.toFixed(1) + ' ' + u[i];
+}
+function fmtUptime(s) {
+  s = Number(s) || 0;
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
+  if (d > 0) return `${d}d ${h}h`;
+  if (h > 0) return `${h}h ${m}m`;
+  return `${m}m`;
+}
+function fmtTime(ts) {
+  const d = new Date(Number(ts) * 1000);
+  return isNaN(d) ? '—' : d.toLocaleString();
+}
+function toast(msg, kind) {
+  const el = document.createElement('div');
+  el.className = 'toast' + (kind === 'ok' ? ' ok' : kind === 'err' ? ' err' : '');
+  el.textContent = msg;
+  $('toast-region').appendChild(el);
+  setTimeout(() => el.remove(), 4000);
+}
+function setOffline(off) {
+  $('offline-banner').classList.toggle('hidden', !off);
+  const ds = $('daemon-state');
+  ds.dataset.state = off ? 'down' : 'up';
+  ds.textContent = off ? 'Daemon: mất kết nối' : 'Daemon: hoạt động';
+}
 
-    // Stats Elements
-    statBuckets: document.getElementById('stat-buckets'),
-    statObjects: document.getElementById('stat-objects'),
-    statSpoolSize: document.getElementById('stat-spool-size'),
-    statKeys: document.getElementById('stat-keys'),
-    spoolProgress: document.getElementById('spool-progress'),
-    infoUptime: document.getElementById('info-uptime'),
-    infoDbSize: document.getElementById('info-db-size'),
-    infoWorkers: document.getElementById('info-workers'),
-    infoPendingJobs: document.getElementById('info-pending-jobs'),
-    infoUploadingJobs: document.getElementById('info-uploading-jobs'),
-
-    // Quick Buttons
-    quickBtnGc: document.getElementById('quick-btn-gc'),
-    quickBtnDoctor: document.getElementById('quick-btn-doctor'),
-    quickBtnBackup: document.getElementById('quick-btn-backup'),
-
-    // Tables & Bodies
-    bucketTbody: document.getElementById('bucket-list-tbody'),
-    keyTbody: document.getElementById('key-list-tbody'),
-    searchBucketInput: document.getElementById('search-bucket-input'),
-    searchKeyInput: document.getElementById('search-key-input'),
-
-    // Config Form
-    configForm: document.getElementById('config-form'),
-    cfgPort: document.getElementById('cfg-port'),
-    cfgEncryption: document.getElementById('cfg-encryption'),
-    cfgRegion: document.getElementById('cfg-region'),
-    cfgWorkers: document.getElementById('cfg-workers'),
-    cfgBotToken: document.getElementById('cfg-bot-token'),
-    cfgChatId: document.getElementById('cfg-chat-id'),
-    cfgBaseUrl: document.getElementById('cfg-base-url'),
-    cfgAdminPwd: document.getElementById('cfg-admin-pwd'),
-
-    // Maintenance
-    btnRunGc: document.getElementById('btn-run-gc'),
-    btnRunDoctor: document.getElementById('btn-run-doctor'),
-    btnRunBackup: document.getElementById('btn-run-backup'),
-    outputGc: document.getElementById('output-gc'),
-    outputDoctor: document.getElementById('output-doctor'),
-    outputBackup: document.getElementById('output-backup'),
-
-    // Audit Terminal
-    terminalBody: document.getElementById('terminal-body'),
-    logFilterInput: document.getElementById('log-filter-input'),
-    btnCopyLogs: document.getElementById('btn-copy-logs'),
-
-    // Modals
-    modalCreateBucket: document.getElementById('modal-create-bucket'),
-    modalCreateKey: document.getElementById('modal-create-key'),
-    btnModalCreateBucket: document.getElementById('btn-modal-create-bucket'),
-    btnModalCreateKey: document.getElementById('btn-modal-create-key'),
-    formCreateBucket: document.getElementById('form-create-bucket'),
-    formCreateKey: document.getElementById('form-create-key'),
-    newAccessKeyId: document.getElementById('new-access-key-id'),
-    newSecretKey: document.getElementById('new-secret-key'),
-    btnGenKeyId: document.getElementById('btn-gen-key-id'),
-    btnGenSecret: document.getElementById('btn-gen-secret')
-  };
-
-  // Toast Helper
-  function showToast(message, type = 'info') {
-    const toast = document.createElement('div');
-    toast.className = `toast toast-${type}`;
-    toast.innerHTML = `
-      <span>${escapeHtml(message)}</span>
-    `;
-    el.toastContainer.appendChild(toast);
-    setTimeout(() => {
-      toast.style.opacity = '0';
-      setTimeout(() => toast.remove(), 300);
-    }, 4000);
+async function api(url, opts = {}) {
+  opts.headers = opts.headers || {};
+  if (state.csrf) opts.headers['x-csrf-token'] = state.csrf;
+  opts.credentials = 'include';
+  let resp;
+  try {
+    resp = await fetch(url, opts);
+  } catch (e) {
+    setOffline(true);
+    throw new Error('Không kết nối được daemon');
   }
+  if (resp.status === 401) { showAuth(); throw new Error('Hết phiên đăng nhập'); }
+  setOffline(false);
+  return resp;
+}
 
-  function escapeHtml(str) {
-    if (!str) return '';
-    return String(str)
-      .replace(/&/g, '&amp;')
-      .replace(/</g, '&lt;')
-      .replace(/>/g, '&gt;')
-      .replace(/"/g, '&quot;');
-  }
+/* ---------- theme ---------- */
+function initTheme() {
+  const saved = localStorage.getItem('tc-theme');
+  const theme = saved || (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark');
+  document.documentElement.dataset.theme = theme;
+}
+$('btn-theme').addEventListener('click', () => {
+  const cur = document.documentElement.dataset.theme === 'light' ? 'dark' : 'light';
+  document.documentElement.dataset.theme = cur;
+  localStorage.setItem('tc-theme', cur);
+});
 
-  function formatBytes(bytes) {
-    if (!bytes || bytes === 0) return '0 B';
-    const k = 1024;
-    const sizes = ['B', 'KiB', 'MiB', 'GiB', 'TiB'];
-    const i = Math.floor(Math.log(bytes) / Math.log(k));
-    return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
-  }
-
-  function formatUptime(seconds) {
-    if (!seconds) return '0s';
-    const hrs = Math.floor(seconds / 3600);
-    const mins = Math.floor((seconds % 3600) / 60);
-    const secs = seconds % 60;
-    if (hrs > 0) return `${hrs}h ${mins}m ${secs}s`;
-    if (mins > 0) return `${mins}m ${secs}s`;
-    return `${secs}s`;
-  }
-
-  // API Client helper
-  async function apiFetch(url, options = {}) {
-    options.headers = options.headers || {};
-    if (state.csrfToken) {
-      options.headers['x-csrf-token'] = state.csrfToken;
-    }
-    options.credentials = 'include';
-    
-    try {
-      const resp = await fetch(url, options);
-      if (resp.status === 401) {
-        showAuthView();
-        throw new Error('Chưa đăng nhập hoặc phiên làm việc đã hết hạn');
-      }
-      return resp;
-    } catch (err) {
-      throw err;
-    }
-  }
-
-  // Initialization & Auth Checks
-  async function init() {
-    await checkSession();
-  }
-
-  async function checkSession() {
-    try {
-      const resp = await fetch('/admin/api/session', { credentials: 'include' });
-      const data = await resp.json();
-      if (data.authenticated) {
-        state.csrfToken = data.csrf_token;
-        showMainView();
-      } else {
-        showAuthView();
-      }
-    } catch (e) {
-      showAuthView();
-    }
-  }
-
-  function showAuthView() {
-    el.authView.classList.remove('hidden');
-    el.mainView.classList.add('hidden');
-    if (state.refreshInterval) {
-      clearInterval(state.refreshInterval);
-      state.refreshInterval = null;
-    }
-  }
-
-  function showMainView() {
-    el.authView.classList.add('hidden');
-    el.mainView.classList.remove('hidden');
-    loadCurrentTabData();
-    if (!state.refreshInterval) {
-      state.refreshInterval = setInterval(refreshStats, 5000);
-    }
-  }
-
-  // Login Handler
-  el.loginForm.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    el.loginError.classList.add('hidden');
-    const pwd = el.adminPassword.value;
-
-    try {
-      const resp = await fetch('/admin/api/login', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ password: pwd }),
-        credentials: 'include'
-      });
-      const data = await resp.json();
-      if (resp.ok && data.ok) {
-        state.csrfToken = data.csrf_token;
-        showToast('Đăng nhập thành công!', 'success');
-        showMainView();
-      } else {
-        el.loginError.textContent = data.error || 'Mật khẩu không chính xác';
-        el.loginError.classList.remove('hidden');
-      }
-    } catch (err) {
-      el.loginError.textContent = 'Kết nối server thất bại: ' + err.message;
-      el.loginError.classList.remove('hidden');
-    }
-  });
-
-  // Logout Handler
-  el.btnLogout.addEventListener('click', async () => {
-    try {
-      await apiFetch('/admin/api/logout', { method: 'POST' });
-      showToast('Đã đăng xuất', 'info');
-    } catch (e) {}
-    showAuthView();
-  });
-
-  // Tab Navigation
-  const tabInfo = {
-    overview: { title: 'Tổng Quan Hệ Thống', subtitle: 'Theo dõi trạng thái và số liệu lưu trữ S3 Gateway thời gian thực' },
-    storage: { title: 'Quản Lý Buckets & Objects', subtitle: 'Danh sách S3 buckets, dung lượng và cấu hình WORM/Versioning' },
-    keys: { title: 'Quản Lý S3 Access Keys (IAM)', subtitle: 'Tạo, quản lý và thu hồi khóa truy cập S3' },
-    config: { title: 'Cấu Hình Động Hệ Thống', subtitle: 'Chỉnh sửa thông số daemon và lưu trực tiếp không cần rebuild binary' },
-    maintenance: { title: 'Trung Tâm Bảo Trì & GC Engine', subtitle: 'Thực thi Garbage Collection, Doctor integrity check và Database Backup' },
-    audit: { title: 'Nhật Ký Hệ Thống Realtime', subtitle: 'Xem log daemon thời gian thực với bộ lọc và tự động ẩn thông tin nhạy cảm' }
-  };
-
-  el.navItems.forEach(item => {
-    item.addEventListener('click', () => {
-      const tabName = item.getAttribute('data-tab');
-      switchTab(tabName);
+/* ---------- auth ---------- */
+function showAuth() {
+  $('auth-view').classList.remove('hidden');
+  $('main-view').classList.add('hidden');
+  stopTimers();
+}
+function showMain() {
+  $('auth-view').classList.add('hidden');
+  $('main-view').classList.remove('hidden');
+  loadTab();
+  state.refreshTimer = state.refreshTimer || setInterval(() => {
+    if (state.tab === 'overview') loadOverview();
+    if (state.tab === 'logs' && $('log-auto').checked) loadLogs();
+  }, 5000);
+}
+function stopTimers() {
+  clearInterval(state.refreshTimer); state.refreshTimer = null;
+}
+async function checkSession() {
+  try {
+    const r = await fetch('/admin/api/session', { credentials: 'include' });
+    const d = await r.json();
+    if (d.authenticated) { state.csrf = d.csrf_token; showMain(); } else showAuth();
+  } catch { showAuth(); }
+}
+$('login-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const err = $('login-error');
+  err.classList.add('hidden');
+  const btn = $('btn-login');
+  btn.disabled = true;
+  try {
+    const r = await fetch('/admin/api/login', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ password: $('admin-password').value }),
+      credentials: 'include',
     });
-  });
-
-  function switchTab(tabName) {
-    state.currentTab = tabName;
-    el.navItems.forEach(i => {
-      if (i.getAttribute('data-tab') === tabName) i.classList.add('active');
-      else i.classList.remove('active');
-    });
-
-    el.tabPanes.forEach(pane => {
-      if (pane.id === `tab-${tabName}`) pane.classList.add('active');
-      else pane.classList.remove('active');
-    });
-
-    if (tabInfo[tabName]) {
-      el.currentTabTitle.textContent = tabInfo[tabName].title;
-      el.currentTabSubtitle.textContent = tabInfo[tabName].subtitle;
-    }
-
-    loadCurrentTabData();
-  }
-
-  function loadCurrentTabData() {
-    refreshStats();
-    if (state.currentTab === 'storage') loadBuckets();
-    if (state.currentTab === 'keys') loadAccessKeys();
-    if (state.currentTab === 'config') loadConfig();
-    if (state.currentTab === 'audit') loadAuditLogs();
-  }
-
-  // Refresh Stats
-  async function refreshStats() {
-    try {
-      const resp = await apiFetch('/admin/api/status');
-      if (!resp.ok) return;
-      const data = await resp.json();
-
-      const counts = data.counts || {};
-      const spool = data.spool || {};
-      const workers = data.workers || {};
-
-      el.statBuckets.textContent = counts.total_buckets ?? data.total_buckets ?? 0;
-      el.statObjects.textContent = counts.total_objects ?? data.total_objects ?? 0;
-      el.statSpoolSize.textContent = formatBytes(spool.used_bytes ?? data.spool_used_bytes ?? 0);
-      el.statKeys.textContent = counts.total_access_keys ?? data.total_access_keys ?? 0;
-
-      const spoolUsed = spool.used_bytes ?? data.spool_used_bytes ?? 0;
-      const spoolTotal = spool.total_bytes ?? data.spool_total_bytes ?? 10737418240;
-      const pct = Math.min(100, Math.round((spoolUsed / spoolTotal) * 100));
-      el.spoolProgress.style.width = `${pct}%`;
-
-      el.infoUptime.textContent = formatUptime(data.uptime_secs ?? data.uptime_seconds ?? 0);
-      el.infoDbSize.textContent = formatBytes(data.db_size_bytes ?? 0);
-      el.infoWorkers.textContent = `${workers.active_worker_count ?? data.worker_concurrency ?? 0} workers`;
-      el.infoPendingJobs.textContent = `${workers.pending_jobs_count ?? data.pending_jobs ?? 0} jobs`;
-      el.infoUploadingJobs.textContent = `${workers.uploading_jobs_count ?? data.uploading_jobs ?? 0} jobs`;
-    } catch (e) {}
-  }
-
-  // Load Buckets
-  async function loadBuckets() {
-    try {
-      const resp = await apiFetch('/admin/api/buckets');
-      const data = await resp.json();
-      state.buckets = Array.isArray(data) ? data : (data.buckets || []);
-      renderBuckets();
-    } catch (e) {
-      el.bucketTbody.innerHTML = `<tr><td colspan="6" class="text-center text-rose">Lỗi khi nạp danh sách buckets</td></tr>`;
-    }
-  }
-
-  function renderBuckets() {
-    const q = el.searchBucketInput.value.toLowerCase().trim();
-    const filtered = state.buckets.filter(b => b.name.toLowerCase().includes(q));
-
-    if (filtered.length === 0) {
-      el.bucketTbody.innerHTML = `<tr><td colspan="6" class="text-center text-muted">Không tìm thấy bucket nào</td></tr>`;
-      return;
-    }
-
-    el.bucketTbody.innerHTML = filtered.map(b => `
-      <tr>
-        <td><strong>${escapeHtml(b.name)}</strong></td>
-        <td><span class="badge badge-success">${escapeHtml(b.region)}</span></td>
-        <td>${escapeHtml(b.versioning || b.versioning_status || 'Disabled')}</td>
-        <td>${escapeHtml(b.encryption_override || 'Off')}</td>
-        <td class="font-mono">${escapeHtml(b.created_at)}</td>
-        <td>
-          <button class="btn btn-sm btn-outline btn-view-objects" data-name="${escapeHtml(b.name)}">Xem Objects</button>
-          <button class="btn btn-sm btn-danger btn-delete-bucket" data-name="${escapeHtml(b.name)}">Xóa</button>
-        </td>
-      </tr>
-    `).join('');
-
-    document.querySelectorAll('.btn-view-objects').forEach(btn => {
-      btn.addEventListener('click', () => viewBucketObjects(btn.getAttribute('data-name')));
-    });
-
-    document.querySelectorAll('.btn-delete-bucket').forEach(btn => {
-      btn.addEventListener('click', () => deleteBucket(btn.getAttribute('data-name')));
-    });
-  }
-
-  async function viewBucketObjects(bucketName) {
-    document.getElementById('view-objects-title').textContent = `Danh Sách Objects — Bucket '${bucketName}'`;
-    const tbody = document.getElementById('object-list-tbody');
-    tbody.innerHTML = `<tr><td colspan="5" class="text-center text-muted">Đang nạp danh sách objects...</td></tr>`;
-    openModal('modal-view-objects');
-
-    try {
-      const resp = await apiFetch(`/admin/api/buckets/${bucketName}/objects`);
-      const objects = await resp.json();
-      if (!Array.isArray(objects) || objects.length === 0) {
-        tbody.innerHTML = `<tr><td colspan="5" class="text-center text-muted">Bucket rỗng (chưa có object nào)</td></tr>`;
-        return;
-      }
-      tbody.innerHTML = objects.map(o => `
-        <tr>
-          <td><strong class="font-mono">${escapeHtml(o.key)}</strong></td>
-          <td class="font-mono">${formatBytes(o.size)}</td>
-          <td><span class="badge ${o.storage_state === 'remote' ? 'badge-success' : 'badge-warning'}">${escapeHtml(o.storage_state)}</span></td>
-          <td class="font-mono">${escapeHtml(o.etag || 'N/A')}</td>
-          <td class="font-mono">${escapeHtml(o.created_at)}</td>
-        </tr>
-      `).join('');
-    } catch (err) {
-      tbody.innerHTML = `<tr><td colspan="5" class="text-center text-rose">Lỗi nạp objects: ${escapeHtml(err.message)}</td></tr>`;
-    }
-  }
-
-  async function deleteBucket(name) {
-    if (!confirm(`Bạn có chắc chắn muốn xóa bucket '${name}' không?`)) return;
-    try {
-      const resp = await apiFetch(`/admin/api/buckets/${name}`, { method: 'DELETE' });
-      const data = await resp.json();
-      if (resp.ok && data.ok) {
-        showToast(`Đã xóa bucket '${name}'`, 'success');
-        loadBuckets();
-        refreshStats();
-      } else {
-        showToast(data.error || 'Xóa bucket thất bại', 'error');
-      }
-    } catch (err) {
-      showToast('Lỗi: ' + err.message, 'error');
-    }
-  }
-
-  // Create Bucket Form
-  el.formCreateBucket.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const name = document.getElementById('new-bucket-name').value.trim();
-    const region = document.getElementById('new-bucket-region').value.trim() || 'us-east-1';
-
-    try {
-      const resp = await apiFetch('/admin/api/buckets', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ name, region })
-      });
-      const data = await resp.json();
-      if (resp.ok && data.ok) {
-        showToast(`Đã tạo bucket '${name}' thành công!`, 'success');
-        closeModal('modal-create-bucket');
-        loadBuckets();
-        refreshStats();
-      } else {
-        showToast(data.error || 'Tạo bucket thất bại', 'error');
-      }
-    } catch (err) {
-      showToast('Lỗi: ' + err.message, 'error');
-    }
-  });
-
-  // Load Access Keys
-  async function loadAccessKeys() {
-    try {
-      const resp = await apiFetch('/admin/api/access-keys');
-      const data = await resp.json();
-      state.accessKeys = Array.isArray(data) ? data : (data.access_keys || []);
-      renderAccessKeys();
-    } catch (e) {
-      el.keyTbody.innerHTML = `<tr><td colspan="5" class="text-center text-rose">Lỗi khi nạp danh sách S3 keys</td></tr>`;
-    }
-  }
-
-  function renderAccessKeys() {
-    const q = el.searchKeyInput.value.toLowerCase().trim();
-    const filtered = state.accessKeys.filter(k => k.access_key_id.toLowerCase().includes(q));
-
-    if (filtered.length === 0) {
-      el.keyTbody.innerHTML = `<tr><td colspan="5" class="text-center text-muted">Không tìm thấy S3 Key nào</td></tr>`;
-      return;
-    }
-
-    el.keyTbody.innerHTML = filtered.map(k => `
-      <tr>
-        <td class="font-mono"><strong>${escapeHtml(k.access_key_id)}</strong></td>
-        <td class="font-mono">
-          <span>••••••••••••••••</span>
-          <button class="btn btn-sm btn-outline btn-copy-secret" data-secret="${escapeHtml(k.secret_key)}" title="Copy Secret Key">Copy Secret</button>
-        </td>
-        <td>${escapeHtml(k.description || 'N/A')}</td>
-        <td class="font-mono">${escapeHtml(k.created_at)}</td>
-        <td>
-          <button class="btn btn-sm btn-danger btn-delete-key" data-id="${escapeHtml(k.access_key_id)}">Thu Hồi</button>
-        </td>
-      </tr>
-    `).join('');
-
-    document.querySelectorAll('.btn-copy-secret').forEach(btn => {
-      btn.addEventListener('click', () => {
-        navigator.clipboard.writeText(btn.getAttribute('data-secret'));
-        showToast('Đã copy Secret Access Key vào Clipboard!', 'success');
-      });
-    });
-
-    document.querySelectorAll('.btn-delete-key').forEach(btn => {
-      btn.addEventListener('click', () => deleteAccessKey(btn.getAttribute('data-id')));
-    });
-  }
-
-  async function deleteAccessKey(id) {
-    if (!confirm(`Bạn có chắc muốn thu hồi Access Key '${id}' không?`)) return;
-    try {
-      const resp = await apiFetch(`/admin/api/access-keys/${id}`, { method: 'DELETE' });
-      const data = await resp.json();
-      if (resp.ok && data.ok) {
-        showToast(`Đã thu hồi Access Key '${id}'`, 'success');
-        loadAccessKeys();
-        refreshStats();
-      } else {
-        showToast(data.error || 'Thu hồi key thất bại', 'error');
-      }
-    } catch (err) {
-      showToast('Lỗi: ' + err.message, 'error');
-    }
-  }
-
-  // Key Generator Helpers
-  function randomString(length, chars) {
-    let result = '';
-    for (let i = 0; i < length; i++) {
-      result += chars.charAt(Math.floor(Math.random() * chars.length));
-    }
-    return result;
-  }
-
-  el.btnGenKeyId.addEventListener('click', () => {
-    el.newAccessKeyId.value = 'AKIA' + randomString(16, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789');
-  });
-
-  el.btnGenSecret.addEventListener('click', () => {
-    el.newSecretKey.value = randomString(40, 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789');
-  });
-
-  el.formCreateKey.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const access_key_id = el.newAccessKeyId.value.trim();
-    const secret_key = el.newSecretKey.value.trim();
-    const description = document.getElementById('new-key-desc').value.trim();
-
-    try {
-      const resp = await apiFetch('/admin/api/access-keys', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ access_key_id, secret_key, description })
-      });
-      const data = await resp.json();
-      if (resp.ok && data.ok) {
-        showToast('Đã tạo Access Key thành công!', 'success');
-        closeModal('modal-create-key');
-        loadAccessKeys();
-        refreshStats();
-      } else {
-        showToast(data.error || 'Tạo Key thất bại', 'error');
-      }
-    } catch (err) {
-      showToast('Lỗi: ' + err.message, 'error');
-    }
-  });
-
-  // Dynamic Config Load & Update
-  async function loadConfig() {
-    try {
-      const resp = await apiFetch('/admin/api/config');
-      const data = await resp.json();
-      if (resp.ok && data.ok && data.config) {
-        const c = data.config;
-        el.cfgPort.value = c.listen_port || 7070;
-        el.cfgEncryption.value = c.encryption || 'off';
-        el.cfgRegion.value = c.region || '*';
-        el.cfgWorkers.value = c.worker_concurrency || 2;
-        el.cfgBotToken.value = c.telegram_bot_token === '[REDACTED]' ? '' : (c.telegram_bot_token || '');
-        el.cfgChatId.value = c.telegram_chat_id || '';
-        el.cfgBaseUrl.value = c.telegram_base_url || 'https://api.telegram.org';
-      }
-    } catch (e) {}
-  }
-
-  el.configForm.addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const items = [
-      { key: 'listen_port', value: el.cfgPort.value },
-      { key: 'encryption', value: el.cfgEncryption.value },
-      { key: 'region', value: el.cfgRegion.value },
-      { key: 'worker_concurrency', value: el.cfgWorkers.value },
-      { key: 'telegram_chat_id', value: el.cfgChatId.value },
-      { key: 'telegram_base_url', value: el.cfgBaseUrl.value }
-    ];
-
-    if (el.cfgBotToken.value && el.cfgBotToken.value !== '[REDACTED]') {
-      items.push({ key: 'telegram_bot_token', value: el.cfgBotToken.value });
-    }
-    if (el.cfgAdminPwd.value && el.cfgAdminPwd.value !== '[REDACTED]') {
-      items.push({ key: 'admin_password', value: el.cfgAdminPwd.value });
-    }
-
-    let successCount = 0;
-    for (const item of items) {
-      try {
-        const resp = await apiFetch('/admin/api/config', {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify(item)
-        });
-        if (resp.ok) successCount++;
-      } catch (err) {}
-    }
-
-    if (successCount > 0) {
-      showToast('Đã lưu và cập nhật cấu hình live thành công!', 'success');
-      loadConfig();
+    const d = await r.json();
+    if (r.ok && d.ok) {
+      state.csrf = d.csrf_token;
+      $('admin-password').value = '';
+      toast('Đăng nhập thành công', 'ok');
+      showMain();
+    } else if (r.status === 429) {
+      err.textContent = d.error || 'Quá nhiều lần sai — thử lại sau 1 phút';
+      err.classList.remove('hidden');
     } else {
-      showToast('Cập nhật cấu hình thất bại', 'error');
+      err.textContent = d.error || 'Mật khẩu không chính xác';
+      err.classList.remove('hidden');
     }
-  });
-
-  // Toggle Password Eye Buttons
-  document.getElementById('btn-toggle-login-pwd').addEventListener('click', () => {
-    el.adminPassword.type = el.adminPassword.type === 'password' ? 'text' : 'password';
-  });
-  document.getElementById('btn-toggle-token').addEventListener('click', () => {
-    el.cfgBotToken.type = el.cfgBotToken.type === 'password' ? 'text' : 'password';
-  });
-
-  // Maintenance Operations
-  el.btnRunGc.addEventListener('click', () => runOperation('/admin/api/gc', el.outputGc, 'Chạy GC Engine'));
-  el.quickBtnGc.addEventListener('click', () => { switchTab('maintenance'); runOperation('/admin/api/gc', el.outputGc, 'Chạy GC Engine'); });
-  
-  el.btnRunDoctor.addEventListener('click', () => runOperation('/admin/api/doctor', el.outputDoctor, 'Kiểm Tra Sức Khỏe Doctor'));
-  el.quickBtnDoctor.addEventListener('click', () => { switchTab('maintenance'); runOperation('/admin/api/doctor', el.outputDoctor, 'Kiểm Tra Sức Khỏe Doctor'); });
-
-  el.btnRunBackup.addEventListener('click', () => runOperation('/admin/api/backup', el.outputBackup, 'Sao Lưu Database'));
-  el.quickBtnBackup.addEventListener('click', () => { switchTab('maintenance'); runOperation('/admin/api/backup', el.outputBackup, 'Sao Lưu Database'); });
-
-  async function runOperation(url, outputEl, title) {
-    outputEl.classList.remove('hidden');
-    outputEl.textContent = `[RUNNING] Đang thực thi ${title}...`;
-    try {
-      const resp = await apiFetch(url, { method: 'POST' });
-      const data = await resp.json();
-      outputEl.textContent = JSON.stringify(data, null, 2);
-      showToast(`Hoàn tất ${title}`, 'success');
-      refreshStats();
-    } catch (err) {
-      outputEl.textContent = `[ERROR] Lỗi thực thi: ${err.message}`;
-      showToast(`Lỗi ${title}`, 'error');
-    }
+  } catch (ex) {
+    err.textContent = 'Kết nối thất bại: ' + ex.message;
+    err.classList.remove('hidden');
   }
+  btn.disabled = false;
+});
+$('btn-logout').addEventListener('click', async () => {
+  try { await api('/admin/api/logout', { method: 'POST' }); } catch {}
+  state.csrf = null;
+  showAuth();
+});
 
-  // Audit Terminal Logs
-  async function loadAuditLogs() {
-    try {
-      const resp = await apiFetch('/admin/api/audit-logs');
-      const logs = await resp.json();
-      state.logs = Array.isArray(logs) ? logs : [];
-      renderAuditLogs();
-    } catch (e) {}
+/* ---------- tabs ---------- */
+const NAV = document.querySelectorAll('.nav-item');
+NAV.forEach((b) => b.addEventListener('click', () => switchTab(b.dataset.tab)));
+function switchTab(t) {
+  state.tab = t;
+  NAV.forEach((b) => b.classList.toggle('active', b.dataset.tab === t));
+  document.querySelectorAll('.tab').forEach((p) => p.classList.toggle('active', p.id === 'tab-' + t));
+  $('tab-title').textContent = TITLES[t] || t;
+  if (t === 'logs') state.logOffset = 0;
+  loadTab();
+}
+function loadTab() {
+  loadOverview();
+  if (state.tab === 'storage') loadBuckets();
+  if (state.tab === 'keys') loadKeys();
+  if (state.tab === 'config') loadConfig();
+  if (state.tab === 'logs') loadLogs();
+}
+$('btn-refresh').addEventListener('click', () => { loadTab(); toast('Đã làm mới', 'ok'); });
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') closeModal();
+  if (e.key === '/' && !/INPUT|SELECT|TEXTAREA/.test(document.activeElement.tagName)) {
+    const q = { storage: 'q-bucket', keys: 'q-key', logs: 'log-q' }[state.tab];
+    if (q) { e.preventDefault(); $(q).focus(); }
   }
+});
 
-  function renderAuditLogs() {
-    const filter = el.logFilterInput.value.toLowerCase().trim();
-    const filtered = state.logs.filter(l => l.toLowerCase().includes(filter));
+/* ---------- overview ---------- */
+async function loadOverview() {
+  const err = $('ov-error');
+  err.classList.add('hidden');
+  try {
+    const r = await api('/admin/api/status');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    const c = d.counts || {}, s = d.spool || {}, w = d.workers || {};
+    const v = (x, fb) => x ?? fb ?? '—';
+    $('ov-buckets').textContent = v(c.total_buckets, d.total_buckets);
+    $('ov-objects').textContent = v(c.total_objects, d.total_objects);
+    $('ov-keys').textContent = v(c.total_access_keys, d.total_access_keys);
+    $('ov-spool').textContent = fmtBytes(v(s.used_bytes, d.spool_used_bytes));
+    $('ov-jobs').textContent = `${v(w.pending_jobs_count, d.pending_jobs)} chờ / ${v(w.uploading_jobs_count, d.uploading_jobs)} chạy`;
+    $('ov-workers').textContent = v(w.active_worker_count, d.worker_concurrency);
+    $('ov-db').textContent = fmtBytes(d.db_size_bytes || 0);
+    $('ov-uptime').textContent = fmtUptime(d.uptime_secs ?? d.uptime_seconds);
+    $('app-version').textContent = d.version ? 'v' + d.version : '';
+    setOffline(false);
+  } catch (e) {
+    err.textContent = 'Không nạp được trạng thái: ' + e.message;
+    err.classList.remove('hidden');
+  }
+}
 
-    if (filtered.length === 0) {
-      el.terminalBody.innerHTML = `<div class="log-line text-muted">[INFO] Không có dòng log nào khớp với bộ lọc</div>`;
+/* ---------- buckets ---------- */
+async function loadBuckets() {
+  const tb = $('bucket-tbody');
+  tb.innerHTML = '<tr><td colspan="5" class="muted">Đang nạp…</td></tr>';
+  $('bucket-error').classList.add('hidden');
+  try {
+    const r = await api('/admin/api/buckets');
+    const d = await r.json();
+    state.buckets = Array.isArray(d) ? d : (d.buckets || []);
+    renderBuckets();
+  } catch (e) {
+    tb.innerHTML = '';
+    const be = $('bucket-error');
+    be.textContent = 'Lỗi nạp buckets: ' + e.message;
+    be.classList.remove('hidden');
+  }
+}
+function renderBuckets() {
+  const q = $('q-bucket').value.toLowerCase().trim();
+  const list = state.buckets.filter((b) => (b.name || '').toLowerCase().includes(q));
+  const tb = $('bucket-tbody');
+  if (!list.length) {
+    tb.innerHTML = `<tr><td colspan="5" class="muted">${state.buckets.length ? 'Không khớp bộ lọc' : 'Chưa có bucket nào — tạo bucket đầu tiên để bắt đầu'}</td></tr>`;
+    return;
+  }
+  tb.innerHTML = list.map((b) => `<tr>
+    <td><strong>${esc(b.name)}</strong></td>
+    <td>${esc(b.region)}</td>
+    <td>${esc(b.versioning || b.versioning_status || 'Disabled')}</td>
+    <td class="mono">${esc(b.created_at)}</td>
+    <td><button class="btn sm ghost" data-act="view" data-n="${esc(b.name)}">Objects</button>
+    <button class="btn sm danger" data-act="del" data-n="${esc(b.name)}">Xóa</button></td>
+  </tr>`).join('');
+  tb.querySelectorAll('button').forEach((btn) => btn.addEventListener('click', () => {
+    if (btn.dataset.act === 'view') viewObjects(btn.dataset.n);
+    else if (confirm(`Xóa bucket '${btn.dataset.n}'? Bucket phải rỗng.`)) deleteBucket(btn.dataset.n);
+  }));
+}
+$('q-bucket').addEventListener('input', renderBuckets);
+async function deleteBucket(n) {
+  try {
+    const r = await api(`/admin/api/buckets/${encodeURIComponent(n)}`, { method: 'DELETE' });
+    const d = await r.json();
+    if (r.ok && d.ok) { toast(`Đã xóa bucket '${n}'`, 'ok'); loadBuckets(); }
+    else toast(d.error || 'Xóa thất bại', 'err');
+  } catch (e) { toast(e.message, 'err'); }
+}
+async function viewObjects(bucket) {
+  $('object-panel').classList.remove('hidden');
+  $('object-title').textContent = `Objects — ${bucket}`;
+  const tb = $('object-tbody');
+  tb.innerHTML = '<tr><td colspan="5" class="muted">Đang nạp…</td></tr>';
+  $('object-error').classList.add('hidden');
+  try {
+    const r = await api(`/admin/api/buckets/${encodeURIComponent(bucket)}/objects`);
+    const d = await r.json();
+    const list = Array.isArray(d) ? d : (d.objects || []);
+    if (!list.length) {
+      tb.innerHTML = '<tr><td colspan="5" class="muted">Bucket rỗng</td></tr>';
       return;
     }
-
-    el.terminalBody.innerHTML = filtered.map(line => {
-      let colorClass = 'text-primary';
-      if (line.includes('[ERROR]')) colorClass = 'text-rose';
-      if (line.includes('[WARN]')) colorClass = 'text-cyan';
-      if (line.includes('[INFO]')) colorClass = 'text-emerald';
-      return `<div class="log-line ${colorClass}">${escapeHtml(line)}</div>`;
-    }).join('');
+    tb.innerHTML = list.map((o) => `<tr>
+      <td class="mono"><strong>${esc(o.key)}</strong></td>
+      <td class="mono">${fmtBytes(o.size)}</td>
+      <td><span class="badge ${o.storage_state === 'remote' ? 'ok' : 'warn'}">${esc(o.storage_state)}</span></td>
+      <td class="mono">${esc(o.etag || '—')}</td>
+      <td class="mono">${esc(o.created_at)}</td>
+    </tr>`).join('');
+  } catch (e) {
+    const oe = $('object-error');
+    oe.textContent = 'Lỗi nạp objects: ' + e.message;
+    oe.classList.remove('hidden');
+    tb.innerHTML = '';
   }
-
-  el.logFilterInput.addEventListener('input', renderAuditLogs);
-  el.btnCopyLogs.addEventListener('click', () => {
-    navigator.clipboard.writeText(state.logs.join('\n'));
-    showToast('Đã copy toàn bộ log vào Clipboard!', 'success');
-  });
-
-  // Modal Open / Close Helpers
-  function openModal(id) { document.getElementById(id).classList.remove('hidden'); }
-  function closeModal(id) { document.getElementById(id).classList.add('hidden'); }
-
-  el.btnModalCreateBucket.addEventListener('click', () => openModal('modal-create-bucket'));
-  el.btnModalCreateKey.addEventListener('click', () => openModal('modal-create-key'));
-
-  document.querySelectorAll('.btn-close-modal').forEach(btn => {
-    btn.addEventListener('click', () => {
-      closeModal(btn.getAttribute('data-modal'));
+}
+$('btn-close-objects').addEventListener('click', () => $('object-panel').classList.add('hidden'));
+$('btn-new-bucket').addEventListener('click', () => openModal({
+  title: 'Tạo bucket',
+  fields: [
+    { id: 'm-name', label: 'Tên bucket', value: '' },
+    { id: 'm-region', label: 'Region', value: 'us-east-1' },
+  ],
+  onOk: async () => {
+    const name = $('m-name').value.trim(), region = $('m-region').value.trim() || 'us-east-1';
+    if (!name) return 'Tên bucket bắt buộc';
+    const r = await api('/admin/api/buckets', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, region }),
     });
-  });
+    const d = await r.json();
+    if (r.ok && d.ok) { toast(`Đã tạo bucket '${name}'`, 'ok'); loadBuckets(); return null; }
+    return d.error || 'Tạo thất bại';
+  },
+}));
 
-  el.searchBucketInput.addEventListener('input', renderBuckets);
-  el.searchKeyInput.addEventListener('input', renderAccessKeys);
-  el.btnRefreshAll.addEventListener('click', () => {
-    loadCurrentTabData();
-    showToast('Đã làm mới dữ liệu', 'info');
-  });
+/* ---------- keys ---------- */
+async function loadKeys() {
+  const tb = $('key-tbody');
+  tb.innerHTML = '<tr><td colspan="5" class="muted">Đang nạp…</td></tr>';
+  $('key-error').classList.add('hidden');
+  try {
+    const r = await api('/admin/api/access-keys');
+    const d = await r.json();
+    state.keys = Array.isArray(d) ? d : (d.access_keys || []);
+    renderKeys();
+  } catch (e) {
+    tb.innerHTML = '';
+    const ke = $('key-error');
+    ke.textContent = 'Lỗi nạp keys: ' + e.message;
+    ke.classList.remove('hidden');
+  }
+}
+function renderKeys() {
+  const q = $('q-key').value.toLowerCase().trim();
+  const list = state.keys.filter((k) => (k.access_key_id || '').toLowerCase().includes(q));
+  const tb = $('key-tbody');
+  if (!list.length) {
+    tb.innerHTML = `<tr><td colspan="5" class="muted">${state.keys.length ? 'Không khớp bộ lọc' : 'Chưa có access key nào'}</td></tr>`;
+    return;
+  }
+  tb.innerHTML = list.map((k) => `<tr>
+    <td class="mono"><strong>${esc(k.access_key_id)}</strong></td>
+    <td>${esc(k.user_id || '—')}</td>
+    <td><span class="badge ${k.status === 'active' ? 'ok' : ''}">${esc(k.status || '—')}</span></td>
+    <td class="mono">${esc(k.created_at)}</td>
+    <td><button class="btn sm danger" data-id="${esc(k.access_key_id)}">Thu hồi</button></td>
+  </tr>`).join('');
+  tb.querySelectorAll('button').forEach((b) => b.addEventListener('click', async () => {
+    if (!confirm(`Thu hồi key '${b.dataset.id}'? Các client dùng key này sẽ mất truy cập.`)) return;
+    try {
+      const r = await api(`/admin/api/access-keys/${encodeURIComponent(b.dataset.id)}`, { method: 'DELETE' });
+      const d = await r.json();
+      if (r.ok && d.ok) { toast('Đã thu hồi key', 'ok'); loadKeys(); }
+      else toast(d.error || 'Thu hồi thất bại', 'err');
+    } catch (e) { toast(e.message, 'err'); }
+  }));
+}
+$('q-key').addEventListener('input', renderKeys);
+$('btn-new-key').addEventListener('click', () => openModal({
+  // Server tự sinh key id + secret (CSPRNG) — form chỉ hỏi user/mô tả.
+  title: 'Tạo access key',
+  fields: [
+    { id: 'm-kuser', label: 'User / mô tả', value: 'admin' },
+  ],
+  onOk: async () => {
+    const r = await api('/admin/api/access-keys', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_id: $('m-kuser').value.trim() || 'admin' }),
+    });
+    const d = await r.json();
+    if (r.ok && d.ok && d.secret_key) {
+      // Secret hiện ĐÚNG MỘT LẦN — không render vào bảng, không lưu đâu khác.
+      const box = $('new-secret');
+      box.innerHTML = `<strong>Lưu ngay — secret chỉ hiện một lần:</strong><br><span class="mono">ID: ${esc(d.access_key_id)}<br>Secret: ${esc(d.secret_key)}</span>`;
+      box.classList.remove('hidden');
+      loadKeys();
+      return null;
+    }
+    return (d && d.error) || 'Tạo key thất bại';
+  },
+}));
 
-  // Start App
-  init();
+/* ---------- config ---------- */
+async function loadConfig() {
+  const err = $('config-error');
+  err.classList.add('hidden');
+  try {
+    const r = await api('/admin/api/config');
+    const d = await r.json();
+    if (!(r.ok && d.ok && d.config)) throw new Error((d && d.error) || 'HTTP ' + r.status);
+    const c = d.config;
+    $('cfg-port').value = c.listen_port ?? 7070;
+    $('cfg-region').value = c.region ?? '*';
+    $('cfg-encryption').value = c.encryption || 'off';
+    $('cfg-workers').value = c.worker_concurrency ?? 2;
+    $('cfg-loglevel').value = c.log_level || 'info';
+    $('cfg-logfile').checked = !!c.log_to_file;
+    $('cfg-logdir').value = c.log_dir || '/var/lib/telecrate/logs';
+    $('cfg-logret').value = c.log_retention_days ?? 14;
+    $('cfg-chat').value = c.telegram_chat_id ?? '';
+    $('cfg-baseurl').value = c.telegram_base_url || 'https://api.telegram.org';
+    $('cfg-token').value = '';
+    $('cfg-adminpwd').value = '';
+  } catch (e) {
+    err.textContent = 'Lỗi nạp cấu hình: ' + e.message;
+    err.classList.remove('hidden');
+  }
+}
+$('config-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const items = [
+    ['listen_port', $('cfg-port').value],
+    ['region', $('cfg-region').value],
+    ['encryption', $('cfg-encryption').value],
+    ['worker_concurrency', $('cfg-workers').value],
+    ['log_level', $('cfg-loglevel').value],
+    ['log_to_file', $('cfg-logfile').checked ? 'true' : 'false'],
+    ['log_dir', $('cfg-logdir').value],
+    ['log_retention_days', $('cfg-logret').value],
+    ['telegram_chat_id', $('cfg-chat').value],
+    ['telegram_base_url', $('cfg-baseurl').value],
+  ];
+  if ($('cfg-token').value) items.push(['telegram_bot_token', $('cfg-token').value]);
+  if ($('cfg-adminpwd').value) items.push(['admin_password', $('cfg-adminpwd').value]);
+  let ok = 0, firstErr = '';
+  for (const [key, value] of items) {
+    try {
+      const r = await api('/admin/api/config', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ key, value }),
+      });
+      if (r.ok) ok++;
+      else if (!firstErr) { try { firstErr = (await r.json()).error || ''; } catch {} }
+    } catch (ex) { if (!firstErr) firstErr = ex.message; }
+  }
+  if (ok === items.length) { toast('Đã lưu cấu hình', 'ok'); $('cfg-token').value = ''; $('cfg-adminpwd').value = ''; }
+  else toast(`Lưu ${ok}/${items.length}${firstErr ? ' — lỗi: ' + firstErr : ''}`, 'err');
+  loadConfig();
+});
+
+/* ---------- maintenance ---------- */
+document.querySelectorAll('[data-op]').forEach((b) => b.addEventListener('click', async () => {
+  const out = $(b.dataset.out);
+  out.classList.remove('hidden');
+  out.textContent = 'Đang chạy…';
+  b.disabled = true;
+  try {
+    const r = await api(b.dataset.op, { method: 'POST' });
+    const d = await r.json();
+    out.textContent = JSON.stringify(d, null, 2);
+    toast(r.ok ? 'Hoàn tất' : 'Có lỗi — xem output', r.ok ? 'ok' : 'err');
+  } catch (e) {
+    out.textContent = 'Lỗi: ' + e.message;
+    toast('Lỗi thực thi', 'err');
+  }
+  b.disabled = false;
+}));
+
+/* ---------- logs ---------- */
+const LV_CLASS = { info: '', warn: 'warn', error: 'err' };
+async function loadLogs() {
+  const err = $('log-error');
+  err.classList.add('hidden');
+  const tb = $('log-tbody');
+  try {
+    const p = new URLSearchParams({
+      limit: 50, offset: state.logOffset,
+    });
+    const lv = $('log-level').value, q = $('log-q').value.trim();
+    if (lv) p.set('level', lv);
+    if (q) p.set('q', q);
+    const r = await api('/admin/api/audit-logs?' + p.toString());
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    const d = await r.json();
+    const list = d.entries || [];
+    state.logTotal = d.total || 0;
+    if (!list.length) {
+      tb.innerHTML = '<tr><td colspan="5" class="muted">Không có bản ghi nào — thử nới bộ lọc</td></tr>';
+    } else {
+      tb.innerHTML = list.map((e) => `<tr>
+        <td class="mono">${esc(fmtTime(e.ts))}</td>
+        <td><span class="badge ${LV_CLASS[e.level] || ''}">${esc(e.level)}</span></td>
+        <td>${esc(e.actor)}</td>
+        <td class="mono">${esc(e.action)}</td>
+        <td>${esc(e.detail)}</td>
+      </tr>`).join('');
+    }
+    const pages = Math.max(1, Math.ceil(state.logTotal / 50));
+    const cur = Math.floor(state.logOffset / 50) + 1;
+    $('log-page').textContent = `Trang ${cur}/${pages} — tổng ${state.logTotal}`;
+    $('log-count').textContent = '';
+    $('log-prev').disabled = state.logOffset === 0;
+    $('log-next').disabled = state.logOffset + 50 >= state.logTotal;
+  } catch (e) {
+    err.textContent = 'Lỗi nạp nhật ký: ' + e.message;
+    err.classList.remove('hidden');
+  }
+}
+$('btn-log-reload').addEventListener('click', () => { state.logOffset = 0; loadLogs(); });
+$('log-level').addEventListener('change', () => { state.logOffset = 0; loadLogs(); });
+$('log-q').addEventListener('input', () => { state.logOffset = 0; loadLogs(); });
+$('log-prev').addEventListener('click', () => { state.logOffset = Math.max(0, state.logOffset - 50); loadLogs(); });
+$('log-next').addEventListener('click', () => { state.logOffset += 50; loadLogs(); });
+$('btn-log-export').addEventListener('click', async () => {
+  try {
+    const r = await api('/admin/api/audit-logs?limit=1000');
+    const d = await r.json();
+    const blob = new Blob([JSON.stringify(d.entries || [], null, 2)], { type: 'application/json' });
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = 'telecrate-audit.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+    toast('Đã xuất nhật ký (đã redact ở server)', 'ok');
+  } catch (e) { toast('Xuất thất bại: ' + e.message, 'err'); }
+});
+
+/* ---------- modal ---------- */
+let modalOk = null;
+function openModal({ title, fields, onOk }) {
+  $('modal-title').textContent = title;
+  $('modal-fields').innerHTML = fields.map((f) =>
+    `<label class="field"><span>${esc(f.label)}</span><input id="${f.id}" value="${esc(f.value || '')}"></label>`
+  ).join('');
+  $('modal-error').classList.add('hidden');
+  modalOk = onOk;
+  $('modal').classList.remove('hidden');
+  const first = $('modal-fields').querySelector('input');
+  if (first) first.focus();
+}
+function closeModal() { $('modal').classList.add('hidden'); modalOk = null; }
+$('modal-cancel').addEventListener('click', closeModal);
+$('modal').addEventListener('click', (e) => { if (e.target === $('modal')) closeModal(); });
+$('modal-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  if (!modalOk) return;
+  const err = $('modal-error');
+  err.classList.add('hidden');
+  $('modal-ok').disabled = true;
+  try {
+    const msg = await modalOk();
+    if (msg) { err.textContent = msg; err.classList.remove('hidden'); }
+    else closeModal();
+  } catch (ex) {
+    err.textContent = ex.message;
+    err.classList.remove('hidden');
+  }
+  $('modal-ok').disabled = false;
+});
+
+/* ---------- start ---------- */
+initTheme();
+checkSession();
 })();

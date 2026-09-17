@@ -21,7 +21,9 @@ serde_json = "1"
 toml = "0.8"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "fmt", "std"] }
+# Log file daily-rotation cho daemon (stdout vẫn giữ cho journald).
+tracing-appender = "0.2"
 rusqlite = { version = "0.31", features = ["bundled", "backup"] }
 sha2 = "0.10"
 hex = "0.4"

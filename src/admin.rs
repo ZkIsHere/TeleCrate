@@ -41,12 +41,49 @@ pub struct SessionInfo {
     pub expires_at: u64,
 }
 
+/// Mức audit — hiển thị/lọc ở dashboard, không lẫn với tracing level của daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AuditLevel {
+    Info,
+    Warn,
+    Error,
+}
+
+impl AuditLevel {
+    fn from_str(s: &str) -> Option<Self> {
+        match s.to_ascii_lowercase().as_str() {
+            "info" => Some(Self::Info),
+            "warn" => Some(Self::Warn),
+            "error" => Some(Self::Error),
+            _ => None,
+        }
+    }
+}
+
+/// Một bản ghi audit có cấu trúc (thay chuỗi tự do — lọc/phân trang được, không parse lại).
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AuditEntry {
+    pub ts: u64,
+    pub level: AuditLevel,
+    pub actor: String,
+    pub action: String,
+    pub detail: String,
+}
+
+/// Sức chứa ring-buffer audit (in-memory; log daemon file giữ bản bền vững).
+pub const AUDIT_RING_CAP: usize = 5000;
+/// Ngưỡng rate-limit login: số lần sai tối đa mỗi cửa sổ.
+pub const LOGIN_FAIL_LIMIT: usize = 10;
+pub const LOGIN_FAIL_WINDOW_SECS: u64 = 60;
+
 /// Global In-Memory Session & Audit Log Store
 #[derive(Debug, Default)]
 pub struct SessionStore {
     sessions: Mutex<HashMap<String, SessionInfo>>,
     start_time: Option<Instant>,
-    audit_logs: Mutex<Vec<String>>,
+    audit_logs: Mutex<std::collections::VecDeque<AuditEntry>>,
+    login_failures: Mutex<Vec<u64>>,
 }
 
 impl SessionStore {
@@ -54,24 +91,69 @@ impl SessionStore {
         Self {
             sessions: Mutex::new(HashMap::new()),
             start_time: Some(Instant::now()),
-            audit_logs: Mutex::new(Vec::new()),
+            audit_logs: Mutex::new(std::collections::VecDeque::new()),
+            login_failures: Mutex::new(Vec::new()),
         }
     }
 
-    pub fn add_log(&self, msg: String) {
+    /// Ghi audit có cấu trúc vào ring-buffer (đầy thì bỏ bản cũ nhất — O(1), không shift Vec).
+    /// `detail` không được chứa secret (caller redact trước; endpoint cũng redact phòng thủ).
+    pub fn audit(&self, level: AuditLevel, actor: &str, action: &str, detail: String) {
         if let Ok(mut logs) = self.audit_logs.lock() {
-            logs.push(msg);
-            if logs.len() > 1000 {
-                logs.remove(0);
+            logs.push_back(AuditEntry {
+                ts: now_secs(),
+                level,
+                actor: actor.to_string(),
+                action: action.to_string(),
+                detail,
+            });
+            while logs.len() > AUDIT_RING_CAP {
+                logs.pop_front();
             }
         }
     }
 
-    pub fn get_logs(&self) -> Vec<String> {
-        self.audit_logs
-            .lock()
-            .map(|l| l.clone())
-            .unwrap_or_default()
+    /// Truy vấn audit mới-nhất-trước, lọc level/từ khóa, phân trang. Trả (entries, total).
+    pub fn query_logs(
+        &self,
+        level: Option<AuditLevel>,
+        q: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> (Vec<AuditEntry>, usize) {
+        let logs = self.audit_logs.lock();
+        let logs = match logs {
+            Ok(l) => l,
+            Err(_) => return (Vec::new(), 0),
+        };
+        let q = q.unwrap_or("").to_ascii_lowercase();
+        let filtered: Vec<AuditEntry> = logs
+            .iter()
+            .rev()
+            .filter(|e| level.map(|l| l == e.level).unwrap_or(true))
+            .filter(|e| {
+                q.is_empty()
+                    || e.action.to_ascii_lowercase().contains(&q)
+                    || e.detail.to_ascii_lowercase().contains(&q)
+                    || e.actor.to_ascii_lowercase().contains(&q)
+            })
+            .cloned()
+            .collect();
+        let total = filtered.len();
+        let entries = filtered.into_iter().skip(offset).take(limit).collect();
+        (entries, total)
+    }
+
+    /// Ghi nhận login sai; trả `true` nếu vượt ngưỡng rate-limit (caller trả 429 + audit).
+    pub fn note_login_failure(&self) -> bool {
+        let now = now_secs();
+        if let Ok(mut v) = self.login_failures.lock() {
+            v.retain(|t| now.saturating_sub(*t) < LOGIN_FAIL_WINDOW_SECS);
+            v.push(now);
+            v.len() > LOGIN_FAIL_LIMIT
+        } else {
+            false
+        }
     }
 
     pub fn uptime_secs(&self) -> u64 {
@@ -267,12 +349,36 @@ pub async fn api_login(
         .unwrap_or("telecrate-admin");
 
     if input_pwd != expected_pwd {
+        let limited = store.note_login_failure();
+        store.audit(
+            AuditLevel::Warn,
+            "unknown",
+            "auth.login_failed",
+            if limited {
+                "rate-limited".to_string()
+            } else {
+                "bad password".to_string()
+            },
+        );
+        if limited {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({ "ok": false, "error": "Quá nhiều lần sai, thử lại sau 1 phút" })),
+            )
+                .into_response();
+        }
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({ "ok": false, "error": "Mật khẩu Admin không chính xác" })),
         )
             .into_response();
     }
+    store.audit(
+        AuditLevel::Info,
+        "admin",
+        "auth.login",
+        "session created".to_string(),
+    );
 
     let (session_id, csrf_token) = store.create_session();
     let cookie_val = format!(
@@ -298,6 +404,12 @@ pub async fn api_login(
 pub async fn api_logout(State((_, store)): State<AdminState>, headers: HeaderMap) -> Response {
     if let Some(session_id) = extract_session_id(&headers) {
         store.remove_session(&session_id);
+        store.audit(
+            AuditLevel::Info,
+            "admin",
+            "auth.logout",
+            "session removed".to_string(),
+        );
     }
 
     let cookie_val = "telecrate_session=; HttpOnly; SameSite=Lax; Path=/; Max-Age=0";
@@ -500,12 +612,12 @@ pub async fn api_create_bucket(
 
     match telecrate::db::create_bucket(&conn, &payload.name, &region) {
         Ok(_) => {
-            store.add_log(format!(
-                "[INFO] [{}] Created S3 bucket '{}' in region '{}'",
-                now_secs(),
-                payload.name,
-                region
-            ));
+            store.audit(
+                AuditLevel::Info,
+                "admin",
+                "bucket.create",
+                format!("name='{name}' region='{region}'", name = payload.name),
+            );
             Json(json!({ "ok": true, "name": payload.name })).into_response()
         }
         Err(e) => (
@@ -540,11 +652,12 @@ pub async fn api_delete_bucket(
 
     match telecrate::db::delete_bucket(&conn, &name) {
         Ok(_) => {
-            store.add_log(format!(
-                "[WARN] [{}] Deleted S3 bucket '{}'",
-                now_secs(),
-                name
-            ));
+            store.audit(
+                AuditLevel::Warn,
+                "admin",
+                "bucket.delete",
+                format!("name='{name}'"),
+            );
             Json(json!({ "ok": true })).into_response()
         }
         Err(e) => (
@@ -693,12 +806,13 @@ pub async fn api_create_access_key(
 
     match telecrate::db::create_access_key(&conn, &access_key_id, &secret_key, Some(&user_id)) {
         Ok(_) => {
-            store.add_log(format!(
-                "[INFO] [{}] Generated new S3 AccessKeyId '{}' for user '{}'",
-                now_secs(),
-                access_key_id,
-                user_id
-            ));
+            // Audit KHÔNG ghi secret_key — chỉ id + user (secret chỉ trả 1 lần trong response).
+            store.audit(
+                AuditLevel::Info,
+                "admin",
+                "key.create",
+                format!("id='{access_key_id}' user='{user_id}'"),
+            );
             Json(json!({
                 "ok": true,
                 "access_key_id": access_key_id,
@@ -739,11 +853,12 @@ pub async fn api_revoke_access_key(
 
     match telecrate::db::delete_access_key(&conn, &key_id) {
         Ok(_) => {
-            store.add_log(format!(
-                "[WARN] [{}] Revoked S3 AccessKeyId '{}'",
-                now_secs(),
-                key_id
-            ));
+            store.audit(
+                AuditLevel::Warn,
+                "admin",
+                "key.revoke",
+                format!("id='{key_id}'"),
+            );
             Json(json!({ "ok": true })).into_response()
         }
         Err(e) => (
@@ -778,12 +893,15 @@ pub async fn api_run_gc(
     let gc_res =
         telecrate::gc::run_gc(&conn, FilePath::new(&config.spool_dir), None).unwrap_or_default();
 
-    store.add_log(format!(
-        "[INFO] [{}] Executed GC Engine: freed {} bytes in spool, cleaned {} parts",
-        now_secs(),
-        gc_res.spool_bytes_freed,
-        gc_res.orphaned_parts_cleaned
-    ));
+    store.audit(
+        AuditLevel::Info,
+        "admin",
+        "gc.run",
+        format!(
+            "spool_bytes_freed={} orphaned_parts_cleaned={}",
+            gc_res.spool_bytes_freed, gc_res.orphaned_parts_cleaned
+        ),
+    );
 
     Json(json!({
         "ok": true,
@@ -820,10 +938,12 @@ pub async fn api_run_doctor(
         .map(|r| serde_json::to_value(r).unwrap_or_default())
         .unwrap_or_else(|e| json!({ "error": format!("Doctor error: {e}") }));
 
-    store.add_log(format!(
-        "[INFO] [{}] Executed Doctor health check & scrub",
-        now_secs()
-    ));
+    store.audit(
+        AuditLevel::Info,
+        "admin",
+        "doctor.run",
+        "health check & scrub".to_string(),
+    );
 
     Json(json!({
         "ok": true,
@@ -861,12 +981,12 @@ pub async fn api_run_backup(
             let size = std::fs::metadata(&backup_path)
                 .map(|m| m.len())
                 .unwrap_or(0);
-            store.add_log(format!(
-                "[INFO] [{}] Database backup created at '{}' ({} bytes)",
-                now_secs(),
-                backup_path,
-                size
-            ));
+            store.audit(
+                AuditLevel::Info,
+                "admin",
+                "backup.run",
+                format!("path='{backup_path}' bytes={size}"),
+            );
             Json(json!({
                 "ok": true,
                 "backup_path": backup_path,
@@ -882,57 +1002,55 @@ pub async fn api_run_backup(
     }
 }
 
-/// `GET /admin/api/audit-logs`
+#[derive(Deserialize, Default)]
+pub struct AuditQuery {
+    /// level=info|warn|error (tùy chọn).
+    pub level: Option<String>,
+    /// q: tìm trong actor/action/detail, không phân biệt hoa thường.
+    pub q: Option<String>,
+    /// limit: mặc định 100, tối đa 1000.
+    pub limit: Option<usize>,
+    /// offset: phân trang.
+    pub offset: Option<usize>,
+}
+
+/// `GET /admin/api/audit-logs?level=&q=&limit=&offset=`
+/// Trả bản ghi audit THẬT từ ring-buffer (mới nhất trước) + tổng số sau lọc.
+/// Không fabricate log, không lộ token/secret (detail đã redact ở tầng ghi + phòng thủ ở đây).
 pub async fn api_get_audit_logs(
-    State((config_lock, store)): State<AdminState>,
+    State((_, store)): State<AdminState>,
     headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<AuditQuery>,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
         return err_resp.into_response();
     }
 
-    let config = read_config(&config_lock);
-    let bot_token_preview = if config.telegram_bot_token.is_empty() {
-        "none".to_string()
-    } else {
-        config
-            .telegram_bot_token
-            .chars()
-            .take(10)
-            .collect::<String>()
-    };
+    let level = params.level.as_deref().and_then(AuditLevel::from_str);
+    if params.level.is_some() && level.is_none() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "level must be info|warn|error" })),
+        )
+            .into_response();
+    }
+    let limit = params.limit.unwrap_or(100).clamp(1, 1000);
+    let offset = params.offset.unwrap_or(0);
 
-    let mut raw_logs = vec![
-        format!(
-            "[INFO] [{}] Daemon serving on port {}",
-            now_secs(),
-            config.listen_port
-        ),
-        format!(
-            "[INFO] [{}] SQLite WAL database open at {}",
-            now_secs(),
-            config.db_path
-        ),
-        format!(
-            "[INFO] [{}] Spool filesystem directory verified at {}",
-            now_secs(),
-            config.spool_dir
-        ),
-        format!(
-            "[INFO] [{}] Telegram transport active with token prefix: {}...",
-            now_secs(),
-            bot_token_preview
-        ),
-        format!(
-            "[INFO] [{}] Session authenticated for Web Dashboard admin.",
-            now_secs()
-        ),
-    ];
-
-    raw_logs.extend(store.get_logs());
-
-    let redacted_logs: Vec<String> = raw_logs.into_iter().map(|l| redact_secrets(&l)).collect();
-    Json(redacted_logs).into_response()
+    let (entries, total) = store.query_logs(level, params.q.as_deref(), limit, offset);
+    let entries: Vec<serde_json::Value> = entries
+        .into_iter()
+        .map(|e| {
+            json!({
+                "ts": e.ts,
+                "level": e.level,
+                "actor": e.actor,
+                "action": e.action,
+                "detail": redact_secrets(&e.detail),
+            })
+        })
+        .collect();
+    Json(json!({ "entries": entries, "total": total })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1000,16 +1118,19 @@ pub async fn api_update_config(
             .into_response();
     }
 
-    store.add_log(format!(
-        "[WARN] [{}] Dynamic config key '{}' updated to '{}'",
-        now_secs(),
-        key,
-        if key.contains("secret") || key.contains("password") || key.contains("token") {
-            "[REDACTED]"
-        } else {
-            val
-        }
-    ));
+    store.audit(
+        AuditLevel::Warn,
+        "admin",
+        "config.update",
+        format!(
+            "key='{key}' value='{}'",
+            if key.contains("secret") || key.contains("password") || key.contains("token") {
+                "[REDACTED]"
+            } else {
+                val
+            }
+        ),
+    );
 
     Json(json!({
         "ok": true,
@@ -1045,5 +1166,57 @@ mod tests {
         let redacted = redact_secrets(input);
         assert!(!redacted.contains("ABCdefGHIjklMNOpqrsTUVwxyz"));
         assert!(redacted.contains("[REDACTED_BOT_TOKEN]"));
+    }
+
+    #[test]
+    fn test_audit_ring_filter_paginate() {
+        let store = SessionStore::new();
+        store.audit(
+            AuditLevel::Info,
+            "admin",
+            "bucket.create",
+            "name='a'".to_string(),
+        );
+        store.audit(
+            AuditLevel::Warn,
+            "admin",
+            "key.revoke",
+            "id='K'".to_string(),
+        );
+        store.audit(
+            AuditLevel::Error,
+            "system",
+            "worker.fail",
+            "timeout".to_string(),
+        );
+
+        // Mới nhất trước.
+        let (all, total) = store.query_logs(None, None, 100, 0);
+        assert_eq!(total, 3);
+        assert_eq!(all[0].action, "worker.fail");
+
+        // Lọc level.
+        let (warns, total) = store.query_logs(Some(AuditLevel::Warn), None, 100, 0);
+        assert_eq!(total, 1);
+        assert_eq!(warns[0].action, "key.revoke");
+
+        // Tìm từ khóa (case-insensitive, cả actor).
+        let (_, total) = store.query_logs(None, Some("SYSTEM"), 100, 0);
+        assert_eq!(total, 1);
+
+        // Phân trang.
+        let (page, total) = store.query_logs(None, None, 2, 1);
+        assert_eq!(total, 3);
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].action, "key.revoke");
+    }
+
+    #[test]
+    fn test_login_rate_limit() {
+        let store = SessionStore::new();
+        for _ in 0..LOGIN_FAIL_LIMIT {
+            assert!(!store.note_login_failure());
+        }
+        assert!(store.note_login_failure());
     }
 }

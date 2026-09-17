@@ -33,3 +33,9 @@ worker_concurrency = 2
 [[access_keys]]
 access_key_id = "AKIAEXAMPLE12345"
 secret_key = "secret1234567890secret1234567890"
+
+# Logging: muc log trace|debug|info|warn|error; file daily-rotation (gi stdout cho journald)
+log_level = "info"
+log_to_file = false
+log_dir = "/var/lib/telecrate/logs"
+log_retention_days = 14

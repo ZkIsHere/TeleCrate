@@ -34,6 +34,10 @@ async fn spawn_test_app() -> (String, Config, tempfile::TempDir) {
         content_keys: Vec::new(),
         content_key_id: String::new(),
         admin_password: Some("test-admin-secret".to_string()),
+        log_level: "info".to_string(),
+        log_to_file: false,
+        log_dir: "/tmp/telecrate-test-logs".to_string(),
+        log_retention_days: 7,
     };
 
     let keys = KeyStore::load(&[]).unwrap();
@@ -259,7 +263,7 @@ async fn test_admin_auth_session_and_csrf_flow() {
         .unwrap();
     assert_eq!(res_backup.status(), 200);
 
-    // 16. Audit logs -> 200
+    // 16. Audit logs -> 200, shape {entries, total}, có bản ghi từ các bước trên
     let res_logs = client
         .get(format!("{}/admin/api/audit-logs", url))
         .header("cookie", &session_cookie)
@@ -267,6 +271,37 @@ async fn test_admin_auth_session_and_csrf_flow() {
         .await
         .unwrap();
     assert_eq!(res_logs.status(), 200);
+    let logs_json: serde_json::Value = res_logs.json().await.unwrap();
+    let entries = logs_json["entries"].as_array().unwrap();
+    assert!(logs_json["total"].as_u64().unwrap() >= entries.len() as u64);
+    assert!(entries.iter().any(|e| e["action"] == "bucket.create"));
+    assert!(entries.iter().all(|e| e.get("ts").is_some()
+        && e.get("level").is_some()
+        && e.get("actor").is_some()
+        && e.get("action").is_some()
+        && e.get("detail").is_some()));
+
+    // 16b. Lọc level=warn + phân trang limit=1.
+    let res_warn = client
+        .get(format!("{}/admin/api/audit-logs?level=warn&limit=1", url))
+        .header("cookie", &session_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_warn.status(), 200);
+    let warn_json: serde_json::Value = res_warn.json().await.unwrap();
+    for e in warn_json["entries"].as_array().unwrap() {
+        assert_eq!(e["level"], "warn");
+    }
+
+    // 16c. level sai -> 400.
+    let res_bad = client
+        .get(format!("{}/admin/api/audit-logs?level=nope", url))
+        .header("cookie", &session_cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_bad.status(), 400);
 
     // 17. Logout -> 200
     let res_logout = client
@@ -287,4 +322,19 @@ async fn test_admin_auth_session_and_csrf_flow() {
         .unwrap();
     let json_end: serde_json::Value = res_sess_end.json().await.unwrap();
     assert_eq!(json_end["authenticated"], false);
+
+    // 19. Rate-limit login: đã có 1 lần sai ở bước 3 → 9 lần nữa 401, rồi 429.
+    for i in 0..11 {
+        let r = client
+            .post(format!("{}/admin/api/login", url))
+            .json(&serde_json::json!({ "password": "wrong" }))
+            .send()
+            .await
+            .unwrap();
+        if i < 9 {
+            assert_eq!(r.status(), 401, "lần {i}");
+        } else {
+            assert_eq!(r.status(), 429, "lần {i} phải bị rate-limit");
+        }
+    }
 }

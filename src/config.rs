@@ -60,6 +60,18 @@ pub struct Config {
     /// Mật khẩu đăng nhập Web Dashboard & Admin API (tùy chọn).
     #[serde(default)]
     pub admin_password: Option<String>,
+    /// Mức log daemon: trace|debug|info|warn|error (áp dụng cả stdout và file).
+    #[serde(default = "default_log_level")]
+    pub log_level: String,
+    /// Ghi log ra file daily-rotation (giữ stdout cho journald trong mọi trường hợp).
+    #[serde(default)]
+    pub log_to_file: bool,
+    /// Thư mục log file. Thay đổi cần restart.
+    #[serde(default = "default_log_dir")]
+    pub log_dir: String,
+    /// Giữ file log N ngày gần nhất, xóa file cũ hơn ở startup.
+    #[serde(default = "default_log_retention")]
+    pub log_retention_days: u64,
 }
 
 /// Một khóa mã hóa: chỉ id + đường dẫn file (không bao giờ chứa key material).
@@ -85,6 +97,18 @@ fn default_region() -> String {
     "*".to_string()
 }
 
+fn default_log_level() -> String {
+    "info".to_string()
+}
+
+fn default_log_dir() -> String {
+    "/var/lib/telecrate/logs".to_string()
+}
+
+fn default_log_retention() -> u64 {
+    14
+}
+
 impl fmt::Debug for Config {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Config")
@@ -102,6 +126,10 @@ impl fmt::Debug for Config {
             // content_keys chỉ chứa id + đường dẫn file (không có key material).
             .field("content_keys", &self.content_keys)
             .field("content_key_id", &self.content_key_id)
+            .field("log_level", &self.log_level)
+            .field("log_to_file", &self.log_to_file)
+            .field("log_dir", &self.log_dir)
+            .field("log_retention_days", &self.log_retention_days)
             .finish()
     }
 }
@@ -123,6 +151,10 @@ impl Default for Config {
             content_keys: Vec::new(),
             content_key_id: String::new(),
             admin_password: None,
+            log_level: default_log_level(),
+            log_to_file: false,
+            log_dir: default_log_dir(),
+            log_retention_days: default_log_retention(),
         }
     }
 }
@@ -285,6 +317,13 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
             return Err(format!("duplicate access_key_id: {}", k.access_key_id));
         }
     }
+    match cfg.log_level.as_str() {
+        "trace" | "debug" | "info" | "warn" | "error" => {}
+        _ => return Err("log_level must be trace|debug|info|warn|error".to_string()),
+    }
+    if cfg.log_to_file && cfg.log_dir.is_empty() {
+        return Err("log_dir must not be empty when log_to_file is true".to_string());
+    }
     Ok(())
 }
 
@@ -360,6 +399,15 @@ mod tests {
         let cfg: Config = toml::from_str(&text).unwrap();
         validate(&cfg).unwrap();
         assert!(!cfg.region.is_empty());
+    }
+
+    #[test]
+    fn packaging_sample_config_parses() {
+        let text = std::fs::read_to_string("packaging/telecrate.sample.toml").unwrap();
+        let cfg: Config = toml::from_str(&text).unwrap();
+        validate(&cfg).unwrap();
+        assert_eq!(cfg.log_level, "info");
+        assert!(!cfg.log_to_file);
     }
 
     #[test]

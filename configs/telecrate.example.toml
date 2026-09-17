@@ -25,3 +25,9 @@ telegram_chat_id = 0
 # [[content_keys]]
 # id = "k1"
 # file = "/etc/telecrate/content-k1.key"
+
+# Logging: muc log trace|debug|info|warn|error; file daily-rotation (gi stdout cho journald)
+# log_level = "info"
+# log_to_file = false
+# log_dir = "/var/lib/telecrate/logs"
+# log_retention_days = 14

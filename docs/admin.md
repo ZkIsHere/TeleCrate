@@ -6,14 +6,27 @@
 
 ## 1. Web Dashboard Quản trị Tích hợp
 
-TeleCrate tích hợp sẵn Web Dashboard giao diện hiện đại ngay bên trong daemon single-binary.
+TeleCrate tích hợp sẵn Web Dashboard ngay bên trong daemon single-binary (không cần build riêng,
+chạy offline hoàn toàn — không font/CDN ngoài).
 
-### Các tính năng chính trên Web Dashboard:
-1. **Tổng quan (Overview)**: Theo dõi Uptime, dung lượng ổ đĩa spool local, dung lượng DB SQLite, tiến độ worker upload Telegram, tổng số Buckets, Objects và Chunks.
-2. **Quản lý Buckets**: Tạo bucket mới, kiểm tra cấu hình Region & Versioning, xóa bucket rỗng.
-3. **Quản lý Access Keys**: Khởi tạo Access Key S3 mới (Secret Key hiển thị duy nhất 1 lần khi tạo), thu hồi Access Key cũ.
-4. **Bảo trì & GC (Maintenance)**: Thực thi thủ công Physical Garbage Collection (GC), Integrity Doctor scan, và sao lưu SQLite Online Backup.
-5. **Audit Logs Viewer**: Xem nhật ký hoạt động hệ thống với cơ chế che giấu tự động (Secret Redaction) các Bot Token, S3 Secret Keys và Signatures.
+Giao diện vận hành tiết chế: font hệ thống, sáng/tối, bảng mật độ hợp lý, mọi màn hình có trạng thái
+đang nạp/trống/lỗi/mất kết nối. Các tab: Tổng quan (số liệu thật từ daemon), Buckets (+xem objects),
+Access keys (secret chỉ hiện đúng 1 lần lúc tạo, không render ra bảng), Cấu hình (validate trước apply,
+đánh dấu trường cần restart), Bảo trì (GC/Doctor/Backup), Nhật ký (lọc mức + tìm kiếm + phân trang + xuất JSON).
+
+### Logging daemon
+
+- `log_level`: trace|debug|info|warn|error (mặc định `info`), áp dụng cả stdout (journald) và file.
+- `log_to_file = true` + `log_dir` (mặc định `/var/lib/telecrate/logs`): file `telecrate.log.YYYY-MM-DD`
+  rotation theo ngày; startup tự xóa file quá `log_retention_days` (mặc định 14).
+- Không ghi secret/token/key material ra log (quy tắc AGENTS.md §4).
+
+### Audit log
+
+- Ring-buffer in-memory 5000 bản ghi có cấu trúc `{ts, level, actor, action, detail}` (mới nhất trước).
+- API `GET /admin/api/audit-logs?level=&q=&limit=&offset=` trả `{entries, total}`; detail đã redact ở server.
+- Ghi nhận: tạo/xóa bucket, tạo/thu hồi key, GC, doctor, backup, đổi config (giá trị secret → `[REDACTED]`),
+  login thành công/thất bại, logout. Login sai quá 10 lần/phút → 429.
 
 ---
 
