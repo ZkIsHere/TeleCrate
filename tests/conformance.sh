@@ -78,9 +78,9 @@ curl -fsSL "$url" -o /tmp/tc_presigned.txt
 cmp /tmp/tc_small.txt /tmp/tc_presigned.txt
 echo "[aws] presigned download OK"
 
-# 6. Head/metadata qua API (etag/md5 single-part).
+# 6. Head/metadata qua API (27 = len('hello-telecrate-conformance')).
 aws s3api head-object --bucket tc-conf-main --key small.txt \
-  --endpoint-url "${ENDPOINT}" --query 'ContentLength' --output text | grep -q "28"
+  --endpoint-url "${ENDPOINT}" --query 'ContentLength' --output text | grep -q "27"
 echo "[aws] head-object OK"
 
 echo "== S3 conformance PASS (aws) =="
