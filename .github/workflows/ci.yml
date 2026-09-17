@@ -64,8 +64,19 @@ jobs:
       - name: cài AWS CLI nếu thiếu
         run: |
           if ! command -v aws >/dev/null 2>&1; then
-            (pip3 install --user awscli || sudo apt-get install -y awscli) 2>&1 | tail -2
+            if command -v apt-get >/dev/null 2>&1; then
+              apt-get update && apt-get install -y awscli
+            elif command -v pip3 >/dev/null 2>&1; then
+              pip3 install --user awscli
+            else
+              cd /tmp
+              curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+              (command -v unzip >/dev/null || (command -v apt-get >/dev/null && apt-get install -y unzip))
+              unzip -q -o awscliv2.zip
+              ./aws/install
+            fi
           fi
+          export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
           command -v aws && aws --version
       - name: dựng daemon tạm + chạy conformance
         run: |
