@@ -107,4 +107,8 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME:-v0.2.0}"
           echo "Uploading release assets for tag $TAG..."
-          gh release upload "$TAG" dist/* --clobber || gh release create "$TAG" dist/* --title "TeleCrate $TAG" --notes "Automated CD Build for TeleCrate $TAG"
+          if [ -f "RELEASE_NOTES.md" ]; then
+            gh release create "$TAG" dist/* --title "TeleCrate $TAG" --notes-file RELEASE_NOTES.md || (gh release upload "$TAG" dist/* --clobber && gh release edit "$TAG" --notes-file RELEASE_NOTES.md)
+          else
+            gh release upload "$TAG" dist/* --clobber || gh release create "$TAG" dist/* --title "TeleCrate $TAG" --notes "Automated CD Build for TeleCrate $TAG"
+          fi
