@@ -39,5 +39,16 @@ quick-xml = { version = "0.37", features = ["serialize"] }
 chacha20poly1305 = "0.10"
 getrandom = "0.2"
 tempfile = "3"
+# TLS native (HTTPS serve + self-signed gen + parse): thuần Rust, không OpenSSL hệ thống.
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+# CryptoProvider cho rustls: cả axum-server và reqwest đều dùng bản no-provider,
+# nên daemon phải install_default(ring) ở startup (tránh panic khi handshake).
+rustls = { version = "0.23", features = ["ring"] }
+# rcgen backend ring (chỉ cần cc như rusqlite bundled; tránh aws-lc-sys đòi cmake trên runner).
+rcgen = { version = "0.13", default-features = false, features = ["pem", "ring", "x509-parser"] }
+x509-parser = "0.16"
+# DAL hợp nhất SQLite + Postgres: viết query `?` + bind một lần, sqlx tự
+# rebind `$N` cho Postgres. Không dùng sqlx macros (cần DATABASE_URL lúc compile).
+sqlx = { version = "0.8", default-features = false, features = ["sqlite", "postgres", "runtime-tokio-rustls"] }
 
 [dev-dependencies]

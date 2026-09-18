@@ -63,13 +63,7 @@ fn base_config(dir: &tempfile::TempDir) -> Config {
 /// Dựng server từ config đầy đủ (init DB nếu chưa có). Trả base URL.
 fn spawn_with(cfg: Config) -> String {
     std::fs::create_dir_all(&cfg.spool_dir).unwrap();
-    let mut conn = telecrate::db::open(&cfg.db_path).unwrap();
-    if telecrate::db::schema_version(&conn).unwrap() == 0 {
-        telecrate::db::apply_all_migrations(&mut conn).unwrap();
-    }
-    drop(conn);
     let keys = cfg.load_keystore().unwrap_or_default();
-    let app = telecrate::app::router(cfg, None, keys);
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -77,6 +71,11 @@ fn spawn_with(cfg: Config) -> String {
             .build()
             .unwrap();
         rt.block_on(async move {
+            let db = telecrate::db::Db::open_sqlite(&cfg.db_path).await.unwrap();
+            if telecrate::db::schema_version(&db).await.unwrap() == 0 {
+                telecrate::db::apply_all_migrations(&db).await.unwrap();
+            }
+            let app = telecrate::app::router(cfg, db, None, keys);
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             tx.send(l.local_addr().unwrap().port()).unwrap();
             axum::serve(l, app).await.unwrap();
@@ -163,11 +162,19 @@ fn mkbucket(client: &reqwest::blocking::Client, base: &str) {
 
 /// Đọc spool path của version đầu tiên của key (truy DB trực tiếp trong test).
 fn spool_of(db_path: &str, bucket: &str, key: &str) -> String {
-    let conn = telecrate::db::open(db_path).unwrap();
-    let v = telecrate::db::latest_version(&conn, bucket, key)
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let conn = rt
+        .block_on(telecrate::db::Db::open_sqlite(db_path))
+        .unwrap();
+    let v = rt
+        .block_on(telecrate::db::latest_version(&conn, bucket, key))
         .unwrap()
         .unwrap();
-    telecrate::db::chunks_of(&conn, &v.version_id).unwrap()[0]
+    rt.block_on(telecrate::db::chunks_of(&conn, &v.version_id))
+        .unwrap()[0]
         .spool_path
         .clone()
         .unwrap()
@@ -261,11 +268,20 @@ fn rotation_new_writes_use_new_key_old_still_readable() {
     let r = req(&client, "GET", &base2, "/enc/b.bin", b"", &[]);
     assert_eq!(r.body, b"era-two");
     // b.bin dùng k2.
-    let conn = telecrate::db::open(&db_path).unwrap();
-    let v = telecrate::db::latest_version(&conn, "enc", "b.bin")
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let conn = rt
+        .block_on(telecrate::db::Db::open_sqlite(&db_path))
+        .unwrap();
+    let v = rt
+        .block_on(telecrate::db::latest_version(&conn, "enc", "b.bin"))
         .unwrap()
         .unwrap();
-    let chunks = telecrate::db::chunks_of(&conn, &v.version_id).unwrap();
+    let chunks = rt
+        .block_on(telecrate::db::chunks_of(&conn, &v.version_id))
+        .unwrap();
     assert_eq!(chunks[0].key_ref.as_deref(), Some("k2"));
 }
 

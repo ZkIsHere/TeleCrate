@@ -17,14 +17,14 @@ async fn spawn_test_app() -> (String, Config, tempfile::TempDir) {
 
     std::fs::create_dir_all(&spool_dir).unwrap();
 
-    let mut conn = telecrate::db::open(&db_path).unwrap();
-    telecrate::db::apply_all_migrations(&mut conn).unwrap();
-
     let config = Config {
         db_path,
         spool_dir,
         db_backend: "sqlite".to_string(),
         database_url: None,
+        tls_enabled: false,
+        tls_cert_file: None,
+        tls_key_file: None,
         listen_port: 0,
         encryption: "off".to_string(),
         access_keys: Vec::new(),
@@ -41,8 +41,12 @@ async fn spawn_test_app() -> (String, Config, tempfile::TempDir) {
         log_retention_days: 7,
     };
 
+    let db = telecrate::db::Db::open_sqlite(&config.db_path)
+        .await
+        .unwrap();
+    telecrate::db::apply_all_migrations(&db).await.unwrap();
     let keys = KeyStore::load(&[]).unwrap();
-    let router = telecrate::app::router(config.clone(), None, keys);
+    let router = telecrate::app::router(config.clone(), db, None, keys);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -58,17 +62,22 @@ async fn spawn_test_app() -> (String, Config, tempfile::TempDir) {
 #[tokio::test]
 async fn test_s3_tool_conformance_lifecycle() {
     let (_url, cfg, _dir) = spawn_test_app().await;
-    let mut conn = telecrate::db::open(&cfg.db_path).unwrap();
+    let conn = telecrate::db::Db::open_sqlite(&cfg.db_path).await.unwrap();
 
     // 1. Create access key
     let access_key_id = "AKIAEXAMPLECONFORMANCE";
     let secret_key = "secretconformancekey1234567890secret";
     telecrate::db::create_access_key(&conn, access_key_id, secret_key, Some("conformance-test"))
+        .await
         .unwrap();
 
     // 2. Perform Bucket Creation (CreateBucket)
-    telecrate::db::create_bucket(&conn, "conformance-bucket", "us-east-1").unwrap();
-    assert!(telecrate::db::head_bucket(&conn, "conformance-bucket").unwrap());
+    telecrate::db::create_bucket(&conn, "conformance-bucket", "us-east-1")
+        .await
+        .unwrap();
+    assert!(telecrate::db::head_bucket(&conn, "conformance-bucket")
+        .await
+        .unwrap());
 
     // 3. PutObject single-part
     let key = "folder/subfolder/file.txt";
@@ -76,7 +85,7 @@ async fn test_s3_tool_conformance_lifecycle() {
     let etag = format!("\"{:x}\"", md5::compute(body));
 
     telecrate::db::put_object(
-        &mut conn,
+        &conn,
         "conformance-bucket",
         key,
         "v-conf-1",
@@ -96,15 +105,22 @@ async fn test_s3_tool_conformance_lifecycle() {
         }],
         "job-conf-1",
     )
+    .await
     .unwrap();
 
     // 4. ListObjectsV2 via DB / HTTP List simulation
-    let keys = telecrate::db::list_keys(&conn, "conformance-bucket", "folder/", "", 100).unwrap();
+    let keys = telecrate::db::list_keys(&conn, "conformance-bucket", "folder/", "", 100)
+        .await
+        .unwrap();
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0].0, "folder/subfolder/file.txt");
 
     // 5. DeleteObject
-    telecrate::db::delete_object(&mut conn, "conformance-bucket", key).unwrap();
-    let head_res = telecrate::db::latest_version(&conn, "conformance-bucket", key).unwrap();
+    telecrate::db::delete_object(&conn, "conformance-bucket", key)
+        .await
+        .unwrap();
+    let head_res = telecrate::db::latest_version(&conn, "conformance-bucket", key)
+        .await
+        .unwrap();
     assert!(head_res.is_none() || head_res.unwrap().is_delete_marker);
 }

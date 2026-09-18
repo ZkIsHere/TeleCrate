@@ -34,12 +34,11 @@ GET/HEAD/LIST sau ghi thành công phải thấy ngay version vừa ghi, kể c�
   không mock S3 200.
 - **CLI vs daemon**: mục tiêu CLI gọi admin API khi daemon chạy. HIỆN TẠI `init/doctor/migrations`
   mở DB trực tiếp và chưa có pid lock — `partial`, khóa single-daemon + pid lock làm ở M2 cùng worker.
-- **SQLite (WAL)**: index bucket/object/version/chunk/jobs/multipart/policies/retention/migrations/checkpoints. Xem `data-model.md`.
-  Backend runnable duy nhất (`db_backend="sqlite"`). Postgres ở `partial` (chọn backend + schema DDL
-  `migrations/postgres/0001_0004_schema.sql` xong, query DAL `blocked` — xem ADR 0005 và
-  compatibility matrix); daemon từ chối khởi động khi `db_backend='postgres'` thay vì fallback lén.
-  Migration `0001_init` đã có (M0); các bảng còn lại thêm dần theo milestone. Backup nhất quán
-  (`VACUUM INTO` / copy sau checkpoint) là `planned` (M5) — hiện `migrations apply` chỉ copy file DB làm backup.
+- **Database DAL (SQLite WAL & PostgreSQL)**: index bucket/object/version/chunk/jobs/multipart/policies/retention/migrations/checkpoints. Xem `data-model.md`.
+  Dual-backend async qua `telecrate::db::Db` (`sqlx`). Hỗ trợ chọn `db_backend = "sqlite"` (mặc định)
+  hoặc `db_backend = "postgres"` với `database_url`. Cả 2 backend chạy chung logic DAL, transaction `Tx`,
+  schema parity 15 bảng (migrations SQLite 0001→0004 và Postgres DDL). Daemon và worker hoàn toàn async,
+  không block thread pool. Backup/restore và disaster recovery hỗ trợ mã hóa AEAD.
 - **spool filesystem**: thư mục data riêng, file chunk đặt tên theo content-hash/job-id, KHÔNG dùng object key trực tiếp làm path (chặn path traversal). Quota + high/low watermark + reserved free space. Không LRU cho pending data.
 - **read cache (OPTIONAL, mặc định tắt/quota 0)**: chỉ chứa bản tái tải được, eviction riêng, không chiếm quota spool.
 - **Telegram transport trait** (`src/telegram.rs`, `implemented-and-tested` M1): `BotApiHttpTransport`
@@ -49,6 +48,12 @@ GET/HEAD/LIST sau ghi thành công phải thấy ngay version vừa ghi, kể c�
   `file_id`. URL/file_reference coi là ephemeral, refresh khi cần. Lỗi phân loại Transient/Permanent
   cho scheduler; token luôn redact trong error/Debug (có test). Chi tiết: `telegram-capability.md`.
 - **Scheduler** (`planned`, M2): global/per-bot/per-chat bounded concurrency, backoff + jitter, tôn trọng Retry-After/FLOOD_WAIT, circuit breaker, phân biệt lỗi tạm thời vs vĩnh viễn (token sai, mất quyền, channel xóa).
+- **TLS native** (`implemented-and-tested`): serve HTTPS mặc định (rustls/ring,
+  thuần Rust) trên cùng `listen_port`; chưa cấu hình cert/key thì tự sinh self-signed
+  lúc khởi động. Bắt buộc cho client S3 chỉ nói HTTPS (vd PBS).
+  Self-signed sinh từ dashboard/CLI (`POST /admin/api/tls/generate`, key 0600),
+  fingerprint SHA-256 hiển thị để khai báo phía client. Tab dashboard **Kết nối**
+  hướng dẫn nối PBS/AWS CLI/rclone (endpoint, keys, fingerprint, lệnh mẫu).
 - **Frontend tĩnh**: build một lần (Vite), daemon serve, không cần Node.js runtime khi vận hành.
 
 ## 3. Durability & crash recovery

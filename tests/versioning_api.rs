@@ -56,9 +56,6 @@ fn spawn_server() -> (tempfile::TempDir, String) {
         ..Default::default()
     };
     std::fs::create_dir_all(&cfg.spool_dir).unwrap();
-    let mut conn = telecrate::db::open(&cfg.db_path).unwrap();
-    telecrate::db::apply_all_migrations(&mut conn).unwrap();
-    drop(conn);
 
     let (tx, rx) = mpsc::channel();
     let cfg_thread = cfg.clone();
@@ -68,11 +65,15 @@ fn spawn_server() -> (tempfile::TempDir, String) {
             .build()
             .unwrap();
         rt.block_on(async {
+            let db = telecrate::db::Db::open_sqlite(&cfg_thread.db_path)
+                .await
+                .unwrap();
+            telecrate::db::apply_all_migrations(&db).await.unwrap();
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             tx.send(format!("http://{addr}")).unwrap();
             let keys = cfg_thread.load_keystore().unwrap();
-            axum::serve(listener, telecrate::app::router(cfg_thread, None, keys))
+            axum::serve(listener, telecrate::app::router(cfg_thread, db, None, keys))
                 .await
                 .unwrap();
         });

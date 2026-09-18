@@ -54,19 +54,17 @@ fn spawn_server() -> (tempfile::TempDir, String) {
         ..Default::default()
     };
     std::fs::create_dir_all(&cfg.spool_dir).unwrap();
-    let mut conn = telecrate::db::open(&cfg.db_path).unwrap();
-    telecrate::db::apply_all_migrations(&mut conn).unwrap();
-    drop(conn);
 
     let (tx, rx) = mpsc::channel();
-    // Router dựng ngoài async context; test này không cấu hình telegram → transport None.
-    let app = telecrate::app::router(cfg, None, telecrate::crypto::KeyStore::default());
     thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
             .unwrap();
         rt.block_on(async move {
+            let db = telecrate::db::Db::open_sqlite(&cfg.db_path).await.unwrap();
+            telecrate::db::apply_all_migrations(&db).await.unwrap();
+            let app = telecrate::app::router(cfg, db, None, telecrate::crypto::KeyStore::default());
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let port = l.local_addr().unwrap().port();
             tx.send(port).unwrap();

@@ -1,7 +1,7 @@
 //! Module Garbage Collection (GC Engine) — dọn dẹp spool local và message Telegram.
 
+use crate::db::{Db, Val};
 use crate::telegram::{RemoteLocator, Transport};
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
@@ -15,15 +15,15 @@ pub struct GcStats {
 }
 
 /// Thực thi Garbage Collection cho spool local và remote Telegram.
-pub fn run_gc(
-    conn: &Connection,
+pub async fn run_gc(
+    db: &Db,
     spool_dir: &Path,
     transport: Option<&dyn Transport>,
 ) -> Result<GcStats, String> {
     let mut stats = GcStats::default();
 
     // 1. Spool GC: Dọn dẹp spool file của các chunk đã telegram-committed
-    if let Ok(spool_rows) = get_committed_spool_chunks(conn) {
+    if let Ok(spool_rows) = get_committed_spool_chunks(db).await {
         for (chunk_version_id, idx, spool_path) in spool_rows {
             let path = Path::new(&spool_path);
             if path.exists() {
@@ -32,22 +32,26 @@ pub fn run_gc(
                 }
                 if std::fs::remove_file(path).is_ok() {
                     stats.spool_files_deleted += 1;
-                    let _ = conn.execute(
+                    let _ = crate::db::exec(
+                        db,
                         "UPDATE chunks SET spool_path = NULL WHERE version_id = ? AND idx = ?",
-                        rusqlite::params![chunk_version_id, idx],
-                    );
+                        &[Val::text(&chunk_version_id), Val::int(idx)],
+                    )
+                    .await;
                 }
             } else {
-                let _ = conn.execute(
+                let _ = crate::db::exec(
+                    db,
                     "UPDATE chunks SET spool_path = NULL WHERE version_id = ? AND idx = ?",
-                    rusqlite::params![chunk_version_id, idx],
-                );
+                    &[Val::text(&chunk_version_id), Val::int(idx)],
+                )
+                .await;
             }
         }
     }
 
     // Dọn dẹp spool files mồ côi không nằm trong bất kỳ active_spool nào của DB
-    if let Ok(active_set) = crate::db::active_spool_paths(conn) {
+    if let Ok(active_set) = crate::db::active_spool_paths(db).await {
         if let Ok(entries) = std::fs::read_dir(spool_dir) {
             for entry in entries.flatten() {
                 let p = entry.path();
@@ -68,20 +72,20 @@ pub fn run_gc(
     // 2. Telegram Remote GC: Xóa remote Telegram blob của các object version đã bị xóa/tombstoned
     // Ràng buộc: KHÔNG xóa nếu version đang được bảo vệ bởi Object Lock Retention hoặc Legal Hold!
     if let Some(tr) = transport {
-        let now_iso: String = conn
-            .query_row("SELECT datetime('now')", [], |r| r.get(0))
-            .unwrap_or_default();
+        let now_iso = crate::db::now_str();
 
-        if let Ok(locators) = get_deletable_telegram_locators(conn, &now_iso) {
+        if let Ok(locators) = get_deletable_telegram_locators(db, &now_iso).await {
             for (version_id, idx, locator_json) in locators {
                 if let Ok(locator) = serde_json::from_str::<RemoteLocator>(&locator_json) {
                     match tr.delete(&locator) {
                         Ok(_) => {
                             stats.telegram_messages_deleted += 1;
-                            let _ = conn.execute(
+                            let _ = crate::db::exec(
+                                db,
                                 "UPDATE chunks SET remote_locator_json = NULL WHERE version_id = ? AND idx = ?",
-                                rusqlite::params![version_id, idx],
-                            );
+                                &[Val::text(&version_id), Val::int(idx)],
+                            )
+                            .await;
                         }
                         Err(e) => {
                             stats.errors.push(format!(
@@ -95,7 +99,7 @@ pub fn run_gc(
     }
 
     // 3. Multipart GC: Dọn dẹp parts của multipart upload bị abort hoặc expired
-    if let Ok(cleaned) = clean_expired_or_aborted_multipart_parts(conn) {
+    if let Ok(cleaned) = clean_expired_or_aborted_multipart_parts(db).await {
         stats.orphaned_parts_cleaned += cleaned;
     }
 
@@ -103,39 +107,35 @@ pub fn run_gc(
 }
 
 /// Lấy danh sách (version_id, idx, spool_path) của các chunk đã `telegram-committed` nhưng vẫn còn `spool_path`.
-fn get_committed_spool_chunks(conn: &Connection) -> Result<Vec<(String, i32, String)>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT version_id, idx, spool_path FROM chunks WHERE state = 'telegram-committed' AND spool_path IS NOT NULL",
-        )
-        .map_err(|e| format!("prepare stmt: {e}"))?;
-
-    let rows = stmt
-        .query_map([], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i32>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })
-        .map_err(|e| format!("query map: {e}"))?;
+async fn get_committed_spool_chunks(db: &Db) -> Result<Vec<(String, i64, String)>, String> {
+    let rows = crate::db::fetch_all(
+        db,
+        "SELECT version_id, idx, spool_path FROM chunks WHERE state = 'telegram-committed' AND spool_path IS NOT NULL",
+        &[],
+    )
+    .await
+    .map_err(|e| format!("query map: {e}"))?;
 
     let mut res = Vec::new();
-    for item in rows.flatten() {
-        res.push(item);
+    for r in rows {
+        res.push((
+            r.get_string(0).map_err(|e| format!("row: {e}"))?,
+            r.get_i64(1).map_err(|e| format!("row: {e}"))?,
+            r.get_string(2).map_err(|e| format!("row: {e}"))?,
+        ));
     }
     Ok(res)
 }
 
 /// Lấy danh sách các Telegram remote locator của các chunk thuộc version đã bị xóa/không còn reference
 /// và KHÔNG bị Object Lock retention/legal hold bảo vệ.
-fn get_deletable_telegram_locators(
-    conn: &Connection,
+async fn get_deletable_telegram_locators(
+    db: &Db,
     now_iso: &str,
-) -> Result<Vec<(String, i32, String)>, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT c.version_id, c.idx, c.remote_locator_json 
+) -> Result<Vec<(String, i64, String)>, String> {
+    let rows = crate::db::fetch_all(
+        db,
+        "SELECT c.version_id, c.idx, c.remote_locator_json 
              FROM chunks c
              JOIN objects o ON c.version_id = o.version_id
              LEFT JOIN object_locks ol ON o.bucket = ol.bucket AND o.key = ol.key AND o.version_id = ol.version_id
@@ -143,55 +143,52 @@ fn get_deletable_telegram_locators(
                AND (o.is_delete_marker = 1)
                AND (ol.legal_hold IS NULL OR ol.legal_hold = 0)
                AND (ol.retain_until_date IS NULL OR ol.retain_until_date <= ?)",
-        )
-        .map_err(|e| format!("prepare deletable locators: {e}"))?;
-
-    let rows = stmt
-        .query_map([now_iso], |r| {
-            Ok((
-                r.get::<_, String>(0)?,
-                r.get::<_, i32>(1)?,
-                r.get::<_, String>(2)?,
-            ))
-        })
-        .map_err(|e| format!("query map locators: {e}"))?;
+        &[Val::text(now_iso)],
+    )
+    .await
+    .map_err(|e| format!("query map locators: {e}"))?;
 
     let mut res = Vec::new();
-    for item in rows.flatten() {
-        res.push(item);
+    for r in rows {
+        res.push((
+            r.get_string(0).map_err(|e| format!("row: {e}"))?,
+            r.get_i64(1).map_err(|e| format!("row: {e}"))?,
+            r.get_string(2).map_err(|e| format!("row: {e}"))?,
+        ));
     }
     Ok(res)
 }
 
 /// Dọn dẹp các part mồ côi của multipart upload bị abort hoặc đã hủy.
-fn clean_expired_or_aborted_multipart_parts(conn: &Connection) -> Result<usize, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT p.spool_path FROM multipart_parts p 
+async fn clean_expired_or_aborted_multipart_parts(db: &Db) -> Result<usize, String> {
+    let rows = crate::db::fetch_all(
+        db,
+        "SELECT p.spool_path FROM multipart_parts p 
              LEFT JOIN multipart_uploads u ON p.upload_id = u.upload_id 
              WHERE u.upload_id IS NULL AND p.spool_path IS NOT NULL",
-        )
-        .map_err(|e| format!("prepare multipart clean: {e}"))?;
+        &[],
+    )
+    .await
+    .map_err(|e| format!("query map multipart clean: {e}"))?;
 
-    let rows = stmt
-        .query_map([], |r| r.get::<_, String>(0))
-        .map_err(|e| format!("query map multipart clean: {e}"))?;
-
-    for row in rows.flatten() {
-        let p = Path::new(&row);
-        if p.exists() {
-            let _ = std::fs::remove_file(p);
+    for r in &rows {
+        if let Ok(p) = r.get_string(0) {
+            let p = Path::new(&p);
+            if p.exists() {
+                let _ = std::fs::remove_file(p);
+            }
         }
     }
 
-    let deleted_rows = conn
-        .execute(
-            "DELETE FROM multipart_parts WHERE upload_id NOT IN (SELECT upload_id FROM multipart_uploads)",
-            [],
-        )
-        .unwrap_or(0);
+    let deleted_rows = crate::db::exec(
+        db,
+        "DELETE FROM multipart_parts WHERE upload_id NOT IN (SELECT upload_id FROM multipart_uploads)",
+        &[],
+    )
+    .await
+    .unwrap_or(0);
 
-    Ok(deleted_rows)
+    Ok(deleted_rows as usize)
 }
 
 #[cfg(test)]
@@ -200,23 +197,23 @@ mod tests {
     use crate::db::*;
     use crate::telegram::MockTransport;
 
-    #[test]
-    fn test_spool_gc_and_orphan_cleanup() {
+    #[tokio::test]
+    async fn test_spool_gc_and_orphan_cleanup() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("gc.db");
         let spool_dir = temp_dir.path().join("spool");
         std::fs::create_dir_all(&spool_dir).unwrap();
 
-        let mut conn = open(db_path.to_str().unwrap()).unwrap();
-        apply_all_migrations(&mut conn).unwrap();
+        let conn = Db::open_sqlite(db_path.to_str().unwrap()).await.unwrap();
+        apply_all_migrations(&conn).await.unwrap();
 
         // Create a dummy spool file for a committed chunk
         let dummy_chunk_path = spool_dir.join("c1.chunk");
         std::fs::write(&dummy_chunk_path, b"hello chunk data").unwrap();
 
-        create_bucket(&conn, "bkt", "r").unwrap();
+        create_bucket(&conn, "bkt", "r").await.unwrap();
         put_object(
-            &mut conn,
+            &conn,
             "bkt",
             "k1",
             "v1",
@@ -236,44 +233,47 @@ mod tests {
             }],
             "job1",
         )
+        .await
         .unwrap();
 
         // Mark chunk state as telegram-committed
-        conn.execute(
+        crate::db::exec(
+            &conn,
             "UPDATE chunks SET state = 'telegram-committed' WHERE version_id = 'v1'",
-            [],
+            &[],
         )
+        .await
         .unwrap();
 
         // Create an orphan chunk file on disk
         let orphan_path = spool_dir.join("orphan.chunk");
         std::fs::write(&orphan_path, b"orphan data").unwrap();
 
-        let stats = run_gc(&conn, &spool_dir, None).unwrap();
+        let stats = run_gc(&conn, &spool_dir, None).await.unwrap();
         assert_eq!(stats.spool_files_deleted, 2);
         assert!(!dummy_chunk_path.exists());
         assert!(!orphan_path.exists());
     }
 
-    #[test]
-    fn test_remote_telegram_gc_respects_object_lock() {
+    #[tokio::test]
+    async fn test_remote_telegram_gc_respects_object_lock() {
         let temp_dir = tempfile::tempdir().unwrap();
         let db_path = temp_dir.path().join("gc_lock.db");
         let spool_dir = temp_dir.path().join("spool");
         std::fs::create_dir_all(&spool_dir).unwrap();
 
-        let mut conn = open(db_path.to_str().unwrap()).unwrap();
-        apply_all_migrations(&mut conn).unwrap();
+        let conn = Db::open_sqlite(db_path.to_str().unwrap()).await.unwrap();
+        apply_all_migrations(&conn).await.unwrap();
 
         let mock = MockTransport::default();
         let loc = mock.upload(100, b"data").unwrap();
         let loc_json = serde_json::to_string(&loc).unwrap();
 
-        create_bucket(&conn, "bkt-lock", "r").unwrap();
+        create_bucket(&conn, "bkt-lock", "r").await.unwrap();
 
         // 1. Version v-deleted with legal hold -> NOT deleted by GC
         put_object(
-            &mut conn,
+            &conn,
             "bkt-lock",
             "k-locked",
             "v-locked",
@@ -293,16 +293,21 @@ mod tests {
             }],
             "j1",
         )
+        .await
         .unwrap();
-        conn.execute(
+        crate::db::exec(
+            &conn,
             "UPDATE chunks SET remote_locator_json = ? WHERE version_id = 'v-locked'",
-            [loc_json.clone()],
+            &[Val::text(&loc_json)],
         )
+        .await
         .unwrap();
-        conn.execute(
+        crate::db::exec(
+            &conn,
             "UPDATE objects SET is_delete_marker = 1 WHERE version_id = 'v-locked'",
-            [],
+            &[],
         )
+        .await
         .unwrap();
         set_bucket_object_lock_config(
             &conn,
@@ -313,15 +318,20 @@ mod tests {
                 default_retention_days: None,
             },
         )
+        .await
         .unwrap();
-        set_object_legal_hold(&conn, "bkt-lock", "k-locked", "v-locked", true).unwrap();
+        set_object_legal_hold(&conn, "bkt-lock", "k-locked", "v-locked", true)
+            .await
+            .unwrap();
 
-        let stats = run_gc(&conn, &spool_dir, Some(&mock)).unwrap();
+        let stats = run_gc(&conn, &spool_dir, Some(&mock)).await.unwrap();
         assert_eq!(stats.telegram_messages_deleted, 0);
 
         // Turn off legal hold -> GC deletes remote message
-        set_object_legal_hold(&conn, "bkt-lock", "k-locked", "v-locked", false).unwrap();
-        let stats = run_gc(&conn, &spool_dir, Some(&mock)).unwrap();
+        set_object_legal_hold(&conn, "bkt-lock", "k-locked", "v-locked", false)
+            .await
+            .unwrap();
+        let stats = run_gc(&conn, &spool_dir, Some(&mock)).await.unwrap();
         assert_eq!(stats.telegram_messages_deleted, 1);
     }
 }

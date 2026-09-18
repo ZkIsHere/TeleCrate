@@ -34,6 +34,18 @@ pub struct Config {
     /// Chứa password — redact mọi nơi như bot token. None = không dùng.
     #[serde(default)]
     pub database_url: Option<String>,
+    /// HTTPS native: true = serve TLS trên listen_port (thay vì HTTP thuần).
+    /// PBS S3 bắt buộc HTTPS nên BẬT MẶC ĐỊNH; tắt cần restart.
+    /// Bật mà chưa cấu hình cert/key → daemon tự sinh self-signed lúc khởi động.
+    #[serde(default = "default_tls_enabled")]
+    pub tls_enabled: bool,
+    /// PEM cert chain cho TLS. Bắt buộc khi tls_enabled. Có thể tự sinh
+    /// self-signed qua dashboard (`POST /admin/api/tls/generate`).
+    #[serde(default)]
+    pub tls_cert_file: Option<String>,
+    /// PEM private key cho TLS (file 0600). Bắt buộc khi tls_enabled.
+    #[serde(default)]
+    pub tls_key_file: Option<String>,
     /// Port HTTP S3 + admin + dashboard. Thay đổi cần restart.
     pub listen_port: u16,
     /// Mã hóa nội dung: "off" | "on". Chỉ áp dụng ghi mới; dữ liệu cũ giữ chế độ cũ.
@@ -91,6 +103,10 @@ fn default_db_backend() -> String {
     "sqlite".to_string()
 }
 
+fn default_tls_enabled() -> bool {
+    true
+}
+
 fn default_worker_concurrency() -> usize {
     2
 }
@@ -121,6 +137,9 @@ impl fmt::Debug for Config {
             .field("spool_dir", &self.spool_dir)
             .field("db_backend", &self.db_backend)
             .field("database_url", &self.database_url.as_ref().map(|_| "***"))
+            .field("tls_enabled", &self.tls_enabled)
+            .field("tls_cert_file", &self.tls_cert_file)
+            .field("tls_key_file", &self.tls_key_file)
             .field("listen_port", &self.listen_port)
             .field("encryption", &self.encryption)
             .field("access_keys", &self.access_keys)
@@ -146,6 +165,9 @@ impl Default for Config {
             spool_dir: "/var/lib/telecrate/spool".to_string(),
             db_backend: default_db_backend(),
             database_url: None,
+            tls_enabled: default_tls_enabled(),
+            tls_cert_file: None,
+            tls_key_file: None,
             listen_port: 7070,
             encryption: "off".to_string(),
             access_keys: Vec::new(),
@@ -227,6 +249,27 @@ impl Config {
             }
             "database_url" => {
                 self.database_url = if val.is_empty() {
+                    None
+                } else {
+                    Some(val.to_string())
+                };
+            }
+            "tls_enabled" => {
+                self.tls_enabled = match val.to_ascii_lowercase().as_str() {
+                    "true" | "1" | "on" => true,
+                    "false" | "0" | "off" => false,
+                    _ => return Err("tls_enabled must be 'true' or 'false'".to_string()),
+                };
+            }
+            "tls_cert_file" => {
+                self.tls_cert_file = if val.is_empty() {
+                    None
+                } else {
+                    Some(val.to_string())
+                };
+            }
+            "tls_key_file" => {
+                self.tls_key_file = if val.is_empty() {
                     None
                 } else {
                     Some(val.to_string())
@@ -328,6 +371,41 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
             }
         },
         _ => return Err("db_backend must be 'sqlite' or 'postgres'".to_string()),
+    }
+    // TLS native (mặc định BẬT): chưa cấu hình cert/key (cùng None) → daemon tự sinh
+    // self-signed lúc khởi động (tls::ensure_auto_tls). Cấu hình tay thì cả hai
+    // phải cùng có, absolute, không `..`, file tồn tại (fail-closed ở load/update).
+    if cfg.tls_enabled {
+        match (&cfg.tls_cert_file, &cfg.tls_key_file) {
+            (None, None) => {}
+            (Some(c), Some(k)) if !c.is_empty() && !k.is_empty() => {}
+            _ => {
+                return Err(
+                    "tls cert/key phải cùng có hoặc cùng để trống (trống = tự sinh)".to_string(),
+                );
+            }
+        }
+        for (name, p) in [
+            ("tls_cert_file", cfg.tls_cert_file.as_deref().unwrap_or("")),
+            ("tls_key_file", cfg.tls_key_file.as_deref().unwrap_or("")),
+        ] {
+            if p.is_empty() {
+                continue; // Cặp None/None = chế độ tự sinh, bỏ qua kiểm tra path.
+            }
+            let path = std::path::Path::new(p);
+            if !(path.is_absolute() || p.starts_with('/')) {
+                return Err(format!("{name} must be an absolute path"));
+            }
+            if path
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return Err(format!("{name} must not contain '..'"));
+            }
+            if !path.is_file() {
+                return Err(format!("{name} does not exist: {p}"));
+            }
+        }
     }
     if cfg.encryption != "off" && cfg.encryption != "on" {
         return Err("encryption must be 'off' or 'on'".to_string());
@@ -514,6 +592,48 @@ mod tests {
             .unwrap();
         let dbg = format!("{c:?}");
         assert!(!dbg.contains("s3cret"), "url leaked: {dbg}");
+    }
+
+    #[test]
+    fn tls_requires_existing_cert_and_key() {
+        // Mặc định BẬT, chưa cấu hình paths (None/None) → qua (daemon tự sinh).
+        assert!(validate(&Config::default()).is_ok());
+        // Tắt hẳn vẫn qua.
+        let c = Config {
+            tls_enabled: false,
+            ..Config::default()
+        };
+        assert!(validate(&c).is_ok());
+        // Một có một không → lỗi.
+        let c = Config {
+            tls_cert_file: Some("/x/tls.crt".to_string()),
+            ..Config::default()
+        };
+        assert!(validate(&c).is_err());
+        assert!(Config::default()
+            .update_key("tls_enabled", "maybe")
+            .is_err());
+        // Bật + file thật → qua.
+        let dir = tempfile::tempdir().unwrap();
+        let cert = dir.path().join("tls.crt");
+        let key = dir.path().join("tls.key");
+        std::fs::write(&cert, "x").unwrap();
+        std::fs::write(&key, "y").unwrap();
+        let c = Config {
+            tls_enabled: true,
+            tls_cert_file: Some(cert.to_str().unwrap().to_string()),
+            tls_key_file: Some(key.to_str().unwrap().to_string()),
+            ..Config::default()
+        };
+        assert!(validate(&c).is_ok());
+        // Đường dẫn tương đối / .. → lỗi.
+        let c = Config {
+            tls_enabled: true,
+            tls_cert_file: Some("tls/tls.crt".to_string()),
+            tls_key_file: Some("/etc/telecrate/../x.key".to_string()),
+            ..Config::default()
+        };
+        assert!(validate(&c).is_err());
     }
 
     #[test]

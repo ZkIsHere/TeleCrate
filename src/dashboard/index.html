@@ -56,8 +56,12 @@
           <span class="nav-badge" id="nav-badge-keys"></span>
         </button>
         <button class="nav-item" data-tab="config">
-          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a1.5 1.5 0 0 0-1.5 1.5c0 .18.03.35.09.51A6 6 0 0 0 4.1 3.1l-.01-.01a1.5 1.5 0 1 0-1 1l.01.01a6 6 0 0 0-1.09 2.49c-.16-.06-.33-.09-.51-.09a1.5 1.5 0 1 0 0 3c.18 0 .35-.03.51-.09a6 6 0 0 0 1.09 2.49l-.01.01a1.5 1.5 0 1 0 1 1l.01-.01a6 6 0 0 0 2.49 1.09c-.06.16-.09.33-.09.51a1.5 1.5 0 1 0 3 0c0-.18-.03-.35-.09-.51a6 6 0 0 0 2.49-1.09l.01.01a1.5 1.5 0 1 0 1-1l-.01-.01a6 6 0 0 0 1.09-2.49c.16.06.33.09.51.09a1.5 1.5 0 1 0 0-3c-.18 0-.35.03-.51.09a6 6 0 0 0-1.09-2.49l.01-.01a1.5 1.5 0 1 0-1-1l-.01.01A6 6 0 0 0 9.41 2.01c.06-.16.09-.33.09-.51A1.5 1.5 0 0 0 8 0zM8 11a3 3 0 1 1 0-6 3 3 0 0 1 0 6z"/></svg>
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M8 0a1.5 1.5 0 0 0-1.5 1.5c0 .18.03.35.09.51A6 6 0 0 0 4.1 3.1l-.01-.01a1.5 1.5 0 1 0-1 1l.01.01a6 6 0 0 0-1.09 2.49c-.16-.06-.33-.09-.51-.09a1.5 1.5 0 1 0 0 3c.18 0 .35-.03.51-.09a6 6 0 0 0 1.09 2.49l-.01.01a1.5 1.5 0 1 0 1 1l.01-.01a6 6 0 0 0 2.49 1.09c-.06.16-.09.33-.09.51a1.5 1.5 0 1 0 3 0c0-.18-.03-.35-.09-.51a6 6 0 0 0 2.49-1.09l.01.01a1.5 1.5 0 1 0 1-1l-.01-.01a6 6 0 0 0 1.09-2.49c.16.06.33.09.51.09a1.5 1.5 0 1 0 0-3c-.18 0-.35-.03-.51-.09a6 6 0 0 0-1.09-2.49l.01-.01a1.5 1.5 0 1 0-1-1l-.01.01A6 6 0 0 0 9.41 2.01c.06-.16.09-.33.09-.51A1.5 1.5 0 0 0 8 0zM8 11a3 3 0 1 1 0-6 3 3 0 0 1 0 6z"/></svg>
           <span>Cấu hình</span>
+        </button>
+        <button class="nav-item" data-tab="connect">
+          <svg width="16" height="16" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="8" cy="8" r="6.2"/><path d="M1.8 8h12.4M8 1.8c-3.8 3.8-3.8 8.6 0 12.4 3.8-3.8 3.8-8.6 0-12.4z"/></svg>
+          <span>Kết nối</span>
         </button>
         <button class="nav-item" data-tab="jobs">
           <svg width="16" height="16" viewBox="0 0 16 16" fill="currentColor"><path d="M2 1a1 1 0 0 0-1 1v1a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V2a1 1 0 0 0-1-1zm0 5a1 1 0 0 0-1 1v1a1 1 0 0 0 1 1h8a1 1 0 0 0 1-1V7a1 1 0 0 0-1-1zm0 5a1 1 0 0 0-1 1v1a1 1 0 0 0 1 1h5a1 1 0 0 0 1-1v-1a1 1 0 0 0-1-1z"/></svg>
@@ -236,6 +240,20 @@
             <label class="field"><span>Postgres URL <em>(để trống = giữ nguyên/xóa khi về sqlite)</em></span><input id="cfg-dburl" type="password" autocomplete="new-password" placeholder="postgresql://user:pass@host:5432/telecrate"></label>
           </fieldset>
           <fieldset>
+            <legend>TLS / HTTPS <span id="tls-badge" class="muted small"></span></legend>
+            <div id="tls-status" class="muted small">Đang nạp trạng thái TLS…</div>
+            <label class="field check"><input type="checkbox" id="cfg-tls-enabled"><span>Bật HTTPS native <em class="tag-restart">⟳ restart</em> <em>(PBS S3 bắt buộc HTTPS)</em></span></label>
+            <label class="field"><span>Cert chain (PEM) <em class="tag-restart">⟳ restart</em></span><input id="cfg-tlscert" placeholder="/var/lib/telecrate/tls.crt"></label>
+            <label class="field"><span>Private key (PEM) <em class="tag-restart">⟳ restart</em></span><input id="cfg-tlskey" placeholder="/var/lib/telecrate/tls.key"></label>
+            <div class="field-row">
+              <input id="tls-cn" placeholder="CN, vd telecrate.local" aria-label="Common Name">
+              <input id="tls-sans" placeholder="SANs, vd telecrate.local,192.168.1.10" aria-label="Subject Alt Names">
+              <input id="tls-days" inputmode="numeric" placeholder="825" aria-label="Số ngày hiệu lực" style="max-width:90px">
+              <button type="button" class="btn sm" id="btn-tls-gen">Tự sinh self-signed</button>
+            </div>
+            <div id="tls-fp" class="muted small" style="margin-top:6px"></div>
+          </fieldset>
+          <fieldset>
             <legend>Logging</legend>
             <label class="field"><span>Mức log</span>
               <select id="cfg-loglevel"><option value="error">error</option><option value="warn">warn</option><option value="info">info</option><option value="debug">debug</option><option value="trace">trace</option></select>
@@ -247,6 +265,50 @@
           <div class="form-actions"><button type="submit" class="btn primary">Lưu cấu hình</button></div>
         </form>
         <p class="muted small">Validate trước khi apply. Trường cần restart được đánh dấu ⟳.</p>
+      </section>
+
+      <!-- CONNECT -->
+      <section id="tab-connect" class="tab" aria-label="Kết nối">
+        <div id="connect-error" class="alert-error hidden"></div>
+        <fieldset>
+          <legend>Máy chủ TeleCrate</legend>
+          <div class="field-row">
+            <label class="field"><span>Host / IP client nhìn thấy</span><input id="conn-host" placeholder="vd 192.168.1.10"></label>
+            <label class="field"><span>Port</span><input id="conn-port" inputmode="numeric" placeholder="7070"></label>
+          </div>
+          <div class="field-row">
+            <label class="field"><span>S3 endpoint URL</span><input id="conn-url" readonly></label>
+            <button type="button" class="btn sm" id="btn-conn-copy-url">Chép URL</button>
+          </div>
+          <div id="conn-tls-note" class="muted small"></div>
+        </fieldset>
+        <fieldset>
+          <legend>Xác thực S3</legend>
+          <div class="field-row">
+            <label class="field"><span>Access Key ID</span><select id="conn-key"></select></label>
+            <label class="field"><span>Region</span><input id="conn-region" value="us-east-1"></label>
+            <button type="button" class="btn sm" id="btn-conn-newkey">Tạo key mới</button>
+          </div>
+          <div id="conn-new-secret" class="alert-warn hidden" role="alert"></div>
+        </fieldset>
+        <fieldset>
+          <legend>Proxmox Backup Server</legend>
+          <div class="field-row">
+            <label class="field"><span>Bucket (tạo trước trong TeleCrate)</span><input id="conn-bucket" placeholder="pbs"></label>
+          </div>
+          <div id="conn-pbs-steps" class="muted small"></div>
+          <div class="field-row">
+            <button type="button" class="btn sm" id="btn-conn-copy-fp">Chép fingerprint</button>
+            <button type="button" class="btn sm" id="btn-conn-copy-pbs">Chép lệnh tạo datastore</button>
+          </div>
+        </fieldset>
+        <fieldset>
+          <legend>AWS CLI / rclone</legend>
+          <div id="conn-cli-snippet" style="font-family:var(--mono);background:var(--bg);padding:8px;border-radius:4px;border:1px solid var(--border);white-space:pre-wrap"></div>
+          <div class="field-row">
+            <button type="button" class="btn sm" id="btn-conn-copy-cli">Chép lệnh AWS CLI</button>
+          </div>
+        </fieldset>
       </section>
 
       <!-- JOBS -->

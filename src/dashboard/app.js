@@ -34,6 +34,7 @@ const TITLES = {
   storage: 'Buckets',
   keys: 'Access keys',
   config: 'Cấu hình',
+  connect: 'Kết nối',
   jobs: 'Jobs',
   maintenance: 'Bảo trì',
   logs: 'Nhật ký',
@@ -243,6 +244,7 @@ function loadTab() {
   else if (state.tab === 'storage') loadBuckets();
   else if (state.tab === 'keys') loadKeys();
   else if (state.tab === 'config') loadConfig();
+  else if (state.tab === 'connect') loadConnect();
   else if (state.tab === 'jobs') loadJobs();
   else if (state.tab === 'maintenance') loadMaintenance();
   else if (state.tab === 'logs') loadLogs();
@@ -959,6 +961,9 @@ async function loadConfig() {
     $('cfg-spool').value = c.spool_dir || '/var/lib/telecrate/spool';
     $('cfg-dbbackend').value = c.db_backend || 'sqlite';
     $('cfg-dburl').value = '';
+    $('cfg-tls-enabled').checked = !!c.tls_enabled;
+    $('cfg-tlscert').value = c.tls_cert_file || '';
+    $('cfg-tlskey').value = c.tls_key_file || '';
     $('cfg-loglevel').value = c.log_level || 'info';
     $('cfg-logfile').checked = !!c.log_to_file;
     $('cfg-logdir').value = c.log_dir || '/var/lib/telecrate/logs';
@@ -966,6 +971,7 @@ async function loadConfig() {
     $('cfg-chat').value = c.telegram_chat_id ?? '';
     $('cfg-token').value = '';
     $('cfg-adminpwd').value = '';
+    loadTlsStatus();
   } catch (e) {
     if (err) {
       err.textContent = 'Lỗi nạp cấu hình: ' + e.message;
@@ -993,6 +999,73 @@ $('btn-tg-test')?.addEventListener('click', async () => {
   }
 });
 
+/* ==========================================================================
+   TLS / HTTPS Tab (trạng thái xem bất cứ lúc nào + tự sinh self-signed)
+   ========================================================================== */
+async function loadTlsStatus() {
+  const box = $('tls-status');
+  const badge = $('tls-badge');
+  const fp = $('tls-fp');
+  try {
+    const r = await api('/admin/api/tls/status');
+    const d = await r.json();
+    if (!(r.ok && d.ok && d.tls)) throw new Error((d && d.error) || 'HTTP ' + r.status);
+    const t = d.tls;
+    if (badge) badge.textContent = t.enabled ? (t.cert_present && t.key_present ? '● HTTPS bật' : '● bật nhưng thiếu cert/key') : '○ HTTP thuần';
+    if (!box) return;
+    if (!t.cert_present) {
+      box.textContent = t.enabled
+        ? 'TLS đang BẬT nhưng chưa có cert — daemon sẽ từ chối khởi động. Hãy tự sinh hoặc nhập đường dẫn cert/key rồi Lưu.'
+        : 'TLS đang TẮT (HTTP thuần). PBS S3 bắt buộc HTTPS — hãy tự sinh self-signed, Lưu cấu hình rồi restart daemon.';
+      if (fp) fp.textContent = '';
+      return;
+    }
+    const lines = [
+      `Subject: ${t.subject || '-'}`,
+      `SANs: ${(t.sans || []).join(', ') || '-'}`,
+      `Hiệu lực: ${t.not_before || '?'} → ${t.not_after || '?'} (còn ~${t.days_left ?? '?'} ngày)${t.expired ? ' — ĐÃ HẾT HẠN' : ''}`,
+      `Cert: ${t.cert_file || ''}${t.key_present ? '' : ' (THIẾU KEY!)'}`,
+    ];
+    box.textContent = lines.join(' · ');
+    if (fp) fp.textContent = t.fingerprint ? `SHA-256 fingerprint (dán vào endpoint PBS): ${t.fingerprint}` : '';
+  } catch (e) {
+    if (box) box.textContent = 'Lỗi nạp trạng thái TLS: ' + e.message;
+  }
+}
+
+$('btn-tls-gen')?.addEventListener('click', async () => {
+  const fp = $('tls-fp');
+  const cn = $('tls-cn').value.trim();
+  if (!cn) {
+    toast('Nhập CN trước khi sinh cert (vd telecrate.local)', 'err');
+    return;
+  }
+  if (fp) fp.textContent = 'Đang sinh cert…';
+  try {
+    const body = { cn, sans: $('tls-sans').value.trim(), days: Number($('tls-days').value) || 825 };
+    if ($('cfg-tlscert').value.trim()) body.cert_path = $('cfg-tlscert').value.trim();
+    if ($('cfg-tlskey').value.trim()) body.key_path = $('cfg-tlskey').value.trim();
+    const r = await api('/admin/api/tls/generate', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const d = await r.json();
+    if (r.ok && d.ok) {
+      $('cfg-tlscert').value = d.cert_path || '';
+      $('cfg-tlskey').value = d.key_path || '';
+      if (fp) fp.textContent = `Đã sinh cert. SHA-256 fingerprint (dán vào endpoint PBS): ${d.fingerprint}`;
+      toast('Đã sinh cert self-signed — tick Bật HTTPS rồi Lưu + restart daemon', 'ok');
+      loadTlsStatus();
+    } else {
+      if (fp) fp.textContent = '';
+      toast('Sinh cert thất bại' + (d.error ? ' — lỗi: ' + d.error : ''), 'err');
+    }
+  } catch (e) {
+    toast('Sinh cert thất bại — lỗi: ' + e.message, 'err');
+  }
+});
+
 $('config-form')?.addEventListener('submit', async (e) => {
   e.preventDefault();
   // Batch nguyên tử 1 request: đổi db_backend cần backend+URL cùng lúc
@@ -1003,6 +1076,9 @@ $('config-form')?.addEventListener('submit', async (e) => {
     worker_concurrency: $('cfg-workers').value,
     spool_dir: $('cfg-spool').value.trim(),
     db_backend: $('cfg-dbbackend').value,
+    tls_enabled: $('cfg-tls-enabled').checked ? 'true' : 'false',
+    tls_cert_file: $('cfg-tlscert').value.trim(),
+    tls_key_file: $('cfg-tlskey').value.trim(),
     log_level: $('cfg-loglevel').value,
     log_to_file: $('cfg-logfile').checked ? 'true' : 'false',
     log_dir: $('cfg-logdir').value,
@@ -1034,6 +1110,149 @@ $('config-form')?.addEventListener('submit', async (e) => {
     toast('Lưu thất bại — lỗi: ' + ex.message, 'err');
   }
   loadConfig();
+});
+
+/* ==========================================================================
+   Connect Helper — hướng dẫn nối client (PBS / AWS CLI / rclone)
+   ========================================================================== */
+function connState() {
+  const host = $('conn-host').value.trim() || window.location.hostname || 'localhost';
+  const port = $('conn-port').value.trim() || '7070';
+  const tls = $('conn-url').dataset.scheme !== 'http';
+  return { host, port, tls };
+}
+
+function copyText(text, okMsg) {
+  const done = () => toast(okMsg || 'Đã chép', 'ok');
+  if (navigator.clipboard?.writeText) {
+    navigator.clipboard.writeText(text).then(done, () => toast('Chép thất bại', 'err'));
+  } else {
+    const ta = document.createElement('textarea');
+    ta.value = text;
+    document.body.appendChild(ta);
+    ta.select();
+    try { document.execCommand('copy'); done(); } catch { toast('Chép thất bại', 'err'); }
+    ta.remove();
+  }
+}
+
+async function loadConnect() {
+  const err = $('connect-error');
+  err?.classList.add('hidden');
+  try {
+    const [rc, rt, rk] = await Promise.all([
+      api('/admin/api/config').then((r) => r.json()),
+      api('/admin/api/tls/status').then((r) => r.json()),
+      api('/admin/api/access-keys').then((r) => r.json()),
+    ]);
+    if (!(rc.ok && rc.config)) throw new Error((rc && rc.error) || 'không nạp được config');
+    const c = rc.config;
+    const scheme = c.tls_enabled ? 'https' : 'http';
+    if (!$('conn-host').value) $('conn-host').value = window.location.hostname || '';
+    if (!$('conn-port').value) $('conn-port').value = c.listen_port ?? 7070;
+    const host = $('conn-host').value.trim() || 'localhost';
+    const port = $('conn-port').value.trim() || '7070';
+    const url = `${scheme}://${host}:${port}`;
+    const urlBox = $('conn-url');
+    urlBox.value = url;
+    urlBox.dataset.scheme = scheme;
+    const tls = rt.ok && rt.tls ? rt.tls : null;
+    $('conn-tls-note').textContent = tls && tls.enabled
+      ? `HTTPS đang bật${tls.fingerprint ? ` · fingerprint: ${tls.fingerprint}` : ''}${tls.days_left != null ? ` · cert còn ~${tls.days_left} ngày` : ''}`
+      : 'HTTP thuần — client bắt HTTPS (vd PBS) sẽ từ chối. Bật TLS ở tab Cấu hình.';
+    // Keys vào select (giữ lựa chọn hiện tại nếu còn).
+    const sel = $('conn-key');
+    const prev = sel.value;
+    const keys = Array.isArray(rk) ? rk.filter((k) => (k.status || 'Active') === 'Active') : [];
+    sel.innerHTML = keys.length
+      ? keys.map((k) => `<option value="${esc(k.access_key_id)}">${esc(k.access_key_id)}</option>`).join('')
+      : '<option value="">(chưa có key — bấm Tạo key mới)</option>';
+    if (prev && keys.some((k) => k.access_key_id === prev)) sel.value = prev;
+    renderConnectSnippets();
+  } catch (e) {
+    if (err) {
+      err.textContent = 'Lỗi nạp thông tin kết nối: ' + e.message;
+      err.classList.remove('hidden');
+    }
+  }
+}
+
+function renderConnectSnippets() {
+  const { host, port, tls } = connState();
+  const scheme = tls ? 'https' : 'http';
+  const key = $('conn-key').value || 'AKIA...';
+  const region = $('conn-region').value.trim() || 'us-east-1';
+  const bucket = $('conn-bucket').value.trim() || '<bucket>';
+  const endpoint = `${scheme}://${host}:${port}`;
+  const noVerify = tls ? ' --no-verify-ssl' : '';
+  $('conn-pbs-steps').textContent =
+    `Trên PBS: Configuration > Remotes > S3 Endpoints > Add — Endpoint: ${host}, Port: ${port}, ` +
+    `Path Style: tick, Region: ${region}, Access/Secret Key như trên` +
+    `${tls ? ', Fingerprint: (nút Chép fingerprint)' : ' — LƯU Ý: PBS bắt HTTPS, hãy bật TLS trước'}; ` +
+    `rồi tạo datastore mới (cache trống) với bucket ${bucket}.`;
+  $('conn-cli-snippet').textContent =
+    `export AWS_ACCESS_KEY_ID="${key}"\n` +
+    `export AWS_SECRET_ACCESS_KEY="<secret>"\n` +
+    `export AWS_EC2_METADATA_DISABLED=true\n` +
+    `aws${noVerify} --endpoint-url ${endpoint} --region ${region} s3 ls\n` +
+    `aws${noVerify} --endpoint-url ${endpoint} --region ${region} s3 mb s3://${bucket === '<bucket>' ? 'test-bucket' : bucket}`;
+}
+
+['conn-host', 'conn-port', 'conn-region', 'conn-bucket'].forEach((id) => {
+  $(id)?.addEventListener('input', renderConnectSnippets);
+});
+$('conn-key')?.addEventListener('change', renderConnectSnippets);
+
+$('btn-conn-copy-url')?.addEventListener('click', () => copyText($('conn-url').value, 'Đã chép endpoint URL'));
+
+$('btn-conn-copy-fp')?.addEventListener('click', async () => {
+  try {
+    const r = await api('/admin/api/tls/status');
+    const d = await r.json();
+    if (r.ok && d.ok && d.tls?.fingerprint) copyText(d.tls.fingerprint, 'Đã chép fingerprint');
+    else toast('Chưa có fingerprint (TLS tắt hoặc chưa có cert)', 'err');
+  } catch (e) { toast(e.message, 'err'); }
+});
+
+$('btn-conn-copy-pbs')?.addEventListener('click', () => {
+  const bucket = $('conn-bucket').value.trim() || '<bucket>';
+  copyText(
+    `# endpoint <endpoint-id> đã lưu trong PBS (Configuration > Remotes > S3 Endpoints)\n` +
+    `proxmox-backup-manager s3 check <endpoint-id> ${bucket}\n` +
+    `# cache PHẢI là thư mục trống mới, không dùng datastore đang có:\n` +
+    `proxmox-backup-manager datastore create <store-moi> /mnt/datastore/<store-moi>-cache --backend type=s3,client=<endpoint-id>,bucket=${bucket}`,
+    'Đã chép lệnh',
+  );
+});
+
+$('btn-conn-copy-cli')?.addEventListener('click', () => copyText($('conn-cli-snippet').textContent, 'Đã chép lệnh AWS CLI'));
+
+$('btn-conn-newkey')?.addEventListener('click', async () => {
+  try {
+    const r = await api('/admin/api/access-keys', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_id: 'connect-helper' }),
+    });
+    const d = await r.json();
+    if (r.ok && d.ok && d.secret_key) {
+      const box = $('conn-new-secret');
+      if (box) {
+        box.innerHTML =
+          `<strong>Secret key chỉ hiển thị ĐÚNG 1 LẦN — chép ngay vào client:</strong><br>` +
+          `<div style="margin-top:6px;font-family:var(--mono);background:var(--bg);padding:8px;border-radius:4px;border:1px solid var(--border)">` +
+          `Access Key ID: <strong>${esc(d.access_key_id)}</strong><br>` +
+          `Secret Key: <strong>${esc(d.secret_key)}</strong></div>`;
+        box.classList.remove('hidden');
+      }
+      await loadConnect();
+      $('conn-key').value = d.access_key_id;
+      renderConnectSnippets();
+      toast('Đã tạo key mới', 'ok');
+    } else {
+      toast('Tạo key thất bại' + (d.error ? ' — ' + d.error : ''), 'err');
+    }
+  } catch (e) { toast(e.message, 'err'); }
 });
 
 /* ==========================================================================

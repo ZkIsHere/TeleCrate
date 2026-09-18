@@ -30,6 +30,25 @@ Access keys (secret chỉ hiện đúng 1 lần lúc tạo, không render ra b�
   đổi backend cần backend+URL cùng lúc. API đơn key (`{"key","value"}`) vẫn tương thích.
 - `database_url` redact ở GET config, audit log và CLI stdout như secret.
 
+### TLS / HTTPS native (cho PBS S3)
+
+- TeleCrate serve **HTTPS mặc định** trên cùng `listen_port` (PBS S3 bắt buộc HTTPS).
+  Chưa cấu hình cert/key → daemon **tự sinh self-signed** lúc khởi động
+  (`/var/lib/telecrate/tls.crt|tls.key`, key 0600) và in fingerprint ra log.
+  Muốn về HTTP thuần: `tls_enabled = false` + restart (không khuyến nghị).
+- Dashboard tab Cấu hình → fieldset **TLS / HTTPS** hiển thị trạng thái bất cứ lúc nào:
+  bật/tắt, đường dẫn cert/key, Subject, SANs, hạn dùng, số ngày còn lại và
+  **SHA-256 fingerprint** (`AA:BB:...`) để dán vào endpoint PBS (self-signed).
+- Nút **Tự sinh self-signed** (ECDSA P-256, `POST /admin/api/tls/generate`): nhập CN
+  (vd IP/hostname máy TeleCrate) + SANs cách nhau dấu phẩy + số ngày (1..825).
+  Key ghi quyền 600. Sinh xong tick **Bật HTTPS** → Lưu → restart daemon.
+- Tab **Kết nối**: helper nhập host/port, xem endpoint URL, chọn/tạo Access Key
+  (secret chỉ hiện 1 lần), preset PBS (endpoint/port/path-style/fingerprint/bucket),
+  snippet AWS CLI + nút chép, lệnh `s3 check`/`datastore create`.
+- Trạng thái chi tiết qua API: `GET /admin/api/tls/status` (cần login, không trả key material).
+- Dùng cert CA thật (Let's Encrypt) thì chép fullchain + key vào máy, nhập đường dẫn,
+  bật HTTPS — PBS không cần fingerprint nữa.
+
 ### Audit log
 
 - Ring-buffer in-memory 5000 bản ghi có cấu trúc `{ts, level, actor, action, detail}` (mới nhất trước).

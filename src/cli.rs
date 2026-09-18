@@ -59,7 +59,7 @@ pub async fn run_status_cli(config_path: &str) -> Result<(), String> {
     }
 
     // Fallback standalone health check
-    let h = telecrate::health_check(config_path);
+    let h = telecrate::health_check(config_path).await;
     println!(
         "[DAEMON STOPPED]\n{}",
         serde_json::to_string_pretty(&json!({
@@ -116,8 +116,17 @@ pub async fn run_gc_cli(config_path: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    println!("--> Daemon đã dừng: Thực thi GC trực tiếp trên SQLite index...");
-    let conn = telecrate::db::open(&cfg.db_path)?;
+    println!("--> Daemon đã dừng: Thực thi GC trực tiếp trên DB index...");
+    let db = match cfg.db_backend.as_str() {
+        "postgres" => {
+            let url = cfg
+                .database_url
+                .as_deref()
+                .ok_or_else(|| "missing database_url for postgres backend".to_string())?;
+            telecrate::db::Db::open_postgres(url).await?
+        }
+        _ => telecrate::db::Db::open_sqlite(&cfg.db_path).await?,
+    };
     let cfg_route = cfg.clone();
     let (transport, _) =
         tokio::task::spawn_blocking(move || (telecrate::app::build_transport(&cfg_route), ()))
@@ -125,12 +134,13 @@ pub async fn run_gc_cli(config_path: &str) -> Result<(), String> {
             .map_err(|e| format!("build transport: {e}"))?;
 
     let stats = telecrate::gc::run_gc(
-        &conn,
+        &db,
         std::path::Path::new(&cfg.spool_dir),
         transport
             .as_ref()
             .map(|t| t as &dyn telecrate::telegram::Transport),
-    )?;
+    )
+    .await?;
 
     println!("{}", serde_json::to_string_pretty(&stats).unwrap());
     Ok(())

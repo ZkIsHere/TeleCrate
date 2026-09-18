@@ -32,6 +32,12 @@ chunk_size_bytes = 8388608
 # Số lượng worker đồng thời tải dữ liệu lên Telegram nền (1..8)
 worker_concurrency = 2
 
+# HTTPS native (PBS S3 bắt buộc HTTPS): true cần cert+key tuyệt đối + restart daemon.
+# Tự sinh self-signed qua dashboard (tab Cấu hình → TLS / HTTPS) hoặc để trống dùng HTTP.
+tls_enabled = false
+# tls_cert_file = "/var/lib/telecrate/tls.crt"
+# tls_key_file = "/var/lib/telecrate/tls.key"
+
 # Access keys tĩnh mặc định khởi tạo
 [[access_keys]]
 access_key_id = "AKIAEXAMPLE12345"

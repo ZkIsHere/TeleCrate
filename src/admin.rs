@@ -25,7 +25,7 @@ pub const DASHBOARD_JS: &str = include_str!("dashboard/app.js");
 const SESSION_TTL_SECS: u64 = 86400;
 
 pub type AdminConfig = Arc<std::sync::RwLock<telecrate::config::Config>>;
-pub type AdminState = (AdminConfig, Arc<SessionStore>);
+pub type AdminState = (AdminConfig, Arc<SessionStore>, telecrate::db::Db);
 
 pub fn read_config(config_lock: &AdminConfig) -> telecrate::config::Config {
     config_lock
@@ -352,7 +352,7 @@ pub struct LoginPayload {
 
 /// `POST /admin/api/login`
 pub async fn api_login(
-    State((config_lock, store)): State<AdminState>,
+    State((config_lock, store, _)): State<AdminState>,
     Json(payload): Json<LoginPayload>,
 ) -> Response {
     let config = read_config(&config_lock);
@@ -416,7 +416,7 @@ pub async fn api_login(
 }
 
 /// `POST /admin/api/logout`
-pub async fn api_logout(State((_, store)): State<AdminState>, headers: HeaderMap) -> Response {
+pub async fn api_logout(State((_, store, _)): State<AdminState>, headers: HeaderMap) -> Response {
     if let Some(session_id) = extract_session_id(&headers) {
         store.remove_session(&session_id);
         store.audit(
@@ -441,7 +441,7 @@ pub async fn api_logout(State((_, store)): State<AdminState>, headers: HeaderMap
 
 /// `GET /admin/api/session`
 pub async fn api_session_status(
-    State((_, store)): State<AdminState>,
+    State((_, store, _)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Some(session_id) = extract_session_id(&headers) {
@@ -473,7 +473,7 @@ fn dir_size(path: &FilePath) -> u64 {
 
 /// `GET /admin/api/status`
 pub async fn api_get_status(
-    State((config_lock, store)): State<AdminState>,
+    State((config_lock, store, db)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
@@ -489,40 +489,34 @@ pub async fn api_get_status(
         .unwrap_or(0);
 
     let mut total_buckets = 0;
-    let mut total_objects = 0;
-    let mut total_chunks = 0;
     let mut total_access_keys = 0;
-    let mut pending_jobs = 0;
-    let mut uploading_jobs = 0;
 
-    if let Ok(conn) = telecrate::db::open(&config.db_path) {
-        if let Ok(bkts) = telecrate::db::list_buckets(&conn) {
-            total_buckets = bkts.len();
-        }
-        if let Ok(keys) = telecrate::db::list_access_keys(&conn) {
-            total_access_keys = keys.len();
-        }
-        if let Ok(n) = conn.query_row("SELECT COUNT(*) FROM objects", [], |r| r.get(0)) {
-            total_objects = n;
-        }
-        if let Ok(n) = conn.query_row("SELECT COUNT(*) FROM chunks", [], |r| r.get(0)) {
-            total_chunks = n;
-        }
-        if let Ok(n) = conn.query_row(
-            "SELECT COUNT(*) FROM upload_jobs WHERE state = 'pending'",
-            [],
-            |r| r.get(0),
-        ) {
-            pending_jobs = n;
-        }
-        if let Ok(n) = conn.query_row(
-            "SELECT COUNT(*) FROM upload_jobs WHERE state = 'uploading'",
-            [],
-            |r| r.get(0),
-        ) {
-            uploading_jobs = n;
-        }
+    if let Ok(bkts) = telecrate::db::list_buckets(&db).await {
+        total_buckets = bkts.len();
     }
+    if let Ok(keys) = telecrate::db::list_access_keys(&db).await {
+        total_access_keys = keys.len();
+    }
+    let total_objects = crate::db::count(&db, "SELECT COUNT(*) FROM objects", &[])
+        .await
+        .unwrap_or(0);
+    let total_chunks = crate::db::count(&db, "SELECT COUNT(*) FROM chunks", &[])
+        .await
+        .unwrap_or(0);
+    let pending_jobs = crate::db::count(
+        &db,
+        "SELECT COUNT(*) FROM upload_jobs WHERE state = 'pending'",
+        &[],
+    )
+    .await
+    .unwrap_or(0);
+    let uploading_jobs = crate::db::count(
+        &db,
+        "SELECT COUNT(*) FROM upload_jobs WHERE state = 'uploading'",
+        &[],
+    )
+    .await
+    .unwrap_or(0);
 
     Json(json!({
         "version": telecrate::VERSION,
@@ -551,26 +545,14 @@ pub async fn api_get_status(
 
 /// `GET /admin/api/buckets`
 pub async fn api_list_buckets(
-    State((config_lock, store)): State<AdminState>,
+    State((_config_lock, store, db)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
         return err_resp.into_response();
     }
 
-    let config = read_config(&config_lock);
-    let conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
-
-    let buckets = match telecrate::db::list_buckets(&conn) {
+    let buckets = match telecrate::db::list_buckets(&db).await {
         Ok(b) => b,
         Err(e) => {
             return (
@@ -583,7 +565,8 @@ pub async fn api_list_buckets(
 
     let mut list = Vec::new();
     for b in buckets {
-        let versioning = telecrate::db::get_bucket_versioning(&conn, &b.name)
+        let versioning = telecrate::db::get_bucket_versioning(&db, &b.name)
+            .await
             .unwrap_or_else(|_| "Disabled".to_string());
         list.push(json!({
             "name": b.name,
@@ -604,7 +587,7 @@ pub struct CreateBucketPayload {
 
 /// `POST /admin/api/buckets`
 pub async fn api_create_bucket(
-    State((config_lock, store)): State<AdminState>,
+    State((_config_lock, store, db)): State<AdminState>,
     headers: HeaderMap,
     Json(payload): Json<CreateBucketPayload>,
 ) -> Response {
@@ -612,22 +595,11 @@ pub async fn api_create_bucket(
         return err_resp.into_response();
     }
 
-    let config = read_config(&config_lock);
     let region = payload
         .region
         .unwrap_or_else(|| telecrate::config::DEFAULT_REGION.to_string());
-    let conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
 
-    match telecrate::db::create_bucket(&conn, &payload.name, &region) {
+    match telecrate::db::create_bucket(&db, &payload.name, &region).await {
         Ok(_) => {
             store.audit(
                 AuditLevel::Info,
@@ -647,7 +619,7 @@ pub async fn api_create_bucket(
 
 /// `DELETE /admin/api/buckets/:name`
 pub async fn api_delete_bucket(
-    State((config_lock, store)): State<AdminState>,
+    State((_config_lock, store, db)): State<AdminState>,
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -655,28 +627,26 @@ pub async fn api_delete_bucket(
         return err_resp.into_response();
     }
 
-    let config = read_config(&config_lock);
-    let conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
-
-    match telecrate::db::delete_bucket(&conn, &name) {
-        Ok(_) => {
+    match telecrate::db::delete_bucket(&db, &name).await {
+        Ok(telecrate::db::DeleteBucketOutcome::Deleted) => {
             store.audit(
                 AuditLevel::Warn,
                 "admin",
                 "bucket.delete",
                 format!("name='{name}'"),
             );
-            Json(json!({ "ok": true })).into_response()
+            Json(json!({ "ok": true, "name": name })).into_response()
         }
+        Ok(telecrate::db::DeleteBucketOutcome::NotEmpty) => (
+            StatusCode::CONFLICT,
+            Json(json!({ "error": "BucketNotEmpty: Bucket không rỗng, vui lòng xóa hết objects trước" })),
+        )
+            .into_response(),
+        Ok(telecrate::db::DeleteBucketOutcome::NoSuchBucket) => (
+            StatusCode::NOT_FOUND,
+            Json(json!({ "error": "NoSuchBucket: Bucket không tồn tại" })),
+        )
+            .into_response(),
         Err(e) => (
             StatusCode::BAD_REQUEST,
             Json(json!({ "error": format!("Delete failed: {e}") })),
@@ -687,7 +657,7 @@ pub async fn api_delete_bucket(
 
 /// `GET /admin/api/buckets/:name/objects`
 pub async fn api_list_bucket_objects(
-    State((config_lock, store)): State<AdminState>,
+    State((_config_lock, store, db)): State<AdminState>,
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -695,48 +665,54 @@ pub async fn api_list_bucket_objects(
         return err_resp.into_response();
     }
 
-    let config = read_config(&config_lock);
-    let conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
-
-    let mut stmt = match conn.prepare(
+    let rows = match telecrate::db::fetch_all(
+        &db,
         "SELECT key, version_id, is_delete_marker, storage_state, size, etag, content_type, created_at FROM objects WHERE bucket = ? ORDER BY key ASC, created_at DESC",
-    ) {
-        Ok(s) => s,
+        &[telecrate::db::Val::text(&name)],
+    )
+    .await
+    {
+        Ok(r) => r,
         Err(e) => {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(json!({ "error": format!("Query prepare error: {e}") })),
             )
-                .into_response()
+                .into_response();
         }
     };
 
-    let object_rows = stmt.query_map([&name], |r| {
-        Ok(json!({
-            "key": r.get::<_, String>(0)?,
-            "version_id": r.get::<_, String>(1)?,
-            "is_delete_marker": r.get::<_, i64>(2)? != 0,
-            "storage_state": r.get::<_, String>(3)?,
-            "size": r.get::<_, i64>(4)?,
-            "etag": r.get::<_, String>(5)?,
-            "content_type": r.get::<_, String>(6)?,
-            "created_at": r.get::<_, String>(7)?,
-        }))
-    });
-
     let mut list = Vec::new();
-    if let Ok(rows) = object_rows {
-        for obj in rows.flatten() {
-            list.push(obj);
+    for r in rows {
+        if let (
+            Ok(key),
+            Ok(version_id),
+            Ok(is_del),
+            Ok(storage_state),
+            Ok(size),
+            Ok(etag),
+            Ok(content_type),
+            Ok(created_at),
+        ) = (
+            r.get_string(0),
+            r.get_string(1),
+            r.get_i64(2),
+            r.get_string(3),
+            r.get_i64(4),
+            r.get_string(5),
+            r.get_string(6),
+            r.get_string(7),
+        ) {
+            list.push(json!({
+                "key": key,
+                "version_id": version_id,
+                "is_delete_marker": is_del != 0,
+                "storage_state": storage_state,
+                "size": size,
+                "etag": etag,
+                "content_type": content_type,
+                "created_at": created_at,
+            }));
         }
     }
 
@@ -745,26 +721,14 @@ pub async fn api_list_bucket_objects(
 
 /// `GET /admin/api/access-keys`
 pub async fn api_list_access_keys(
-    State((config_lock, store)): State<AdminState>,
+    State((_config_lock, store, db)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
         return err_resp.into_response();
     }
 
-    let config = read_config(&config_lock);
-    let conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
-
-    let keys = match telecrate::db::list_access_keys(&conn) {
+    let keys = match telecrate::db::list_access_keys(&db).await {
         Ok(k) => k,
         Err(e) => {
             return (
@@ -797,7 +761,7 @@ pub struct CreateKeyPayload {
 
 /// `POST /admin/api/access-keys`
 pub async fn api_create_access_key(
-    State((config_lock, store)): State<AdminState>,
+    State((_config_lock, store, db)): State<AdminState>,
     headers: HeaderMap,
     Json(payload): Json<CreateKeyPayload>,
 ) -> Response {
@@ -806,22 +770,10 @@ pub async fn api_create_access_key(
     }
 
     let user_id = payload.user_id.unwrap_or_else(|| "admin".to_string());
-    let config = read_config(&config_lock);
-    let conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
-
     let access_key_id = format!("AKIA{}", hex::encode(crypto_random_bytes(8)).to_uppercase());
     let secret_key = hex::encode(crypto_random_bytes(20));
 
-    match telecrate::db::create_access_key(&conn, &access_key_id, &secret_key, Some(&user_id)) {
+    match telecrate::db::create_access_key(&db, &access_key_id, &secret_key, Some(&user_id)).await {
         Ok(_) => {
             // Audit KHÔNG ghi secret_key — chỉ id + user (secret chỉ trả 1 lần trong response).
             store.audit(
@@ -848,7 +800,7 @@ pub async fn api_create_access_key(
 
 /// `DELETE /admin/api/access-keys/:id`
 pub async fn api_revoke_access_key(
-    State((config_lock, store)): State<AdminState>,
+    State((_config_lock, store, db)): State<AdminState>,
     Path(key_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
@@ -856,19 +808,7 @@ pub async fn api_revoke_access_key(
         return err_resp.into_response();
     }
 
-    let config = read_config(&config_lock);
-    let conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
-
-    match telecrate::db::delete_access_key(&conn, &key_id) {
+    match telecrate::db::delete_access_key(&db, &key_id).await {
         Ok(_) => {
             store.audit(
                 AuditLevel::Warn,
@@ -888,7 +828,7 @@ pub async fn api_revoke_access_key(
 
 /// `POST /admin/api/gc`
 pub async fn api_run_gc(
-    State((config_lock, store)): State<AdminState>,
+    State((config_lock, store, db)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, true) {
@@ -896,19 +836,9 @@ pub async fn api_run_gc(
     }
 
     let config = read_config(&config_lock);
-    let conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
-
-    let gc_res =
-        telecrate::gc::run_gc(&conn, FilePath::new(&config.spool_dir), None).unwrap_or_default();
+    let gc_res = telecrate::gc::run_gc(&db, FilePath::new(&config.spool_dir), None)
+        .await
+        .unwrap_or_default();
 
     store.audit(
         AuditLevel::Info,
@@ -932,26 +862,15 @@ pub async fn api_run_gc(
 
 /// `POST /admin/api/doctor`
 pub async fn api_run_doctor(
-    State((config_lock, store)): State<AdminState>,
+    State((_config_lock, store, db)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, true) {
         return err_resp.into_response();
     }
 
-    let config = read_config(&config_lock);
-    let conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
-
-    let report = telecrate::doctor::run_doctor(&conn)
+    let report = telecrate::doctor::run_doctor(&db)
+        .await
         .map(|r| serde_json::to_value(r).unwrap_or_default())
         .unwrap_or_else(|e| json!({ "error": format!("Doctor error: {e}") }));
 
@@ -971,7 +890,7 @@ pub async fn api_run_doctor(
 
 /// `POST /admin/api/backup`
 pub async fn api_run_backup(
-    State((config_lock, store)): State<AdminState>,
+    State((config_lock, store, db)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, true) {
@@ -979,21 +898,10 @@ pub async fn api_run_backup(
     }
 
     let config = read_config(&config_lock);
-    let conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
-
     let timestamp = now_secs();
     let backup_path = format!("{}.backup_{}", config.db_path, timestamp);
 
-    match telecrate::db::backup_db(&conn, &backup_path) {
+    match telecrate::db::backup_db(&db, &backup_path).await {
         Ok(_) => {
             let size = std::fs::metadata(&backup_path)
                 .map(|m| m.len())
@@ -1035,7 +943,7 @@ pub struct AuditQuery {
 /// Trả bản ghi audit THẬT từ ring-buffer (mới nhất trước) + tổng số sau lọc.
 /// Không fabricate log, không lộ token/secret (detail đã redact ở tầng ghi + phòng thủ ở đây).
 pub async fn api_get_audit_logs(
-    State((_, store)): State<AdminState>,
+    State((_, store, _)): State<AdminState>,
     headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<AuditQuery>,
 ) -> Response {
@@ -1093,7 +1001,7 @@ fn is_sensitive_config_key(key: &str) -> bool {
 
 /// `GET /admin/api/config`
 pub async fn api_get_config(
-    State((config_lock, store)): State<AdminState>,
+    State((config_lock, store, _)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
@@ -1120,7 +1028,7 @@ pub async fn api_get_config(
 
 /// `POST /admin/api/config`
 pub async fn api_update_config(
-    State((config_lock, store)): State<AdminState>,
+    State((config_lock, store, _)): State<AdminState>,
     headers: HeaderMap,
     Json(payload): Json<ConfigUpdatePayload>,
 ) -> Response {
@@ -1154,46 +1062,52 @@ pub async fn api_update_config(
             )
                 .into_response();
         }
-        *config = staged;
-        if let Err(e) = config.save_to_file(&save_path) {
+        if let Err(e) = staged.save_to_file(&save_path) {
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "ok": false, "error": format!("Lưu file config thất bại: {e}") })),
+                Json(json!({ "ok": false, "error": format!("Lưu file thất bại: {e}") })),
             )
                 .into_response();
         }
-        let mut keys: Vec<&String> = map.keys().collect();
-        keys.sort();
-        let sensitive = keys.iter().any(|k| is_sensitive_config_key(k));
+        *config = staged;
+        let audit_keys: Vec<String> = map
+            .iter()
+            .map(|(k, v)| {
+                if is_sensitive_config_key(k) {
+                    format!("{k}=[REDACTED]")
+                } else {
+                    format!("{k}={v}")
+                }
+            })
+            .collect();
         store.audit(
             AuditLevel::Warn,
             "admin",
             "config.update_batch",
-            format!(
-                "keys='{}' value='{}'",
-                keys.iter()
-                    .map(|k| k.as_str())
-                    .collect::<Vec<_>>()
-                    .join(","),
-                if sensitive {
-                    "[REDACTED]"
-                } else {
-                    "(batch values)"
-                },
-            ),
+            format!("path='{save_path}' updates=[{}]", audit_keys.join(", ")),
         );
         return Json(json!({
             "ok": true,
-            "message": format!("Đã cập nhật {} keys thành công", keys.len()),
-            "keys": keys,
+            "message": format!("Đã cập nhật {} key thành công", map.len()),
+            "count": map.len()
         }))
         .into_response();
     }
 
+    // Nhánh legacy đơn key.
     let key = payload.key.trim();
-    let val = payload.value.trim();
+    let value = payload.value.trim();
 
-    if let Err(e) = config.update_key(key, val) {
+    if key.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "Tên tham số 'key' không được để trống" })),
+        )
+            .into_response();
+    }
+
+    let mut staged = config.clone();
+    if let Err(e) = staged.apply_key(key, value) {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({ "ok": false, "error": e })),
@@ -1201,26 +1115,35 @@ pub async fn api_update_config(
             .into_response();
     }
 
-    if let Err(e) = config.save_to_file(&save_path) {
+    if let Err(e) = telecrate::config::validate(&staged) {
         return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({ "ok": false, "error": format!("Lưu file config thất bại: {e}") })),
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": e })),
         )
             .into_response();
     }
 
+    if let Err(e) = staged.save_to_file(&save_path) {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": format!("Lưu file thất bại: {e}") })),
+        )
+            .into_response();
+    }
+
+    *config = staged;
+
+    // Audit an toàn: không ghi value của secret/token.
+    let audit_val = if is_sensitive_config_key(key) {
+        "[REDACTED]"
+    } else {
+        value
+    };
     store.audit(
         AuditLevel::Warn,
         "admin",
         "config.update",
-        format!(
-            "key='{key}' value='{}'",
-            if is_sensitive_config_key(key) {
-                "[REDACTED]"
-            } else {
-                val
-            }
-        ),
+        format!("path='{save_path}' key='{key}' value='{audit_val}'"),
     );
 
     Json(json!({
@@ -1229,6 +1152,162 @@ pub async fn api_update_config(
         "key": key
     }))
     .into_response()
+}
+
+/// `GET /admin/api/tls/status` — trạng thái TLS xem bất cứ lúc nào (dashboard badge).
+/// Chỉ trả metadata + fingerprint, không bao giờ trả key material.
+pub async fn api_tls_status(
+    State((config_lock, store, _)): State<AdminState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
+        return err_resp.into_response();
+    }
+    let config = read_config(&config_lock);
+    let cert_file = config.tls_cert_file.clone().unwrap_or_default();
+    let key_file = config.tls_key_file.clone().unwrap_or_default();
+    let cert_present = !cert_file.is_empty() && FilePath::new(&cert_file).is_file();
+    let key_present = !key_file.is_empty() && FilePath::new(&key_file).is_file();
+    let mut tls = json!({
+        "enabled": config.tls_enabled,
+        "cert_file": cert_file,
+        "key_file": key_file,
+        "cert_present": cert_present,
+        "key_present": key_present,
+    });
+    if cert_present {
+        match telecrate::tls::cert_info_pem_file(&cert_file) {
+            Ok(info) => {
+                tls["subject"] = json!(info.subject);
+                tls["sans"] = json!(info.sans);
+                tls["not_before"] = json!(info.not_before);
+                tls["not_after"] = json!(info.not_after);
+                tls["days_left"] = json!(info.days_left);
+                tls["fingerprint"] = json!(info.fingerprint);
+                tls["expired"] = json!(info.days_left < 0);
+            }
+            Err(e) => {
+                tls["error"] = json!(e);
+            }
+        }
+    }
+    Json(json!({ "ok": true, "tls": tls })).into_response()
+}
+
+#[derive(Deserialize)]
+pub struct TlsGeneratePayload {
+    #[serde(default)]
+    pub cn: String,
+    /// SANs cách nhau dấu phẩy (DNS và/hoặc IP). Rỗng = dùng CN.
+    #[serde(default)]
+    pub sans: String,
+    #[serde(default = "default_tls_days")]
+    pub days: u64,
+    /// Mặc định dưới /var/lib/telecrate để daemon user ghi được.
+    #[serde(default)]
+    pub cert_path: String,
+    #[serde(default)]
+    pub key_path: String,
+}
+
+fn default_tls_days() -> u64 {
+    825
+}
+
+/// `POST /admin/api/tls/generate` — tự sinh self-signed (ECDSA P-256) + ghi file.
+/// Trả fingerprint SHA-256 để dán vào endpoint PBS. Key ghi 0600 (unix).
+pub async fn api_tls_generate(
+    State((_config_lock, store, _)): State<AdminState>,
+    headers: HeaderMap,
+    Json(payload): Json<TlsGeneratePayload>,
+) -> Response {
+    if let Err(err_resp) = authenticate_admin_request(&headers, &store, true) {
+        return err_resp.into_response();
+    }
+    let cn = payload.cn.trim().to_string();
+    if cn.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "ok": false, "error": "cn must not be empty" })),
+        )
+            .into_response();
+    }
+    let days = if payload.days == 0 {
+        default_tls_days()
+    } else {
+        payload.days
+    };
+    let sans: Vec<String> = if payload.sans.trim().is_empty() {
+        vec![cn.clone()]
+    } else {
+        payload
+            .sans
+            .split(',')
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect()
+    };
+    let cert_out = if payload.cert_path.trim().is_empty() {
+        "/var/lib/telecrate/tls.crt".to_string()
+    } else {
+        payload.cert_path.trim().to_string()
+    };
+    let key_out = if payload.key_path.trim().is_empty() {
+        "/var/lib/telecrate/tls.key".to_string()
+    } else {
+        payload.key_path.trim().to_string()
+    };
+    for (name, p) in [
+        ("cert_path", cert_out.as_str()),
+        ("key_path", key_out.as_str()),
+    ] {
+        let path = FilePath::new(p);
+        if !(path.is_absolute() || p.starts_with('/')) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": format!("{name} must be an absolute path") })),
+            )
+                .into_response();
+        }
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": format!("{name} must not contain '..'") })),
+            )
+                .into_response();
+        }
+    }
+    match telecrate::tls::generate_self_signed(&cn, &sans, days, &cert_out, &key_out) {
+        Ok(info) => {
+            store.audit(
+                AuditLevel::Warn,
+                "admin",
+                "tls.generate",
+                format!(
+                    "cn='{cn}' cert='{cert_out}' fingerprint='{}'",
+                    info.fingerprint
+                ),
+            );
+            Json(json!({
+                "ok": true,
+                "subject": info.subject,
+                "sans": info.sans,
+                "fingerprint": info.fingerprint,
+                "not_after": info.not_after,
+                "cert_file": cert_out,
+                "key_file": key_out,
+            }))
+            .into_response()
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({ "ok": false, "error": e })),
+        )
+            .into_response(),
+    }
 }
 
 // ============================================================
@@ -1256,35 +1335,36 @@ impl SessionStore {
 }
 
 /// Background task: sample metrics mỗi 10s. Gọi từ daemon startup (tokio::spawn).
-pub async fn metrics_sampler(config_lock: AdminConfig, store: Arc<SessionStore>) {
+pub async fn metrics_sampler(
+    config_lock: AdminConfig,
+    store: Arc<SessionStore>,
+    db: telecrate::db::Db,
+) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
     loop {
         interval.tick().await;
         let config = read_config(&config_lock);
         let spool_used = dir_size(FilePath::new(&config.spool_dir));
-        let mut total_objects: i64 = 0;
-        let mut total_size: i64 = 0;
-        let mut pending: i64 = 0;
-        let mut uploading: i64 = 0;
-        if let Ok(conn) = telecrate::db::open(&config.db_path) {
-            total_objects = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM objects WHERE is_delete_marker = 0",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            total_size = conn
-                .query_row(
-                    "SELECT COALESCE(SUM(size), 0) FROM objects WHERE is_delete_marker = 0",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            if let Ok(s) = telecrate::db::job_summary(&conn) {
-                pending = s.pending;
-                uploading = s.uploading;
-            }
+        let total_objects = crate::db::count(
+            &db,
+            "SELECT COUNT(*) FROM objects WHERE is_delete_marker = 0",
+            &[],
+        )
+        .await
+        .unwrap_or(0);
+        let size_row = crate::db::fetch_opt(
+            &db,
+            "SELECT COALESCE(SUM(size), 0) FROM objects WHERE is_delete_marker = 0",
+            &[],
+        )
+        .await
+        .ok()
+        .flatten();
+        let total_size = size_row.and_then(|r| r.get_i64(0).ok()).unwrap_or(0);
+        let (mut pending, mut uploading) = (0, 0);
+        if let Ok(s) = telecrate::db::job_summary(&db).await {
+            pending = s.pending;
+            uploading = s.uploading;
         }
         store.record_metrics(MetricsPoint {
             ts: now_secs(),
@@ -1299,7 +1379,7 @@ pub async fn metrics_sampler(config_lock: AdminConfig, store: Arc<SessionStore>)
 
 /// `GET /admin/api/metrics-history`
 pub async fn api_get_metrics_history(
-    State((config_lock, store)): State<AdminState>,
+    State((config_lock, store, db)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
@@ -1309,29 +1389,26 @@ pub async fn api_get_metrics_history(
     if points.is_empty() {
         let config = read_config(&config_lock);
         let spool_used = dir_size(FilePath::new(&config.spool_dir));
-        let mut total_objects: i64 = 0;
-        let mut total_size: i64 = 0;
-        let mut pending: i64 = 0;
-        let mut uploading: i64 = 0;
-        if let Ok(conn) = telecrate::db::open(&config.db_path) {
-            total_objects = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM objects WHERE is_delete_marker = 0",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            total_size = conn
-                .query_row(
-                    "SELECT COALESCE(SUM(size), 0) FROM objects WHERE is_delete_marker = 0",
-                    [],
-                    |r| r.get(0),
-                )
-                .unwrap_or(0);
-            if let Ok(s) = telecrate::db::job_summary(&conn) {
-                pending = s.pending;
-                uploading = s.uploading;
-            }
+        let total_objects = crate::db::count(
+            &db,
+            "SELECT COUNT(*) FROM objects WHERE is_delete_marker = 0",
+            &[],
+        )
+        .await
+        .unwrap_or(0);
+        let size_row = crate::db::fetch_opt(
+            &db,
+            "SELECT COALESCE(SUM(size), 0) FROM objects WHERE is_delete_marker = 0",
+            &[],
+        )
+        .await
+        .ok()
+        .flatten();
+        let total_size = size_row.and_then(|r| r.get_i64(0).ok()).unwrap_or(0);
+        let (mut pending, mut uploading) = (0, 0);
+        if let Ok(s) = telecrate::db::job_summary(&db).await {
+            pending = s.pending;
+            uploading = s.uploading;
         }
         points.push(MetricsPoint {
             ts: now_secs(),
@@ -1352,24 +1429,13 @@ pub async fn api_get_metrics_history(
 
 /// `GET /admin/api/buckets` — MODIFIED: include per-bucket stats.
 pub async fn api_list_buckets_v2(
-    State((config_lock, store)): State<AdminState>,
+    State((_config_lock, store, db)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
         return err_resp.into_response();
     }
-    let config = read_config(&config_lock);
-    let conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
-    let buckets = match telecrate::db::list_buckets(&conn) {
+    let buckets = match telecrate::db::list_buckets(&db).await {
         Ok(b) => b,
         Err(e) => {
             return (
@@ -1379,14 +1445,15 @@ pub async fn api_list_buckets_v2(
                 .into_response()
         }
     };
-    let stats = telecrate::db::bucket_stats(&conn).unwrap_or_default();
+    let stats = telecrate::db::bucket_stats(&db).await.unwrap_or_default();
     let stats_map: HashMap<String, (i64, i64)> = stats
         .into_iter()
         .map(|s| (s.name, (s.object_count, s.total_size_bytes)))
         .collect();
     let mut list = Vec::new();
     for b in buckets {
-        let versioning = telecrate::db::get_bucket_versioning(&conn, &b.name)
+        let versioning = telecrate::db::get_bucket_versioning(&db, &b.name)
+            .await
             .unwrap_or_else(|_| "Disabled".to_string());
         let (obj_count, total_size) = stats_map.get(&b.name).copied().unwrap_or((0, 0));
         list.push(json!({
@@ -1411,7 +1478,7 @@ pub struct ObjectListQuery {
 
 /// `GET /admin/api/buckets/:name/objects` — MODIFIED: prefix + delimiter support.
 pub async fn api_list_bucket_objects_v2(
-    State((config_lock, store)): State<AdminState>,
+    State((_config_lock, store, db)): State<AdminState>,
     Path(name): Path<String>,
     headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<ObjectListQuery>,
@@ -1419,39 +1486,25 @@ pub async fn api_list_bucket_objects_v2(
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
         return err_resp.into_response();
     }
-    let config = read_config(&config_lock);
-    let conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
     let prefix = params.prefix.unwrap_or_default();
     let delimiter = params.delimiter.unwrap_or_default();
     let max_keys = params.max_keys.unwrap_or(200).min(1000);
     let start_after = params.continuation_token.unwrap_or_default();
 
     // Query all matching keys (list_keys already supports prefix)
-    let rows = match telecrate::db::list_keys(
-        &conn,
-        &name,
-        &prefix,
-        &start_after,
-        (max_keys + 1) as i64,
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("List error: {e}") })),
-            )
-                .into_response()
-        }
-    };
+    let rows =
+        match telecrate::db::list_keys(&db, &name, &prefix, &start_after, (max_keys + 1) as i64)
+            .await
+        {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({ "error": format!("List error: {e}") })),
+                )
+                    .into_response()
+            }
+        };
 
     let is_truncated = rows.len() > max_keys;
     let rows: Vec<_> = rows.into_iter().take(max_keys).collect();
@@ -1526,25 +1579,14 @@ pub async fn api_list_bucket_objects_v2(
 
 /// `GET /admin/api/buckets/:name/objects-detail/*key` — Object detail.
 pub async fn api_get_object_detail(
-    State((config_lock, store)): State<AdminState>,
+    State((_config_lock, store, db)): State<AdminState>,
     Path((bucket, key)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
         return err_resp.into_response();
     }
-    let config = read_config(&config_lock);
-    let conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
-    let version = match telecrate::db::latest_version(&conn, &bucket, &key) {
+    let version = match telecrate::db::latest_version(&db, &bucket, &key).await {
         Ok(Some(v)) => v,
         Ok(None) => {
             return (
@@ -1561,7 +1603,9 @@ pub async fn api_get_object_detail(
                 .into_response()
         }
     };
-    let chunks = telecrate::db::chunks_of(&conn, &version.version_id).unwrap_or_default();
+    let chunks = telecrate::db::chunks_of(&db, &version.version_id)
+        .await
+        .unwrap_or_default();
     let chunks_json: Vec<serde_json::Value> = chunks
         .iter()
         .map(|c| {
@@ -1604,25 +1648,14 @@ pub async fn api_get_object_detail(
 
 /// `DELETE /admin/api/buckets/:name/objects-detail/*key` — Delete object from dashboard.
 pub async fn api_delete_object(
-    State((config_lock, store)): State<AdminState>,
+    State((_config_lock, store, db)): State<AdminState>,
     Path((bucket, key)): Path<(String, String)>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, true) {
         return err_resp.into_response();
     }
-    let config = read_config(&config_lock);
-    let mut conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
-    match telecrate::db::delete_object(&mut conn, &bucket, &key) {
+    match telecrate::db::delete_object(&db, &bucket, &key).await {
         Ok(r) => {
             // Clean up spool files
             for sp in &r.spool_paths {
@@ -1658,7 +1691,7 @@ pub struct UpdateKeyPayload {
 
 /// `PUT /admin/api/access-keys/:id` — Update access key (status/description/buckets).
 pub async fn api_update_access_key(
-    State((config_lock, store)): State<AdminState>,
+    State((_config_lock, store, db)): State<AdminState>,
     Path(key_id): Path<String>,
     headers: HeaderMap,
     Json(payload): Json<UpdateKeyPayload>,
@@ -1666,20 +1699,9 @@ pub async fn api_update_access_key(
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, true) {
         return err_resp.into_response();
     }
-    let config = read_config(&config_lock);
-    let conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
     let mut changes = Vec::new();
     if let Some(ref status) = payload.status {
-        match telecrate::db::update_access_key_status(&conn, &key_id, status) {
+        match telecrate::db::update_access_key_status(&db, &key_id, status).await {
             Ok(true) => changes.push(format!("status={status}")),
             Ok(false) => {
                 return (
@@ -1694,7 +1716,7 @@ pub async fn api_update_access_key(
         }
     }
     if let Some(ref desc) = payload.description {
-        let _ = telecrate::db::update_access_key_description(&conn, &key_id, desc);
+        let _ = telecrate::db::update_access_key_description(&db, &key_id, desc).await;
         changes.push("description updated".to_string());
     }
     if let Some(ref ab) = payload.allowed_buckets {
@@ -1703,7 +1725,8 @@ pub async fn api_update_access_key(
         } else {
             Some(ab.to_string())
         };
-        let _ = telecrate::db::update_access_key_allowed_buckets(&conn, &key_id, ab_str.as_deref());
+        let _ =
+            telecrate::db::update_access_key_allowed_buckets(&db, &key_id, ab_str.as_deref()).await;
         changes.push("allowed_buckets updated".to_string());
     }
     store.audit(
@@ -1717,67 +1740,52 @@ pub async fn api_update_access_key(
 
 /// `GET /admin/api/access-keys` — MODIFIED: include last_used_at and allowed_buckets.
 pub async fn api_list_access_keys_v2(
-    State((config_lock, store)): State<AdminState>,
+    State((_config_lock, store, db)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
         return err_resp.into_response();
     }
-    let config = read_config(&config_lock);
-    let conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
     // Query with new columns (migration 0004 adds them; graceful if missing)
-    let mut stmt = conn
-        .prepare("SELECT access_key_id, status, description, created_at, last_used_at, allowed_buckets FROM access_keys ORDER BY created_at ASC")
-        .unwrap_or_else(|_| {
-            // Fallback without new columns
-            conn.prepare("SELECT access_key_id, status, description, created_at, NULL, NULL FROM access_keys ORDER BY created_at ASC").unwrap()
-        });
-    let rows = stmt.query_map([], |r| {
-        Ok(json!({
-            "access_key_id": r.get::<_, String>(0)?,
-            "status": r.get::<_, String>(1)?,
-            "user_id": r.get::<_, Option<String>>(2)?.unwrap_or_else(|| "admin".to_string()),
-            "created_at": r.get::<_, String>(3)?,
-            "last_used_at": r.get::<_, Option<String>>(4)?,
-            "allowed_buckets": r.get::<_, Option<String>>(5)?,
-        }))
-    });
-    let list: Vec<serde_json::Value> = match rows {
-        Ok(r) => r.flatten().collect(),
-        Err(_) => Vec::new(),
+    let rows = match telecrate::db::fetch_all(
+        &db,
+        "SELECT access_key_id, status, description, created_at, last_used_at, allowed_buckets FROM access_keys ORDER BY created_at ASC",
+        &[],
+    )
+    .await
+    {
+        Ok(r) => r,
+        Err(_) => telecrate::db::fetch_all(
+            &db,
+            "SELECT access_key_id, status, description, created_at, NULL, NULL FROM access_keys ORDER BY created_at ASC",
+            &[],
+        )
+        .await
+        .unwrap_or_default(),
     };
+    let mut list = Vec::new();
+    for r in rows {
+        list.push(json!({
+            "access_key_id": r.get_string(0).unwrap_or_default(),
+            "status": r.get_string(1).unwrap_or_default(),
+            "user_id": r.get_opt_string(2).unwrap_or(None).unwrap_or_else(|| "admin".to_string()),
+            "created_at": r.get_string(3).unwrap_or_default(),
+            "last_used_at": r.get_opt_string(4),
+            "allowed_buckets": r.get_opt_string(5),
+        }));
+    }
     Json(list).into_response()
 }
 
 /// `GET /admin/api/jobs` — List upload jobs.
 pub async fn api_list_jobs(
-    State((config_lock, store)): State<AdminState>,
+    State((_config_lock, store, db)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
         return err_resp.into_response();
     }
-    let config = read_config(&config_lock);
-    let conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
-    match telecrate::db::list_jobs(&conn) {
+    match telecrate::db::list_jobs(&db).await {
         Ok((jobs, summary)) => {
             let jobs_json: Vec<serde_json::Value> = jobs
                 .into_iter()
@@ -1821,7 +1829,7 @@ pub async fn api_list_jobs(
 
 /// `POST /admin/api/telegram-test` — Test Telegram connection.
 pub async fn api_telegram_test(
-    State((config_lock, store)): State<AdminState>,
+    State((config_lock, store, _)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, true) {
@@ -1917,71 +1925,58 @@ pub async fn api_telegram_test(
 
 /// `GET /admin/api/multipart-uploads` — List in-progress multipart uploads.
 pub async fn api_list_multipart_uploads(
-    State((config_lock, store)): State<AdminState>,
+    State((_config_lock, store, db)): State<AdminState>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
         return err_resp.into_response();
     }
-    let config = read_config(&config_lock);
-    let conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
     // Direct query — list_multipart_uploads in db.rs takes bucket param,
     // but for dashboard we want all uploads across all buckets.
-    let mut stmt = match conn.prepare(
+    let rows = match telecrate::db::fetch_all(
+        &db,
         "SELECT upload_id, bucket, key, content_type, created_at FROM multipart_uploads ORDER BY created_at DESC LIMIT 100",
-    ) {
-        Ok(s) => s,
+        &[],
+    )
+    .await
+    {
+        Ok(r) => r,
         Err(e) => {
             return Json(json!({ "uploads": [], "total": 0, "error": format!("{e}") })).into_response();
         }
     };
-    let rows = stmt.query_map([], |r| {
-        Ok(json!({
-            "upload_id": r.get::<_, String>(0)?,
-            "bucket": r.get::<_, String>(1)?,
-            "key": r.get::<_, String>(2)?,
-            "content_type": r.get::<_, String>(3)?,
-            "created_at": r.get::<_, String>(4)?,
-        }))
-    });
-    let list: Vec<serde_json::Value> = match rows {
-        Ok(r) => r.flatten().collect(),
-        Err(_) => Vec::new(),
-    };
+    let mut list = Vec::new();
+    for r in rows {
+        if let (Ok(upload_id), Ok(bucket), Ok(key), Ok(content_type), Ok(created_at)) = (
+            r.get_string(0),
+            r.get_string(1),
+            r.get_string(2),
+            r.get_string(3),
+            r.get_string(4),
+        ) {
+            list.push(json!({
+                "upload_id": upload_id,
+                "bucket": bucket,
+                "key": key,
+                "content_type": content_type,
+                "created_at": created_at,
+            }));
+        }
+    }
     let total = list.len();
     Json(json!({ "uploads": list, "total": total })).into_response()
 }
 
 /// `POST /admin/api/multipart-uploads/:id/abort` — Abort a stuck multipart upload.
 pub async fn api_abort_multipart_upload(
-    State((config_lock, store)): State<AdminState>,
+    State((_config_lock, store, db)): State<AdminState>,
     Path(upload_id): Path<String>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, true) {
         return err_resp.into_response();
     }
-    let config = read_config(&config_lock);
-    let mut conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
-    match telecrate::db::abort_multipart_upload(&mut conn, &upload_id) {
+    match telecrate::db::abort_multipart_upload(&db, &upload_id).await {
         Ok(paths) => {
             for p in &paths {
                 let _ = std::fs::remove_file(p);
@@ -2004,43 +1999,42 @@ pub async fn api_abort_multipart_upload(
 
 /// `GET /admin/api/buckets/:name/settings` — Aggregated bucket settings.
 pub async fn api_get_bucket_settings(
-    State((config_lock, store)): State<AdminState>,
+    State((_config_lock, store, db)): State<AdminState>,
     Path(name): Path<String>,
     headers: HeaderMap,
 ) -> Response {
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
         return err_resp.into_response();
     }
-    let config = read_config(&config_lock);
-    let conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
-    if !telecrate::db::head_bucket(&conn, &name).unwrap_or(false) {
+    if !telecrate::db::head_bucket(&db, &name)
+        .await
+        .unwrap_or(false)
+    {
         return (
             StatusCode::NOT_FOUND,
             Json(json!({ "error": "Bucket not found" })),
         )
             .into_response();
     }
-    let versioning = telecrate::db::get_bucket_versioning(&conn, &name)
+    let versioning = telecrate::db::get_bucket_versioning(&db, &name)
+        .await
         .unwrap_or_else(|_| "Disabled".to_string());
-    let cors: Option<serde_json::Value> = telecrate::db::get_bucket_cors(&conn, &name)
+    let cors: Option<serde_json::Value> = telecrate::db::get_bucket_cors(&db, &name)
+        .await
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok());
-    let policy: Option<serde_json::Value> = telecrate::db::get_bucket_policy(&conn, &name)
+    let policy: Option<serde_json::Value> = telecrate::db::get_bucket_policy(&db, &name)
+        .await
         .ok()
         .flatten()
         .and_then(|s| serde_json::from_str(&s).ok());
-    let bpa = telecrate::db::get_bucket_bpa(&conn, &name).unwrap_or_default();
-    let lock_config = telecrate::db::get_bucket_object_lock_config(&conn, &name).ok();
+    let bpa = telecrate::db::get_bucket_bpa(&db, &name)
+        .await
+        .unwrap_or_default();
+    let lock_config = telecrate::db::get_bucket_object_lock_config(&db, &name)
+        .await
+        .ok();
 
     Json(json!({
         "name": name,
@@ -2065,7 +2059,7 @@ pub struct VersioningPayload {
 
 /// `PUT /admin/api/buckets/:name/versioning` — Toggle bucket versioning.
 pub async fn api_set_bucket_versioning(
-    State((config_lock, store)): State<AdminState>,
+    State((_config_lock, store, db)): State<AdminState>,
     Path(name): Path<String>,
     headers: HeaderMap,
     Json(payload): Json<VersioningPayload>,
@@ -2073,18 +2067,7 @@ pub async fn api_set_bucket_versioning(
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, true) {
         return err_resp.into_response();
     }
-    let config = read_config(&config_lock);
-    let mut conn = match telecrate::db::open(&config.db_path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("DB error: {e}") })),
-            )
-                .into_response()
-        }
-    };
-    match telecrate::db::set_bucket_versioning(&mut conn, &name, &payload.status) {
+    match telecrate::db::set_bucket_versioning(&db, &name, &payload.status).await {
         Ok(_) => {
             store.audit(
                 AuditLevel::Warn,

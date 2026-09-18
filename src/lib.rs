@@ -16,6 +16,7 @@ pub mod s3;
 pub mod sigv4;
 pub mod spool;
 pub mod telegram;
+pub mod tls;
 pub mod worker;
 
 /// Phiên bản crate, dùng cho health/version endpoint.
@@ -29,20 +30,32 @@ pub struct Health {
     pub detail: String,
 }
 
-pub fn health_check(config_path: &str) -> Health {
+pub async fn health_check(config_path: &str) -> Health {
     match config::load(config_path) {
-        Ok(cfg) => match db::open(&cfg.db_path) {
-            Ok(_) => Health {
-                ok: true,
-                version: VERSION.to_string(),
-                detail: format!("config ok, db open ok: {}", cfg.db_path),
-            },
-            Err(e) => Health {
-                ok: false,
-                version: VERSION.to_string(),
-                detail: format!("db open failed: {e}"),
-            },
-        },
+        Ok(cfg) => {
+            let res = match cfg.db_backend.as_str() {
+                "postgres" => {
+                    if let Some(url) = cfg.database_url.as_deref() {
+                        db::Db::open_postgres(url).await
+                    } else {
+                        Err("missing database_url for postgres".to_string())
+                    }
+                }
+                _ => db::Db::open_sqlite(&cfg.db_path).await,
+            };
+            match res {
+                Ok(_) => Health {
+                    ok: true,
+                    version: VERSION.to_string(),
+                    detail: format!("config ok, db open ok: backend={}", cfg.db_backend),
+                },
+                Err(e) => Health {
+                    ok: false,
+                    version: VERSION.to_string(),
+                    detail: format!("db open failed: {e}"),
+                },
+            }
+        }
         Err(e) => Health {
             ok: false,
             version: VERSION.to_string(),

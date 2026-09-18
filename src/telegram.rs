@@ -60,7 +60,7 @@ pub struct CapabilityReport {
 }
 
 /// Interface transport — mọi implementation phải qua capability test trước khi dùng.
-pub trait Transport {
+pub trait Transport: Send + Sync {
     fn transport_type(&self) -> TransportType;
     fn upload(&self, chat_id: i64, bytes: &[u8]) -> Result<RemoteLocator, TransportError>;
     fn download(&self, locator: &RemoteLocator) -> Result<Vec<u8>, TransportError>;

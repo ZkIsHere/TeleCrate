@@ -1,8 +1,7 @@
 //! Module Standalone Recovery Bundle — Export/Import toàn bộ metadata index để tái tạo DB khi hỏng.
 
-use crate::db::{apply_all_migrations, open};
+use crate::db::{apply_all_migrations, Db, Val};
 use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
-use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::Path;
@@ -68,100 +67,160 @@ pub struct RecoveryBundle {
 }
 
 /// Export toàn bộ metadata index thành RecoveryBundle struct.
-pub fn export_recovery_bundle(conn: &Connection) -> Result<RecoveryBundle, String> {
-    let now_iso: String = conn
-        .query_row("SELECT datetime('now')", [], |r| r.get(0))
-        .unwrap_or_default();
+pub async fn export_recovery_bundle(db: &Db) -> Result<RecoveryBundle, String> {
+    let now_iso = crate::db::now_str();
 
     // 1. Buckets
-    let mut stmt = conn
-        .prepare(
-            "SELECT name, region, versioning_status, encryption_override, created_at FROM buckets",
-        )
-        .map_err(|e| format!("prepare buckets export: {e}"))?;
-    let buckets = stmt
-        .query_map([], |r| {
-            Ok(BucketRecord {
-                name: r.get(0)?,
-                region: r.get(1)?,
-                versioning_status: r.get(2)?,
-                encryption_override: r.get(3)?,
-                created_at: r.get(4)?,
-            })
-        })
-        .map_err(|e| format!("query buckets export: {e}"))?
-        .flatten()
-        .collect();
+    let rows = crate::db::fetch_all(
+        db,
+        "SELECT name, region, versioning_status, encryption_override, created_at FROM buckets",
+        &[],
+    )
+    .await
+    .map_err(|e| format!("query buckets export: {e}"))?;
+    let mut buckets = Vec::new();
+    for r in &rows {
+        buckets.push(BucketRecord {
+            name: r
+                .get_string(0)
+                .map_err(|e| format!("row buckets export: {e}"))?,
+            region: r
+                .get_string(1)
+                .map_err(|e| format!("row buckets export: {e}"))?,
+            versioning_status: r
+                .get_string(2)
+                .map_err(|e| format!("row buckets export: {e}"))?,
+            encryption_override: r
+                .get_opt_string(3)
+                .map_err(|e| format!("row buckets export: {e}"))?,
+            created_at: r
+                .get_string(4)
+                .map_err(|e| format!("row buckets export: {e}"))?,
+        });
+    }
 
     // 2. Objects
-    let mut stmt = conn
-        .prepare("SELECT bucket, key, version_id, is_delete_marker, storage_state, size, etag, content_type, created_at FROM objects")
-        .map_err(|e| format!("prepare objects export: {e}"))?;
-    let objects = stmt
-        .query_map([], |r| {
-            let dm: i32 = r.get(3)?;
-            Ok(ObjectRecord {
-                bucket: r.get(0)?,
-                key: r.get(1)?,
-                version_id: r.get(2)?,
-                is_delete_marker: dm != 0,
-                storage_state: r.get(4)?,
-                size: r.get(5)?,
-                etag: r.get(6)?,
-                content_type: r.get(7)?,
-                created_at: r.get(8)?,
-            })
-        })
-        .map_err(|e| format!("query objects export: {e}"))?
-        .flatten()
-        .collect();
+    let rows = crate::db::fetch_all(
+        db,
+        "SELECT bucket, key, version_id, is_delete_marker, storage_state, size, etag, content_type, created_at FROM objects",
+        &[],
+    )
+    .await
+    .map_err(|e| format!("query objects export: {e}"))?;
+    let mut objects = Vec::new();
+    for r in &rows {
+        objects.push(ObjectRecord {
+            bucket: r
+                .get_string(0)
+                .map_err(|e| format!("row objects export: {e}"))?,
+            key: r
+                .get_string(1)
+                .map_err(|e| format!("row objects export: {e}"))?,
+            version_id: r
+                .get_string(2)
+                .map_err(|e| format!("row objects export: {e}"))?,
+            is_delete_marker: r
+                .get_bool(3)
+                .map_err(|e| format!("row objects export: {e}"))?,
+            storage_state: r
+                .get_string(4)
+                .map_err(|e| format!("row objects export: {e}"))?,
+            size: r
+                .get_i64(5)
+                .map_err(|e| format!("row objects export: {e}"))?,
+            etag: r
+                .get_string(6)
+                .map_err(|e| format!("row objects export: {e}"))?,
+            content_type: r
+                .get_string(7)
+                .map_err(|e| format!("row objects export: {e}"))?,
+            created_at: r
+                .get_string(8)
+                .map_err(|e| format!("row objects export: {e}"))?,
+        });
+    }
 
     // 3. Chunks
-    let mut stmt = conn
-        .prepare("SELECT version_id, idx, offset, length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref, nonce, spool_path, remote_locator_json, state FROM chunks")
-        .map_err(|e| format!("prepare chunks export: {e}"))?;
-    let chunks = stmt
-        .query_map([], |r| {
-            Ok(ChunkRecord {
-                version_id: r.get(0)?,
-                idx: r.get(1)?,
-                offset: r.get(2)?,
-                length: r.get(3)?,
-                plaintext_sha256: r.get(4)?,
-                ciphertext_sha256: r.get(5)?,
-                encryption_mode: r.get(6)?,
-                key_ref: r.get(7)?,
-                nonce: r.get(8)?,
-                spool_path: r.get(9)?,
-                remote_locator_json: r.get(10)?,
-                state: r.get(11)?,
-            })
-        })
-        .map_err(|e| format!("query chunks export: {e}"))?
-        .flatten()
-        .collect();
+    let rows = crate::db::fetch_all(
+        db,
+        "SELECT version_id, idx, offset, length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref, nonce, spool_path, remote_locator_json, state FROM chunks",
+        &[],
+    )
+    .await
+    .map_err(|e| format!("query chunks export: {e}"))?;
+    let mut chunks = Vec::new();
+    for r in &rows {
+        chunks.push(ChunkRecord {
+            version_id: r
+                .get_string(0)
+                .map_err(|e| format!("row chunks export: {e}"))?,
+            idx: r
+                .get_i32(1)
+                .map_err(|e| format!("row chunks export: {e}"))?,
+            offset: r
+                .get_i64(2)
+                .map_err(|e| format!("row chunks export: {e}"))?,
+            length: r
+                .get_i64(3)
+                .map_err(|e| format!("row chunks export: {e}"))?,
+            plaintext_sha256: r
+                .get_string(4)
+                .map_err(|e| format!("row chunks export: {e}"))?,
+            ciphertext_sha256: r
+                .get_string(5)
+                .map_err(|e| format!("row chunks export: {e}"))?,
+            encryption_mode: r
+                .get_string(6)
+                .map_err(|e| format!("row chunks export: {e}"))?,
+            key_ref: r
+                .get_opt_string(7)
+                .map_err(|e| format!("row chunks export: {e}"))?,
+            nonce: r
+                .get_opt_string(8)
+                .map_err(|e| format!("row chunks export: {e}"))?,
+            spool_path: r
+                .get_opt_string(9)
+                .map_err(|e| format!("row chunks export: {e}"))?,
+            remote_locator_json: r
+                .get_opt_string(10)
+                .map_err(|e| format!("row chunks export: {e}"))?,
+            state: r
+                .get_string(11)
+                .map_err(|e| format!("row chunks export: {e}"))?,
+        });
+    }
 
     // 4. Object Locks
-    let mut stmt = conn
-        .prepare(
-            "SELECT bucket, key, version_id, retain_until_date, mode, legal_hold FROM object_locks",
-        )
-        .map_err(|e| format!("prepare locks export: {e}"))?;
-    let object_locks = stmt
-        .query_map([], |r| {
-            let lh: i32 = r.get(5)?;
-            Ok(ObjectLockRecord {
-                bucket: r.get(0)?,
-                key: r.get(1)?,
-                version_id: r.get(2)?,
-                retain_until_date: r.get(3)?,
-                mode: r.get(4)?,
-                legal_hold: lh != 0,
-            })
-        })
-        .map_err(|e| format!("query locks export: {e}"))?
-        .flatten()
-        .collect();
+    let rows = crate::db::fetch_all(
+        db,
+        "SELECT bucket, key, version_id, retain_until_date, mode, legal_hold FROM object_locks",
+        &[],
+    )
+    .await
+    .map_err(|e| format!("query locks export: {e}"))?;
+    let mut object_locks = Vec::new();
+    for r in &rows {
+        object_locks.push(ObjectLockRecord {
+            bucket: r
+                .get_string(0)
+                .map_err(|e| format!("row locks export: {e}"))?,
+            key: r
+                .get_string(1)
+                .map_err(|e| format!("row locks export: {e}"))?,
+            version_id: r
+                .get_string(2)
+                .map_err(|e| format!("row locks export: {e}"))?,
+            retain_until_date: r
+                .get_opt_string(3)
+                .map_err(|e| format!("row locks export: {e}"))?,
+            mode: r
+                .get_opt_string(4)
+                .map_err(|e| format!("row locks export: {e}"))?,
+            legal_hold: r
+                .get_bool(5)
+                .map_err(|e| format!("row locks export: {e}"))?,
+        });
+    }
 
     Ok(RecoveryBundle {
         version: 1,
@@ -174,12 +233,12 @@ pub fn export_recovery_bundle(conn: &Connection) -> Result<RecoveryBundle, Strin
 }
 
 /// Export RecoveryBundle ra file (plain JSON hoặc mã hóa passphrase).
-pub fn export_recovery_bundle_file(
-    conn: &Connection,
+pub async fn export_recovery_bundle_file(
+    db: &Db,
     output_path: &str,
     passphrase: Option<&str>,
 ) -> Result<(), String> {
-    let bundle = export_recovery_bundle(conn)?;
+    let bundle = export_recovery_bundle(db).await?;
     let json_bytes =
         serde_json::to_vec_pretty(&bundle).map_err(|e| format!("serialize bundle: {e}"))?;
 
@@ -223,10 +282,11 @@ pub fn export_recovery_bundle_file(
     Ok(())
 }
 
-/// Import RecoveryBundle từ file để tái tạo lại toàn bộ SQLite index từ đầu.
-pub fn import_recovery_bundle_file(
+/// Import RecoveryBundle từ file vào DB đích (đã có schema — apply migrations trước).
+/// Chạy được cả hai backend (import logic qua queries, không copy file).
+pub async fn import_recovery_bundle_file(
     input_path: &str,
-    target_db_path: &str,
+    db: &Db,
     passphrase: Option<&str>,
 ) -> Result<(), String> {
     let raw = std::fs::read(input_path).map_err(|e| format!("read bundle file: {e}"))?;
@@ -261,95 +321,100 @@ pub fn import_recovery_bundle_file(
     let bundle: RecoveryBundle = serde_json::from_slice(&json_bytes)
         .map_err(|e| format!("parse recovery bundle JSON: {e}"))?;
 
-    // Mở DB đích và apply migrations
-    let mut conn = open(target_db_path)?;
-    apply_all_migrations(&mut conn)?;
+    // Apply migrations trên DB đích rồi import trong 1 txn.
+    apply_all_migrations(db).await?;
 
-    let tx = conn.transaction().map_err(|e| format!("begin tx: {e}"))?;
+    let mut tx = db.begin().await?;
 
     // Restore Buckets
     for b in bundle.buckets {
-        tx.execute(
+        tx.exec(
             "INSERT INTO buckets(name, region, versioning_status, encryption_override, created_at)
              VALUES (?, ?, ?, ?, ?)
              ON CONFLICT(name) DO UPDATE SET
                region=excluded.region,
                versioning_status=excluded.versioning_status",
-            rusqlite::params![
-                b.name,
-                b.region,
-                b.versioning_status,
-                b.encryption_override,
-                b.created_at
+            &[
+                Val::text(&b.name),
+                Val::text(&b.region),
+                Val::text(&b.versioning_status),
+                Val::opt_text(b.encryption_override.as_deref()),
+                Val::text(&b.created_at),
             ],
         )
+        .await
         .map_err(|e| format!("restore bucket {}: {e}", b.name))?;
     }
 
     // Restore Objects
     for o in bundle.objects {
-        tx.execute(
+        tx.exec(
             "INSERT INTO objects(bucket, key, version_id, is_delete_marker, storage_state, size, etag, content_type, created_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(version_id) DO NOTHING",
-            rusqlite::params![
-                o.bucket,
-                o.key,
-                o.version_id,
-                if o.is_delete_marker { 1 } else { 0 },
-                o.storage_state,
-                o.size,
-                o.etag,
-                o.content_type,
-                o.created_at
+            &[
+                Val::text(&o.bucket),
+                Val::text(&o.key),
+                Val::text(&o.version_id),
+                Val::int(o.is_delete_marker as i64),
+                Val::text(&o.storage_state),
+                Val::int(o.size),
+                Val::text(&o.etag),
+                Val::text(&o.content_type),
+                Val::text(&o.created_at),
             ],
         )
+        .await
         .map_err(|e| format!("restore object {}: {e}", o.version_id))?;
     }
 
     // Restore Chunks
     for c in bundle.chunks {
-        tx.execute(
+        tx.exec(
             "INSERT INTO chunks(version_id, idx, offset, length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref, nonce, spool_path, remote_locator_json, state)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
              ON CONFLICT(version_id, idx) DO NOTHING",
-            rusqlite::params![
-                c.version_id,
-                c.idx,
-                c.offset,
-                c.length,
-                c.plaintext_sha256,
-                c.ciphertext_sha256,
-                c.encryption_mode,
-                c.key_ref,
-                c.nonce,
-                c.spool_path,
-                c.remote_locator_json,
-                c.state
+            &[
+                Val::text(&c.version_id),
+                Val::int(c.idx as i64),
+                Val::int(c.offset),
+                Val::int(c.length),
+                Val::text(&c.plaintext_sha256),
+                Val::text(&c.ciphertext_sha256),
+                Val::text(&c.encryption_mode),
+                Val::opt_text(c.key_ref.as_deref()),
+                Val::opt_text(c.nonce.as_deref()),
+                Val::opt_text(c.spool_path.as_deref()),
+                Val::opt_text(c.remote_locator_json.as_deref()),
+                Val::text(&c.state),
             ],
         )
+        .await
         .map_err(|e| format!("restore chunk {}/{}: {e}", c.version_id, c.idx))?;
     }
 
     // Restore Object Locks
     for l in bundle.object_locks {
-        tx.execute(
+        tx.exec(
             "INSERT INTO object_locks(bucket, key, version_id, retain_until_date, mode, legal_hold)
              VALUES (?, ?, ?, ?, ?, ?)
              ON CONFLICT(bucket, key, version_id) DO NOTHING",
-            rusqlite::params![
-                l.bucket,
-                l.key,
-                l.version_id,
-                l.retain_until_date,
-                l.mode,
-                if l.legal_hold { 1 } else { 0 }
+            &[
+                Val::text(&l.bucket),
+                Val::text(&l.key),
+                Val::text(&l.version_id),
+                Val::opt_text(l.retain_until_date.as_deref()),
+                Val::opt_text(l.mode.as_deref()),
+                Val::int(l.legal_hold as i64),
             ],
         )
+        .await
         .map_err(|e| format!("restore lock {}/{}: {e}", l.bucket, l.key))?;
     }
 
-    tx.commit().map_err(|e| format!("commit import tx: {e}"))?;
+    tx.commit()
+        .await
+        .map_err(|e| format!("commit import tx: {e}"))?;
     Ok(())
 }
 
@@ -358,20 +423,22 @@ mod tests {
     use super::*;
     use crate::db::*;
 
-    #[test]
-    fn test_recovery_bundle_export_import_roundtrip() {
+    #[tokio::test]
+    async fn test_recovery_bundle_export_import_roundtrip() {
         let temp_dir = tempfile::tempdir().unwrap();
         let src_db = temp_dir.path().join("src.db");
         let restored_db = temp_dir.path().join("restored.db");
         let plain_bundle = temp_dir.path().join("bundle.json");
         let enc_bundle = temp_dir.path().join("bundle.enc");
 
-        let mut conn = open(src_db.to_str().unwrap()).unwrap();
-        apply_all_migrations(&mut conn).unwrap();
+        let conn = Db::open_sqlite(src_db.to_str().unwrap()).await.unwrap();
+        apply_all_migrations(&conn).await.unwrap();
 
-        create_bucket(&conn, "rec-bucket", "telecrate-1").unwrap();
+        create_bucket(&conn, "rec-bucket", "telecrate-1")
+            .await
+            .unwrap();
         put_object(
-            &mut conn,
+            &conn,
             "rec-bucket",
             "hello.txt",
             "v100",
@@ -391,38 +458,46 @@ mod tests {
             }],
             "job100",
         )
+        .await
         .unwrap();
-        set_object_legal_hold(&conn, "rec-bucket", "hello.txt", "v100", true).unwrap();
+        set_object_legal_hold(&conn, "rec-bucket", "hello.txt", "v100", true)
+            .await
+            .unwrap();
 
         // 1. Export plain bundle
-        export_recovery_bundle_file(&conn, plain_bundle.to_str().unwrap(), None).unwrap();
+        export_recovery_bundle_file(&conn, plain_bundle.to_str().unwrap(), None)
+            .await
+            .unwrap();
         assert!(plain_bundle.exists());
 
         // Import into clean DB
-        import_recovery_bundle_file(
-            plain_bundle.to_str().unwrap(),
-            restored_db.to_str().unwrap(),
-            None,
-        )
-        .unwrap();
+        let restored_conn = Db::open_sqlite(restored_db.to_str().unwrap())
+            .await
+            .unwrap();
+        import_recovery_bundle_file(plain_bundle.to_str().unwrap(), &restored_conn, None)
+            .await
+            .unwrap();
 
-        let restored_conn = open(restored_db.to_str().unwrap()).unwrap();
-        assert!(head_bucket(&restored_conn, "rec-bucket").unwrap());
+        assert!(head_bucket(&restored_conn, "rec-bucket").await.unwrap());
         let ver = latest_version(&restored_conn, "rec-bucket", "hello.txt")
+            .await
             .unwrap()
             .unwrap();
-        let _chunks = chunks_of(&restored_conn, &ver.version_id).unwrap();
+        let _chunks = chunks_of(&restored_conn, &ver.version_id).await.unwrap();
         assert_eq!(ver.version_id, "v100");
-        let p1_count: i64 = restored_conn
-            .query_row(
-                "SELECT COUNT(*) FROM chunks WHERE plaintext_sha256 = 'p1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
+        let p1_count = count(
+            &restored_conn,
+            "SELECT COUNT(*) FROM chunks WHERE plaintext_sha256 = 'p1'",
+            &[],
+        )
+        .await
+        .unwrap();
         assert_eq!(p1_count, 1);
-        assert!(get_object_legal_hold(&restored_conn, "rec-bucket", "hello.txt", "v100").unwrap());
-        drop(restored_conn);
+        assert!(
+            get_object_legal_hold(&restored_conn, "rec-bucket", "hello.txt", "v100")
+                .await
+                .unwrap()
+        );
 
         // 2. Export encrypted bundle
         export_recovery_bundle_file(
@@ -430,23 +505,34 @@ mod tests {
             enc_bundle.to_str().unwrap(),
             Some("recovery-passphrase"),
         )
+        .await
         .unwrap();
         assert!(enc_bundle.exists());
 
         // Import with wrong passphrase -> fails
+        let restored_conn2 =
+            Db::open_sqlite(temp_dir.path().join("restored2.db").to_str().unwrap())
+                .await
+                .unwrap();
         let res = import_recovery_bundle_file(
             enc_bundle.to_str().unwrap(),
-            restored_db.to_str().unwrap(),
+            &restored_conn2,
             Some("wrong-pass"),
-        );
+        )
+        .await;
         assert!(res.is_err());
 
         // Import with correct passphrase -> succeeds
+        let restored_conn3 =
+            Db::open_sqlite(temp_dir.path().join("restored3.db").to_str().unwrap())
+                .await
+                .unwrap();
         import_recovery_bundle_file(
             enc_bundle.to_str().unwrap(),
-            restored_db.to_str().unwrap(),
+            &restored_conn3,
             Some("recovery-passphrase"),
         )
+        .await
         .unwrap();
     }
 }

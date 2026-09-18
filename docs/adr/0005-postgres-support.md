@@ -1,29 +1,28 @@
 # ADR 0005 — Hỗ trợ Postgres cho metadata DB (pluggable backend)
 
-> Ngày: 2026-09-18. Trạng thái: `partial` (chấp nhận).
+> Ngày: 2026-09-18. Trạng thái: `implemented-and-tested` (chấp nhận và đã hoàn thành).
 > Liên quan: ADR 0001 (stack SQLite), `docs/data-model.md`, `docs/compatibility-matrix.md`.
 
 ## 1. Bối cảnh
 
-TeleCrate dùng SQLite (WAL) cho toàn bộ index/jobs (`src/db.rs`, `rusqlite` bundled).
-Vận hành có nhu cầu chọn 1 trong 2 backend: `sqlite` hoặc `postgres`.
+TeleCrate ban đầu dùng SQLite (WAL) đồng bộ qua `rusqlite` cho toàn bộ index/jobs.
+Để đáp ứng các kịch bản triển khai phân tán hoặc tận dụng hạ tầng CSDL PostgreSQL có sẵn,
+hệ thống cần hỗ trợ dual-backend: `sqlite` hoặc `postgres` mà không làm phân mảnh logic nghiệp vụ S3.
 
 ## 2. Quyết định
 
+- Cung cấp trừu tượng async DAL `telecrate::db::Db` dựa trên `sqlx` (hỗ trợ cả `sqlx::SqlitePool` và `sqlx::PgPool`).
+- Không còn phụ thuộc `rusqlite` đồng bộ trong runtime chính; toàn bộ S3 HTTP handlers, worker background,
+  GC engine, doctor/verify/scrub, admin API, recovery export/import và migrations đều chạy non-blocking async.
 - Thêm `db_backend = "sqlite" | "postgres"` (mặc định `"sqlite"`) + `database_url`
   (chỉ dùng khi `postgres`, chứa password → redact mọi nơi như bot token).
-- SQLite giữ nguyên 100% hành vi, là backend runnable duy nhất.
-- Postgres ở mức `partial` trong turn này:
-  - **Xong**: chọn backend qua TOML/CLI/dashboard + validate fail-closed,
-    DDL schema Postgres đầy đủ tương đương migrations SQLite 0001→0004
-    (file `migrations/postgres/0001_0004_schema.sql`, nạp qua `include_str!`
-    thành `DbBackend::POSTGRES_SCHEMA`, in ra bằng `telecrate db pg-schema`),
-    guard khởi động từ chối chạy khi `db_backend='postgres'` với thông báo rõ ràng.
-  - **Chưa xong (`blocked`, cấm fake)**: port query DAL (`rusqlite::Connection`
-    dùng trực tiếp khắp `app`/`admin`/`worker`/`gc`), lease atomic Postgres
-    (`SELECT ... FOR UPDATE SKIP LOCKED`), pool + retry, migrate dữ liệu
-    SQLite→Postgres, conformance + crash-injection lại trên Postgres.
-- Không bao giờ lặng lẽ fallback Postgres→SQLite: sai backend là lỗi khởi động.
+- Cả hai backend dùng chung:
+  - Schema parity 15 bảng (SQLite migrations 0001→0004 & Postgres DDL).
+  - Transaction wrapper `Tx<'a>` tương thích cả SQLite và Postgres (`Box<Transaction<Postgres>>`).
+  - Phân trang ListObjects / ListObjectVersions động theo prefix & delimiter.
+  - Lease job atomic cho worker và GC WORM retention guard.
+- Quy tắc kiểm thử: Toàn bộ test suite (unit tests, 20 integration tests, 10 crash points, 25k simulation)
+  đều chạy thông qua async DAL `Db`.
 
 ## 3. Quy tắc an toàn áp dụng
 
@@ -34,12 +33,3 @@ Vận hành có nhu cầu chọn 1 trong 2 backend: `sqlite` hoặc `postgres`.
   `postgres` bắt buộc scheme `postgres://`/`postgresql://`.
 - Đổi backend cần restart + migrate dữ liệu thủ công (không tự migrate).
 
-## 4. Bước tiếp theo (khi làm runtime Postgres)
-
-1. Trait repository trừu tượng trên `db.rs` (mỗi query có 2 implementation).
-2. Lease Postgres bằng `FOR UPDATE SKIP LOCKED` + kiểm chứng no-double-upload
-   tương đương `worker_reclaims_expired_uploading_lease`.
-3. Tool `telecrate db migrate --to postgres` (dump SQLite → COPY vào Postgres,
-   verify count + checksum mẫu).
-4. Chạy lại full suite (unit/integration/conformance/crash-injection) với Postgres,
-   rồi mới chuyển matrix sang `implemented-and-tested`.

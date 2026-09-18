@@ -16,14 +16,14 @@ async fn spawn_test_app() -> (String, Config, tempfile::TempDir) {
 
     std::fs::create_dir_all(&spool_dir).unwrap();
 
-    let mut conn = telecrate::db::open(&db_path).unwrap();
-    telecrate::db::apply_all_migrations(&mut conn).unwrap();
-
     let config = Config {
         db_path,
         spool_dir,
         db_backend: "sqlite".to_string(),
         database_url: None,
+        tls_enabled: false,
+        tls_cert_file: None,
+        tls_key_file: None,
         listen_port: 0,
         encryption: "off".to_string(),
         access_keys: Vec::new(),
@@ -40,8 +40,12 @@ async fn spawn_test_app() -> (String, Config, tempfile::TempDir) {
         log_retention_days: 7,
     };
 
+    let db = telecrate::db::Db::open_sqlite(&config.db_path)
+        .await
+        .unwrap();
+    telecrate::db::apply_all_migrations(&db).await.unwrap();
     let keys = KeyStore::load(&[]).unwrap();
-    let router = telecrate::app::router(config.clone(), None, keys);
+    let router = telecrate::app::router(config.clone(), db, None, keys);
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -535,4 +539,115 @@ async fn test_admin_config_batch_update_atomic() {
         .await
         .unwrap();
     assert_eq!(res_one.status(), 200);
+}
+
+#[tokio::test]
+async fn test_admin_tls_status_and_generate() {
+    let (url, _cfg, dir) = spawn_test_app().await;
+    let client = reqwest::Client::new();
+
+    let res_login = client
+        .post(format!("{}/admin/api/login", url))
+        .json(&serde_json::json!({ "password": "test-admin-secret" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_login.status(), 200);
+    let cookie = res_login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let login_json: serde_json::Value = res_login.json().await.unwrap();
+    let csrf = login_json["csrf_token"].as_str().unwrap().to_string();
+
+    // 1. Status khi chưa có cert: enabled=false, chưa present.
+    let res_st = client
+        .get(format!("{}/admin/api/tls/status", url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_st.status(), 200);
+    let st: serde_json::Value = res_st.json().await.unwrap();
+    assert_eq!(st["tls"]["enabled"], false);
+    assert_eq!(st["tls"]["cert_present"], false);
+
+    // 2. Generate self-signed vào thư mục tạm.
+    let cert_path = dir.path().join("tls.crt").to_str().unwrap().to_string();
+    let key_path = dir.path().join("tls.key").to_str().unwrap().to_string();
+    let res_gen = client
+        .post(format!("{}/admin/api/tls/generate", url))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&serde_json::json!({
+            "cn": "telecrate.local",
+            "sans": "telecrate.local,192.168.1.10",
+            "days": 90,
+            "cert_path": cert_path,
+            "key_path": key_path,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_gen.status(), 200);
+    let gen: serde_json::Value = res_gen.json().await.unwrap();
+    assert_eq!(gen["ok"], true);
+    let fp = gen["fingerprint"].as_str().unwrap();
+    assert_eq!(fp.len(), 32 * 2 + 31); // AA:BB:... PBS style
+    assert!(std::path::Path::new(&cert_path).is_file());
+    assert!(std::path::Path::new(&key_path).is_file());
+
+    // 3. Gắn cert/key vào config (flow dashboard: sinh → Lưu), rồi status đọc được.
+    let cfg_path = dir
+        .path()
+        .join("telecrate.toml")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let res_cfg = client
+        .post(format!("{}/admin/api/config", url))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&serde_json::json!({
+            "updates": {
+                "tls_cert_file": cert_path,
+                "tls_key_file": key_path,
+                "listen_port": "17071"
+            },
+            "config_path": cfg_path,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_cfg.status(), 200);
+    let res_st2 = client
+        .get(format!("{}/admin/api/tls/status", url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let st2: serde_json::Value = res_st2.json().await.unwrap();
+    assert_eq!(st2["tls"]["cert_present"], true);
+    assert_eq!(st2["tls"]["fingerprint"], fp);
+    assert!(st2["tls"]["subject"]
+        .as_str()
+        .unwrap()
+        .contains("telecrate.local"));
+
+    // 4. Generate thiếu CN → 400.
+    let res_bad = client
+        .post(format!("{}/admin/api/tls/generate", url))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&serde_json::json!({ "cn": "" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_bad.status(), 400);
 }

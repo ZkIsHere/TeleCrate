@@ -69,6 +69,7 @@
 - **7.5: `implemented-and-tested` (2026-09-16)** — Final Code Quality & Project Completion Pass (`cargo fmt`, `clippy -D warnings`, full test suite pass). Chính thức hoàn thành Milestone M7 và hoàn thiện toàn bộ dự án TeleCrate v0.1.0!
 - **Postgres backend (ADR 0005, 2026-09-18): `partial`** — Chọn backend `sqlite`/`postgres` qua TOML/CLI/dashboard + validate fail-closed + redaction `database_url`; schema DDL Postgres (`migrations/postgres/0001_0004_schema.sql`, `telecrate db pg-schema`) tương đương SQLite 0001→0004 có test parity. Runtime query DAL vẫn SQLite-only nên `serve/init/doctor` từ chối `postgres` rõ ràng (`blocked`), cấm fallback lén.
 - **v0.3.0 (2026-09-18): `implemented-and-tested`** — Cấu hình vị trí spool (dashboard fieldset Lưu trữ + wizard `install.sh` mục 6 + `TELECRATE_SPOOL_DIR`); Admin API batch nguyên tử (`updates`) cho đổi backend; sửa lỗi parse tag release JSON 1 dòng + retry curl + pin `TELECRATE_VERSION`. Không migration SQLite mới; nâng cấp 0.2.0→0.3.0 chỉ thay binary.
+- **TLS native (chưa release, `implemented-and-tested` local)** — Serve HTTPS mặc định, chưa có cert/key thì tự sinh self-signed lúc khởi động; PEM tay + fail-closed; tự sinh ECDSA + fingerprint SHA-256 cho PBS (`POST /admin/api/tls/generate`, key 0600); fieldset TLS/HTTPS + trạng thái xem bất cứ lúc nào; tab **Kết nối** (endpoint/port/keys/preset PBS/AWS CLI/rclone + nút chép). E2E HTTPS 200 + từ chối plain-HTTP đã kiểm chứng.
 
 Không dừng ở demo upload/download rồi tuyên bố xong. Mỗi milestone chỉ sang tiếp khi required checks của SHA đó xanh.
 

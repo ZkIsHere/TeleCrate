@@ -5,6 +5,10 @@ spool_dir = "/var/lib/telecrate/spool"
 db_backend = "sqlite"
 # Chỉ dùng khi db_backend = "postgres". Chứa password — giữ file 0600, không commit thật.
 # database_url = "postgresql://telecrate:mat-khau-that@127.0.0.1:5432/telecrate"
+# HTTPS native (PBS S3 bắt buộc HTTPS): bật cần cert+key tuyệt đối + restart daemon.
+tls_enabled = false
+# tls_cert_file = "/var/lib/telecrate/tls.crt"
+# tls_key_file = "/var/lib/telecrate/tls.key"
 listen_port = 7070
 # Mã hóa nội dung OPTIONAL: "off" | "on". Chỉ áp dụng ghi mới; dữ liệu cũ giữ chế độ cũ.
 # "off" nghĩa là nội dung có thể đọc được tại nơi lưu nếu nguồn chưa mã hóa.

@@ -146,9 +146,6 @@ fn live_config(dir: &tempfile::TempDir, token: &str, chat: i64) -> Config {
 
 fn run_e2e(cfg: Config, token: &str, chat: i64, payload_len: u32, label: &str) {
     std::fs::create_dir_all(&cfg.spool_dir).unwrap();
-    let mut conn = telecrate::db::open(&cfg.db_path).unwrap();
-    telecrate::db::apply_all_migrations(&mut conn).unwrap();
-    drop(conn);
 
     // Server HTTP — router dựng NGOÀI async context (transport blocking).
     let transport = telecrate::app::build_transport(&cfg);
@@ -160,8 +157,10 @@ fn run_e2e(cfg: Config, token: &str, chat: i64, payload_len: u32, label: &str) {
             .enable_all()
             .build()
             .unwrap();
-        let app = telecrate::app::router(cfg2, transport, keys);
         rt.block_on(async move {
+            let db = telecrate::db::Db::open_sqlite(&cfg2.db_path).await.unwrap();
+            telecrate::db::apply_all_migrations(&db).await.unwrap();
+            let app = telecrate::app::router(cfg2, db, transport, keys);
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             tx.send(l.local_addr().unwrap().port()).unwrap();
             axum::serve(l, app).await.unwrap();
@@ -184,9 +183,16 @@ fn run_e2e(cfg: Config, token: &str, chat: i64, payload_len: u32, label: &str) {
     let shutdown = Arc::new(AtomicBool::new(false));
     let sd = shutdown.clone();
     let dbp = cfg.db_path.clone();
+    let worker_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let db_worker = worker_rt
+        .block_on(telecrate::db::Db::open_sqlite(&dbp))
+        .unwrap();
     thread::spawn(move || {
         telecrate::worker::run_loop(
-            &dbp,
+            db_worker,
             &transport,
             chat,
             "live-e2e".to_string(),
@@ -210,10 +216,20 @@ fn run_e2e(cfg: Config, token: &str, chat: i64, payload_len: u32, label: &str) {
 
     // Chờ worker commit remote (timeout 120s).
     let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let check_rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let check_db = check_rt
+        .block_on(telecrate::db::Db::open_sqlite(&cfg.db_path))
+        .unwrap();
     loop {
-        let conn = telecrate::db::open(&cfg.db_path).unwrap();
-        let st: String = conn
-            .query_row("SELECT state FROM upload_jobs LIMIT 1", [], |r| r.get(0))
+        let st: String = check_rt
+            .block_on(telecrate::db::query_scalar_string(
+                &check_db,
+                "SELECT state FROM upload_jobs LIMIT 1",
+                &[],
+            ))
             .unwrap();
         if st == "done" || st == "failed" {
             assert_eq!(st, "done", "worker failed — xem last_error trong DB");

@@ -75,10 +75,18 @@
 
 | Backend | Trạng thái | Ghi chú |
 |---|---|---|
-| SQLite (WAL, `rusqlite` bundled) | implemented-and-tested | Backend runnable duy nhất; `db_backend="sqlite"` (mặc định) |
+| SQLite (WAL, `sqlx-sqlite`) | implemented-and-tested | Dual-backend async pool; `db_backend="sqlite"` (mặc định) |
 | Postgres — chọn backend + validate | implemented-and-tested | `db_backend="postgres"` + `database_url` qua TOML/CLI/dashboard, validate fail-closed, secret redaction |
 | Postgres — schema DDL | implemented-and-tested | `migrations/postgres/0001_0004_schema.sql` (tương đương SQLite 0001→0004), `telecrate db pg-schema`, test parity 15 bảng |
-| Postgres — runtime query DAL | blocked | DAL hiện `rusqlite::Connection` trực tiếp; `serve/init/doctor` từ chối `postgres` rõ ràng thay vì fallback lén. Bước tiếp: trait repository, lease `FOR UPDATE SKIP LOCKED`, tool migrate dữ liệu, chạy lại full suite |
+| Postgres — runtime query DAL | implemented-and-tested | DAL async `telecrate::db::Db` (`sqlx`), hỗ trợ song song SQLite và Postgres, bind params & dynamic pagination, transaction `Tx`, đầy đủ CRUD/Object/Multipart/Lock/Lease, 109 tests passed |
+
+## Transport bảo mật (TLS native)
+
+| Capability | Trạng thái | Ghi chú |
+|---|---|---|
+| Serve HTTPS (rustls/ring, thuần Rust) | implemented-and-tested | `tls_enabled` + PEM cert/key, cùng `listen_port`; e2e HTTPS 200 + từ chối plain-HTTP |
+| Self-signed gen + fingerprint SHA-256 | implemented-and-tested | ECDSA P-256, SAN IP/DNS, key 0600; fingerprint `AA:BB:...` cho client S3 bắt HTTPS (PBS) |
+| Trạng thái + cấu hình trên dashboard | implemented-and-tested | `GET /admin/api/tls/status`, `POST /admin/api/tls/generate`, fieldset TLS/HTTPS |
 
 ## Nâng cao (website, access points, batch, IAM/STS/SNS/SQS/Lambda, Glacier)
 
