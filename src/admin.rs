@@ -1072,9 +1072,23 @@ pub async fn api_get_audit_logs(
 
 #[derive(Deserialize)]
 pub struct ConfigUpdatePayload {
+    #[serde(default)]
     pub key: String,
+    #[serde(default)]
     pub value: String,
     pub config_path: Option<String>,
+    /// Batch nguyên tử {key: value}: apply hết rồi validate + lưu 1 lần.
+    /// Bắt buộc cho đổi db_backend (backend+URL cùng lúc; từng key riêng lẻ
+    /// kẹt ở trạng thái trung gian không hợp lệ). Vắng mặt = legacy đơn key.
+    pub updates: Option<std::collections::HashMap<String, String>>,
+}
+
+/// Key chứa secret — value không bao giờ vào audit/log.
+fn is_sensitive_config_key(key: &str) -> bool {
+    key.contains("secret")
+        || key.contains("password")
+        || key.contains("token")
+        || key.contains("database_url")
 }
 
 /// `GET /admin/api/config`
@@ -1095,6 +1109,10 @@ pub async fn api_get_config(
         if obj.contains_key("admin_password") {
             obj.insert("admin_password".to_string(), json!("[REDACTED]"));
         }
+        // database_url chứa password Postgres — redact như secret.
+        if obj.contains_key("database_url") {
+            obj.insert("database_url".to_string(), json!("[REDACTED]"));
+        }
     }
 
     Json(json!({ "ok": true, "config": cfg_val })).into_response()
@@ -1110,10 +1128,70 @@ pub async fn api_update_config(
         return err_resp.into_response();
     }
 
+    let mut config = config_lock.write().unwrap_or_else(|e| e.into_inner());
+
+    let save_path = payload
+        .config_path
+        .clone()
+        .unwrap_or_else(|| "/etc/telecrate/telecrate.toml".to_string());
+
+    // Nhánh batch nguyên tử (ưu tiên khi có updates).
+    if let Some(map) = payload.updates.as_ref().filter(|m| !m.is_empty()) {
+        let mut staged = config.clone();
+        for (k, v) in map {
+            if let Err(e) = staged.apply_key(k.trim(), v.trim()) {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "ok": false, "error": e })),
+                )
+                    .into_response();
+            }
+        }
+        if let Err(e) = telecrate::config::validate(&staged) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "ok": false, "error": e })),
+            )
+                .into_response();
+        }
+        *config = staged;
+        if let Err(e) = config.save_to_file(&save_path) {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "ok": false, "error": format!("Lưu file config thất bại: {e}") })),
+            )
+                .into_response();
+        }
+        let mut keys: Vec<&String> = map.keys().collect();
+        keys.sort();
+        let sensitive = keys.iter().any(|k| is_sensitive_config_key(k));
+        store.audit(
+            AuditLevel::Warn,
+            "admin",
+            "config.update_batch",
+            format!(
+                "keys='{}' value='{}'",
+                keys.iter()
+                    .map(|k| k.as_str())
+                    .collect::<Vec<_>>()
+                    .join(","),
+                if sensitive {
+                    "[REDACTED]"
+                } else {
+                    "(batch values)"
+                },
+            ),
+        );
+        return Json(json!({
+            "ok": true,
+            "message": format!("Đã cập nhật {} keys thành công", keys.len()),
+            "keys": keys,
+        }))
+        .into_response();
+    }
+
     let key = payload.key.trim();
     let val = payload.value.trim();
-
-    let mut config = config_lock.write().unwrap_or_else(|e| e.into_inner());
 
     if let Err(e) = config.update_key(key, val) {
         return (
@@ -1122,10 +1200,6 @@ pub async fn api_update_config(
         )
             .into_response();
     }
-
-    let save_path = payload
-        .config_path
-        .unwrap_or_else(|| "/etc/telecrate/telecrate.toml".to_string());
 
     if let Err(e) = config.save_to_file(&save_path) {
         return (
@@ -1141,7 +1215,7 @@ pub async fn api_update_config(
         "config.update",
         format!(
             "key='{key}' value='{}'",
-            if key.contains("secret") || key.contains("password") || key.contains("token") {
+            if is_sensitive_config_key(key) {
                 "[REDACTED]"
             } else {
                 val

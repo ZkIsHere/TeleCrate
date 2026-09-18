@@ -1,6 +1,8 @@
 # Data model TeleCrate (SQLite WAL)
 
 > Forward-only migrations tại `migrations/NNNN_*.sql`. Không sửa migration đã release.
+> Backend Postgres (`db_backend="postgres"`): schema tương đương tại
+> `migrations/postgres/0001_0004_schema.sql` (partial — runtime blocked, xem ADR 0005).
 
 ## Bảng chính (đối chiếu `migrations/0001_init.sql` — cập nhật 2026-09-15)
 

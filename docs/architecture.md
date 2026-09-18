@@ -35,6 +35,9 @@ GET/HEAD/LIST sau ghi thành công phải thấy ngay version vừa ghi, kể c�
 - **CLI vs daemon**: mục tiêu CLI gọi admin API khi daemon chạy. HIỆN TẠI `init/doctor/migrations`
   mở DB trực tiếp và chưa có pid lock — `partial`, khóa single-daemon + pid lock làm ở M2 cùng worker.
 - **SQLite (WAL)**: index bucket/object/version/chunk/jobs/multipart/policies/retention/migrations/checkpoints. Xem `data-model.md`.
+  Backend runnable duy nhất (`db_backend="sqlite"`). Postgres ở `partial` (chọn backend + schema DDL
+  `migrations/postgres/0001_0004_schema.sql` xong, query DAL `blocked` — xem ADR 0005 và
+  compatibility matrix); daemon từ chối khởi động khi `db_backend='postgres'` thay vì fallback lén.
   Migration `0001_init` đã có (M0); các bảng còn lại thêm dần theo milestone. Backup nhất quán
   (`VACUUM INTO` / copy sau checkpoint) là `planned` (M5) — hiện `migrations apply` chỉ copy file DB làm backup.
 - **spool filesystem**: thư mục data riêng, file chunk đặt tên theo content-hash/job-id, KHÔNG dùng object key trực tiếp làm path (chặn path traversal). Quota + high/low watermark + reserved free space. Không LRU cho pending data.

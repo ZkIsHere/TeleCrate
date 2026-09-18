@@ -22,6 +22,8 @@ async fn spawn_test_app() -> (String, Config, tempfile::TempDir) {
     let config = Config {
         db_path,
         spool_dir,
+        db_backend: "sqlite".to_string(),
+        database_url: None,
         listen_port: 0,
         encryption: "off".to_string(),
         access_keys: Vec::new(),
@@ -432,4 +434,105 @@ async fn test_admin_enhanced_api_features() {
         .await
         .unwrap();
     assert!(res_tg.status() == 200 || res_tg.status() == 502);
+}
+
+#[tokio::test]
+async fn test_admin_config_batch_update_atomic() {
+    let (url, _cfg, dir) = spawn_test_app().await;
+    let client = reqwest::Client::new();
+
+    // Login lấy session + CSRF.
+    let res_login = client
+        .post(format!("{}/admin/api/login", url))
+        .json(&serde_json::json!({ "password": "test-admin-secret" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_login.status(), 200);
+    let cookie = res_login
+        .headers()
+        .get("set-cookie")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
+    let login_json: serde_json::Value = res_login.json().await.unwrap();
+    let csrf = login_json["csrf_token"].as_str().unwrap().to_string();
+    let cfg_path = dir
+        .path()
+        .join("telecrate.toml")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    // 1. Batch hợp lệ: sqlite → postgres + URL cùng lúc (từng key riêng lẻ sẽ kẹt).
+    // (Kèm listen_port vì fixture test bind port 0.)
+    let res_batch = client
+        .post(format!("{}/admin/api/config", url))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&serde_json::json!({
+            "updates": {
+                "db_backend": "postgres",
+                "database_url": "postgresql://u:p@127.0.0.1:5432/tc",
+                "listen_port": "17070"
+            },
+            "config_path": cfg_path,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_batch.status(), 200);
+
+    // 2. GET xác nhận backend đổi + URL bị redact.
+    let res_get = client
+        .get(format!("{}/admin/api/config", url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_get.status(), 200);
+    let got: serde_json::Value = res_get.json().await.unwrap();
+    assert_eq!(got["config"]["db_backend"], "postgres");
+    assert_eq!(got["config"]["database_url"], "[REDACTED]");
+
+    // 3. Batch không hợp lệ (về sqlite nhưng giữ URL) → 400, state giữ nguyên.
+    let res_bad = client
+        .post(format!("{}/admin/api/config", url))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&serde_json::json!({
+            "updates": { "db_backend": "sqlite" },
+            "config_path": cfg_path,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_bad.status(), 400);
+    let res_get2 = client
+        .get(format!("{}/admin/api/config", url))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    let got2: serde_json::Value = res_get2.json().await.unwrap();
+    assert_eq!(got2["config"]["db_backend"], "postgres");
+
+    // 4. Legacy đơn key vẫn tương thích.
+    let res_one = client
+        .post(format!("{}/admin/api/config", url))
+        .header("cookie", &cookie)
+        .header("x-csrf-token", &csrf)
+        .json(&serde_json::json!({
+            "key": "worker_concurrency",
+            "value": "3",
+            "config_path": cfg_path,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res_one.status(), 200);
 }

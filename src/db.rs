@@ -23,6 +23,52 @@ pub fn open(db_path: &str) -> Result<Connection, String> {
     Ok(conn)
 }
 
+/// Backend metadata DB (ADR 0005). SQLite = runnable duy nhất;
+/// Postgres = `partial` (chọn backend + schema DDL xong, query DAL blocked).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbBackend {
+    Sqlite,
+    Postgres,
+}
+
+impl DbBackend {
+    pub fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "sqlite" => Ok(Self::Sqlite),
+            "postgres" => Ok(Self::Postgres),
+            _ => Err(format!(
+                "unknown db backend: '{s}' (expected 'sqlite' or 'postgres')"
+            )),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Sqlite => "sqlite",
+            Self::Postgres => "postgres",
+        }
+    }
+}
+
+/// Guard fail-closed cho Init/Serve/Doctor: SQLite → Ok (luồng cũ tiếp tục).
+/// Postgres → Err rõ ràng, KHÔNG bao giờ lặng lẽ dùng SQLite thay thế.
+pub fn ensure_backend_supported(backend: DbBackend) -> Result<(), String> {
+    match backend {
+        DbBackend::Sqlite => Ok(()),
+        DbBackend::Postgres => Err(
+            "db_backend='postgres' chưa runnable: schema DDL + chọn backend đã xong (partial, ADR 0005), \
+             nhưng query DAL vẫn SQLite-only (blocked). Lấy DDL bằng `telecrate db pg-schema` để DBA tạo schema, \
+             và giữ db_backend='sqlite' để chạy production."
+                .to_string(),
+        ),
+    }
+}
+
+/// DDL Postgres đầy đủ, tương đương migrations SQLite 0001→0004, lưu tại
+/// `migrations/postgres/0001_0004_schema.sql` (cùng quy ước file SQL như SQLite).
+/// Dùng cho DBA tạo schema trước (`telecrate db pg-schema`); runtime query port là bước sau (ADR 0005).
+pub const POSTGRES_SCHEMA: &str = include_str!("../migrations/postgres/0001_0004_schema.sql");
+
 /// Lấy version migration hiện tại (0 nếu chưa có bảng).
 pub fn schema_version(conn: &Connection) -> Result<i64, String> {
     let v: i64 = conn
@@ -1858,6 +1904,60 @@ mod tests {
         assert_eq!(schema_version(&conn).unwrap(), 2);
         apply_migration(&mut conn, 3, MIGRATION_003).unwrap();
         assert_eq!(schema_version(&conn).unwrap(), 3);
+    }
+
+    #[test]
+    fn backend_parse_and_guard() {
+        assert_eq!(DbBackend::parse("sqlite").unwrap(), DbBackend::Sqlite);
+        assert_eq!(DbBackend::parse("postgres").unwrap(), DbBackend::Postgres);
+        assert!(DbBackend::parse("mysql").is_err());
+        assert!(ensure_backend_supported(DbBackend::Sqlite).is_ok());
+        // Postgres fail-closed: không lặng lẽ chạy SQLite thay thế.
+        let err = ensure_backend_supported(DbBackend::Postgres).unwrap_err();
+        assert!(err.contains("postgres"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn postgres_schema_covers_all_sqlite_tables_without_sqlite_dialect() {
+        let ddl = POSTGRES_SCHEMA;
+        for table in [
+            "schema_version",
+            "buckets",
+            "objects",
+            "chunks",
+            "upload_jobs",
+            "recovery_checkpoints",
+            "kv",
+            "multipart_uploads",
+            "multipart_parts",
+            "access_keys",
+            "bucket_policies",
+            "bucket_cors",
+            "bucket_bpa",
+            "bucket_lock_configs",
+            "object_locks",
+        ] {
+            assert!(
+                ddl.contains(&format!("CREATE TABLE IF NOT EXISTS {table}(")),
+                "missing table {table}"
+            );
+        }
+        // Không lẫn dialect SQLite.
+        for sqliteism in ["AUTOINCREMENT", "datetime(", "PRAGMA", "VACUUM"] {
+            assert!(
+                !ddl.contains(sqliteism),
+                "postgres DDL must not contain {sqliteism}"
+            );
+        }
+        // Cột bổ sung từ migration 0002/0004 phải có mặt.
+        for col in [
+            "user_metadata_json",
+            "system_metadata_json",
+            "last_used_at",
+            "allowed_buckets",
+        ] {
+            assert!(ddl.contains(col), "missing column {col}");
+        }
     }
 
     #[test]

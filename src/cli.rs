@@ -207,7 +207,17 @@ pub async fn run_config_set_cli(config_path: &str, key: &str, val: &str) -> Resu
         println!("--> Daemon dừng: Cập nhật config trực tiếp file TOML...");
         cfg.update_key(key, val)?;
         cfg.save_to_file(config_path)?;
-        println!("✅ Đã cập nhật '{key}' = '{val}' và lưu vào {config_path}!");
+        // Không in secret/URL chứa password ra stdout.
+        let shown = if key.contains("secret")
+            || key.contains("password")
+            || key.contains("token")
+            || key.contains("database_url")
+        {
+            "[REDACTED]"
+        } else {
+            val
+        };
+        println!("✅ Đã cập nhật '{key}' = '{shown}' và lưu vào {config_path}!");
         Ok(())
     }
 }

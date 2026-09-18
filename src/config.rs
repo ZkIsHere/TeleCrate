@@ -26,6 +26,14 @@ pub struct Config {
     pub db_path: String,
     /// Thư mục spool. Thay đổi cần restart.
     pub spool_dir: String,
+    /// Backend metadata DB: "sqlite" (default, duy nhất runnable) | "postgres"
+    /// (partial — xem ADR 0005). Thay đổi cần restart + migrate dữ liệu thủ công.
+    #[serde(default = "default_db_backend")]
+    pub db_backend: String,
+    /// Connection string Postgres, chỉ dùng khi db_backend="postgres".
+    /// Chứa password — redact mọi nơi như bot token. None = không dùng.
+    #[serde(default)]
+    pub database_url: Option<String>,
     /// Port HTTP S3 + admin + dashboard. Thay đổi cần restart.
     pub listen_port: u16,
     /// Mã hóa nội dung: "off" | "on". Chỉ áp dụng ghi mới; dữ liệu cũ giữ chế độ cũ.
@@ -79,6 +87,10 @@ fn default_chunk_size() -> usize {
     8 * 1024 * 1024
 }
 
+fn default_db_backend() -> String {
+    "sqlite".to_string()
+}
+
 fn default_worker_concurrency() -> usize {
     2
 }
@@ -107,6 +119,8 @@ impl fmt::Debug for Config {
         f.debug_struct("Config")
             .field("db_path", &self.db_path)
             .field("spool_dir", &self.spool_dir)
+            .field("db_backend", &self.db_backend)
+            .field("database_url", &self.database_url.as_ref().map(|_| "***"))
             .field("listen_port", &self.listen_port)
             .field("encryption", &self.encryption)
             .field("access_keys", &self.access_keys)
@@ -130,6 +144,8 @@ impl Default for Config {
         Self {
             db_path: "/var/lib/telecrate/index.db".to_string(),
             spool_dir: "/var/lib/telecrate/spool".to_string(),
+            db_backend: default_db_backend(),
+            database_url: None,
             listen_port: 7070,
             encryption: "off".to_string(),
             access_keys: Vec::new(),
@@ -151,6 +167,15 @@ impl Default for Config {
 impl Config {
     /// Cập nhật giá trị cấu hình theo key string từ CLI hoặc Admin API.
     pub fn update_key(&mut self, key: &str, val: &str) -> Result<(), String> {
+        self.apply_key(key, val)?;
+        validate(self)?;
+        Ok(())
+    }
+
+    /// Gán field theo key mà KHÔNG validate — dùng cho batch apply nhiều key
+    /// rồi validate 1 lần (đổi db_backend cần backend+URL cùng lúc; validate
+    /// từng key riêng lẻ sẽ kẹt ở trạng thái trung gian không hợp lệ).
+    pub fn apply_key(&mut self, key: &str, val: &str) -> Result<(), String> {
         match key {
             "listen_port" => {
                 self.listen_port = val
@@ -194,9 +219,21 @@ impl Config {
             "spool_dir" => {
                 self.spool_dir = val.to_string();
             }
+            "db_backend" => {
+                if val != "sqlite" && val != "postgres" {
+                    return Err("db_backend must be 'sqlite' or 'postgres'".to_string());
+                }
+                self.db_backend = val.to_string();
+            }
+            "database_url" => {
+                self.database_url = if val.is_empty() {
+                    None
+                } else {
+                    Some(val.to_string())
+                };
+            }
             _ => return Err(format!("unknown config key: '{key}'")),
         }
-        validate(self)?;
         Ok(())
     }
 
@@ -249,6 +286,48 @@ pub fn validate(cfg: &Config) -> Result<(), String> {
     }
     if cfg.db_path.is_empty() || cfg.spool_dir.is_empty() {
         return Err("db_path/spool_dir must not be empty".to_string());
+    }
+    // Spool/DB/log là đường dẫn local daemon ghi trực tiếp: bắt buộc absolute,
+    // cấm `..` để chặn traversal/confusion. Đổi spool_dir chỉ có hiệu lực sau restart
+    // (S3 foreground clone config lúc startup, worker đọc lock động) nên dashboard
+    // đánh dấu ⟳ restart; file spool pending cũ không tự migrate.
+    // Note: chấp nhận cả Unix-absolute (`/...`) khi chạy test trên Windows
+    // (production là Linux native; `Path::is_absolute` trên Windows từ chối `/...`).
+    for (name, p) in [
+        ("db_path", cfg.db_path.as_str()),
+        ("spool_dir", cfg.spool_dir.as_str()),
+        ("log_dir", cfg.log_dir.as_str()),
+    ] {
+        let path = std::path::Path::new(p);
+        if !(path.is_absolute() || p.starts_with('/')) {
+            return Err(format!("{name} must be an absolute path"));
+        }
+        if path
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(format!("{name} must not contain '..'"));
+        }
+    }
+    // Backend DB (ADR 0005): sqlite = runnable duy nhất; postgres = partial
+    // (chọn + schema xong, query port blocked). sqlite cấm database_url để
+    // tránh secret mồ côi trong file config gây hiểu nhầm.
+    match cfg.db_backend.as_str() {
+        "sqlite" => {
+            if cfg.database_url.as_ref().is_some_and(|u| !u.is_empty()) {
+                return Err("database_url must be empty when db_backend='sqlite'".to_string());
+            }
+        }
+        "postgres" => match cfg.database_url.as_deref() {
+            Some(u) if u.starts_with("postgres://") || u.starts_with("postgresql://") => {}
+            _ => {
+                return Err(
+                    "db_backend='postgres' requires database_url starting with 'postgres://' or 'postgresql://'"
+                        .to_string(),
+                );
+            }
+        },
+        _ => return Err("db_backend must be 'sqlite' or 'postgres'".to_string()),
     }
     if cfg.encryption != "off" && cfg.encryption != "on" {
         return Err("encryption must be 'off' or 'on'".to_string());
@@ -387,6 +466,92 @@ mod tests {
         validate(&cfg).unwrap();
         assert_eq!(cfg.log_level, "info");
         assert!(!cfg.log_to_file);
+    }
+
+    #[test]
+    fn db_backend_selection_validates() {
+        // Mặc định sqlite, không URL.
+        assert!(validate(&Config::default()).is_ok());
+        // Backend lạ (literal vì update_key từ chối ngay).
+        let c = Config {
+            db_backend: "mysql".to_string(),
+            ..Config::default()
+        };
+        assert!(validate(&c).is_err());
+        assert!(Config::default().update_key("db_backend", "mysql").is_err());
+        // sqlite + URL mồ côi → lỗi.
+        let c = Config {
+            database_url: Some("postgresql://u:p@h:5432/db".to_string()),
+            ..Config::default()
+        };
+        assert!(validate(&c).is_err());
+        // postgres thiếu URL / sai scheme → lỗi.
+        let c = Config {
+            db_backend: "postgres".to_string(),
+            ..Config::default()
+        };
+        assert!(validate(&c).is_err());
+        let c = Config {
+            db_backend: "postgres".to_string(),
+            database_url: Some("mysql://h/db".to_string()),
+            ..Config::default()
+        };
+        assert!(validate(&c).is_err());
+        // postgres + URL đúng → qua validate config (runtime vẫn blocked — ADR 0005).
+        let mut c = Config {
+            db_backend: "postgres".to_string(),
+            database_url: Some("postgresql://u:p@h:5432/db".to_string()),
+            ..Config::default()
+        };
+        assert!(validate(&c).is_ok());
+        // Xóa URL bằng chuỗi rỗng qua update_key khi đã về sqlite.
+        c.apply_key("database_url", "").unwrap();
+        c.apply_key("db_backend", "sqlite").unwrap();
+        assert!(validate(&c).is_ok());
+        assert!(c.database_url.is_none());
+        // Debug không lộ URL.
+        c.apply_key("database_url", "postgresql://u:s3cret@h/db")
+            .unwrap();
+        let dbg = format!("{c:?}");
+        assert!(!dbg.contains("s3cret"), "url leaked: {dbg}");
+    }
+
+    #[test]
+    fn db_backend_switch_needs_atomic_batch() {
+        // Đổi sqlite→postgres phải apply backend+URL rồi validate 1 lần:
+        // update_key từng key riêng lẻ kẹt ở trạng thái trung gian.
+        let mut staged = Config::default();
+        assert!(staged.update_key("db_backend", "postgres").is_err());
+        staged.apply_key("db_backend", "postgres").unwrap();
+        staged
+            .apply_key("database_url", "postgresql://u:p@h:5432/db")
+            .unwrap();
+        assert!(validate(&staged).is_ok());
+        // Chiều ngược lại: xóa URL rồi về sqlite, validate 1 lần.
+        staged.apply_key("database_url", "").unwrap();
+        staged.apply_key("db_backend", "sqlite").unwrap();
+        assert!(validate(&staged).is_ok());
+        // Unknown key vẫn lỗi ngay ở apply.
+        assert!(staged.apply_key("nope", "x").is_err());
+    }
+
+    #[test]
+    fn storage_paths_must_be_absolute_without_dotdot() {
+        let rel = Config {
+            spool_dir: "var/lib/telecrate/spool".to_string(),
+            ..Config::default()
+        };
+        assert!(validate(&rel).is_err());
+        let dotdot = Config {
+            spool_dir: "/var/lib/telecrate/../etc".to_string(),
+            ..Config::default()
+        };
+        assert!(validate(&dotdot).is_err());
+        let ok = Config {
+            spool_dir: "/mnt/data/telecrate-spool".to_string(),
+            ..Config::default()
+        };
+        assert!(validate(&ok).is_ok());
     }
 
     #[test]

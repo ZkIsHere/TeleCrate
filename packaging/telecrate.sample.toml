@@ -3,6 +3,11 @@
 # Đường dẫn lưu trữ cơ sở dữ liệu chỉ mục SQLite (chế độ WAL tự động)
 db_path = "/var/lib/telecrate/index.db"
 
+# Backend metadata DB: "sqlite" (default, duy nhất runnable) | "postgres" (partial — xem ADR 0005).
+db_backend = "sqlite"
+# Chỉ dùng khi db_backend = "postgres" (schema: migrations/postgres/0001_0004_schema.sql).
+# database_url = "postgresql://telecrate:mat-khau-that@127.0.0.1:5432/telecrate"
+
 # Thư mục lưu trữ tạm spool cho các chunk dữ liệu local-first
 spool_dir = "/var/lib/telecrate/spool"
 

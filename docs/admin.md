@@ -21,6 +21,15 @@ Access keys (secret chỉ hiện đúng 1 lần lúc tạo, không render ra b�
   rotation theo ngày; startup tự xóa file quá `log_retention_days` (mặc định 14).
 - Không ghi secret/token/key material ra log (quy tắc AGENTS.md §4).
 
+### Tab Cấu hình (dashboard)
+
+- Fieldset **Lưu trữ**: `spool_dir` (absolute, cấm `..`, ⟳ restart),
+  `db_backend = "sqlite" | "postgres"` (⟳ restart) + `database_url` (password input,
+  chỉ gửi khi nhập mới; về `sqlite` tự xóa URL cũ).
+- Nút Lưu gửi **batch nguyên tử** 1 request `POST /admin/api/config` (`{"updates": {...}}`):
+  đổi backend cần backend+URL cùng lúc. API đơn key (`{"key","value"}`) vẫn tương thích.
+- `database_url` redact ở GET config, audit log và CLI stdout như secret.
+
 ### Audit log
 
 - Ring-buffer in-memory 5000 bản ghi có cấu trúc `{ts, level, actor, action, detail}` (mới nhất trước).

@@ -1,6 +1,10 @@
 # TeleCrate — config mẫu (copy sang /etc/telecrate/telecrate.toml rồi sửa, quyền 0600 vì chứa secrets)
 db_path = "/var/lib/telecrate/index.db"
 spool_dir = "/var/lib/telecrate/spool"
+# Backend metadata DB: "sqlite" (default, duy nhất runnable) | "postgres" (partial — xem ADR 0005).
+db_backend = "sqlite"
+# Chỉ dùng khi db_backend = "postgres". Chứa password — giữ file 0600, không commit thật.
+# database_url = "postgresql://telecrate:mat-khau-that@127.0.0.1:5432/telecrate"
 listen_port = 7070
 # Mã hóa nội dung OPTIONAL: "off" | "on". Chỉ áp dụng ghi mới; dữ liệu cũ giữ chế độ cũ.
 # "off" nghĩa là nội dung có thể đọc được tại nơi lưu nếu nguồn chưa mã hóa.

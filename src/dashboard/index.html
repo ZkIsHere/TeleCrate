@@ -228,6 +228,14 @@
             </div>
           </fieldset>
           <fieldset>
+            <legend>Lưu trữ</legend>
+            <label class="field"><span>Thư mục spool <em class="tag-restart">⟳ restart</em></span><input id="cfg-spool" placeholder="/var/lib/telecrate/spool"></label>
+            <label class="field"><span>DB backend <em class="tag-restart">⟳ restart</em></span>
+              <select id="cfg-dbbackend"><option value="sqlite">sqlite (runnable)</option><option value="postgres">postgres (partial — xem ADR 0005)</option></select>
+            </label>
+            <label class="field"><span>Postgres URL <em>(để trống = giữ nguyên/xóa khi về sqlite)</em></span><input id="cfg-dburl" type="password" autocomplete="new-password" placeholder="postgresql://user:pass@host:5432/telecrate"></label>
+          </fieldset>
+          <fieldset>
             <legend>Logging</legend>
             <label class="field"><span>Mức log</span>
               <select id="cfg-loglevel"><option value="error">error</option><option value="warn">warn</option><option value="info">info</option><option value="debug">debug</option><option value="trace">trace</option></select>

@@ -1,3 +1,57 @@
+# TeleCrate v0.3.0 — Release Notes
+
+Phiên bản **TeleCrate v0.3.0** bổ sung cấu hình vị trí spool (dashboard + installer),
+hỗ trợ chọn backend metadata DB SQLite/Postgres (partial), Admin API batch nguyên tử,
+và sửa lỗi parse tag release trong `install.sh`.
+
+---
+
+## 🌟 Điểm nổi bật trong phiên bản v0.3.0
+
+### 1. Cấu hình vị trí Spool
+* Dashboard tab Cấu hình → fieldset **Lưu trữ**: ô `Thư mục spool` (đánh dấu ⟳ restart),
+  validate absolute + cấm `..` (`src/config.rs`).
+* `install.sh` wizard thêm mục **6. Thư mục spool local** (mặc định `/var/lib/telecrate/spool`,
+  tự động hóa bằng `TELECRATE_SPOOL_DIR=/mnt/data/spool`), tự tạo thư mục + phân quyền `700`.
+
+### 2. Backend metadata DB: SQLite / Postgres (partial — ADR 0005)
+* `db_backend = "sqlite"` (mặc định, runnable duy nhất) | `"postgres"` + `database_url`
+  (redact mọi nơi như bot token). Chọn qua TOML / `telecrate config set` / dashboard.
+* Schema DDL Postgres đầy đủ tương đương SQLite 0001→0004 tại
+  `migrations/postgres/0001_0004_schema.sql`; xem trước bằng `telecrate db pg-schema`.
+* Runtime Postgres còn `blocked`: daemon từ chối khởi động rõ ràng thay vì fallback lén.
+
+### 3. Admin API batch nguyên tử (`POST /admin/api/config` + `updates`)
+* Lưu toàn bộ tab Cấu hình trong 1 request: đổi `db_backend` cần backend+URL cùng lúc,
+  gửi từng key riêng lẻ trước đây kẹt ở trạng thái trung gian. Dashboard đã chuyển sang batch.
+
+### 4. Sửa lỗi `install.sh` parse tag release
+* GitHub API trả JSON 1 dòng làm parser cũ (`grep + cut -f4`) trích nhầm field `url`
+  thành tag → URL download lồng nhau. Parser mới (ưu tiên `jq` → `python3` → `grep -o`),
+  validate tag `vX.Y.Z`, retry curl + hiện lỗi chi tiết, pin version `TELECRATE_VERSION`.
+
+---
+
+## 🔄 Hướng dẫn Nâng cấp từ v0.2.0 lên v0.3.0
+
+Không có migration SQLite mới (schema giữ nguyên) — nâng cấp nhị phân, giữ DB/spool:
+
+```bash
+# 1. Dừng service
+sudo systemctl stop telecrate
+
+# 2. Tải binary v0.3.0 mới nhất và ghi đè
+curl -fsSL https://github.com/ZkIsHere/TeleCrate/releases/download/v0.3.0/telecrate-linux-amd64.tar.gz | sudo tar -xz -C /usr/local/bin/
+
+# 3. Khởi động lại service
+sudo systemctl start telecrate
+
+# 4. Kiểm tra trạng thái hoạt động
+sudo systemctl status telecrate
+```
+
+---
+
 # TeleCrate v0.2.0 — Release Notes
 
 Phiên bản **TeleCrate v0.2.0** mang đến bản nâng cấp toàn diện về giao diện vận hành (Web Dashboard & Admin Console), trải nghiệm duyệt tệp tin chuẩn AWS S3, quản lý khóa truy cập nâng cao, và script cài đặt tự động 1-line (`install.sh`) cho môi trường Linux native.

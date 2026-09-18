@@ -23,6 +23,8 @@ async fn spawn_test_app() -> (String, Config, tempfile::TempDir) {
     let config = Config {
         db_path,
         spool_dir,
+        db_backend: "sqlite".to_string(),
+        database_url: None,
         listen_port: 0,
         encryption: "off".to_string(),
         access_keys: Vec::new(),

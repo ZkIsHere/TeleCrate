@@ -22,15 +22,15 @@ curl -fsSL https://raw.githubusercontent.com/ZkIsHere/TeleCrate/master/install.s
 ```
 
 Script sẽ tự động:
-1. Nhận diện kiến trúc hệ điều hành và tải binary TeleCrate v0.2.0 mới nhất từ GitHub Releases.
+1. Nhận diện kiến trúc hệ điều hành và tải binary TeleCrate v0.3.0 mới nhất từ GitHub Releases.
    - Script tự gọi `https://api.github.com/repos/ZkIsHere/TeleCrate/releases/latest`,
      parse `tag_name` (ưu tiên `jq`, rồi `python3`, rồi `grep -o`), validate tag phải dạng
      `vX.Y.Z` rồi mới ghép URL `https://github.com/.../releases/download/<tag>/...`.
-     Mọi tag lạ (URL, rỗng, rate-limit) đều fallback về `v0.2.0` nên không bao giờ ghép URL lỗi
+     Mọi tag lạ (URL, rỗng, rate-limit) đều fallback về `v0.3.0` nên không bao giờ ghép URL lỗi
      kiểu `.../download/https://api.github.com/.../releases/390919170/...`.
    - Pin version cố định khi cần (bỏ qua GitHub API):
      ```bash
-     TELECRATE_VERSION=v0.2.0 curl -fsSL https://raw.githubusercontent.com/ZkIsHere/TeleCrate/master/install.sh | bash
+     TELECRATE_VERSION=v0.3.0 curl -fsSL https://raw.githubusercontent.com/ZkIsHere/TeleCrate/master/install.sh | bash
      ```
 2. Thiết lập user hệ thống chuyên dụng `telecrate` và phân quyền thư mục lưu trữ `/var/lib/telecrate`.
 3. Khởi chạy **Wizard tương tác** hỏi các thông tin cần thiết:
@@ -38,6 +38,8 @@ Script sẽ tự động:
    - Telegram Bot Token & Telegram Chat/Channel ID
    - Cổng lắng nghe (mặc định `7070`)
    - Tùy chọn mã hóa ChaCha20-Poly1305
+   - Thư mục spool local (mặc định `/var/lib/telecrate/spool`; tự động hóa bằng
+     `TELECRATE_SPOOL_DIR=/mnt/data/spool curl ... | bash`)
    - Tự động sinh Access Key & Secret Key ban đầu
 4. Tự động sinh file cấu hình chuẩn `/etc/telecrate/telecrate.toml` (quyền 600).
 5. Đăng ký, kích hoạt và khởi chạy dịch vụ **Systemd native** (`telecrate.service`).
@@ -124,6 +126,9 @@ Mở file `/etc/telecrate/telecrate.toml` và cập nhật các thông số cầ
 ```toml
 db_path = "/var/lib/telecrate/index.db"
 spool_dir = "/var/lib/telecrate/spool"
+# Backend metadata DB: "sqlite" (default, runnable) | "postgres" (partial — ADR 0005).
+db_backend = "sqlite"
+# database_url = "postgresql://telecrate:mat-khau-that@127.0.0.1:5432/telecrate"
 listen_port = 7070
 encryption = "off"
 admin_password = "mat-khau-quan-tri-secure"

@@ -71,6 +71,15 @@
 | Startup Spool Reconciliation (`reconcile_spool`) | implemented-and-tested | Dọn `.tmp` và `.chunk` mồ côi (cả single-part và multipart) |
 | Integration Crash Injection Suite (10 ranh giới) | implemented-and-tested | [`tests/crash_injection.rs`](file:///d:/PersonalProject/TeleCrate/tests/crash_injection.rs) 10/10 pass |
 
+## Metadata database backends (ADR 0005, 2026-09-18)
+
+| Backend | Trạng thái | Ghi chú |
+|---|---|---|
+| SQLite (WAL, `rusqlite` bundled) | implemented-and-tested | Backend runnable duy nhất; `db_backend="sqlite"` (mặc định) |
+| Postgres — chọn backend + validate | implemented-and-tested | `db_backend="postgres"` + `database_url` qua TOML/CLI/dashboard, validate fail-closed, secret redaction |
+| Postgres — schema DDL | implemented-and-tested | `migrations/postgres/0001_0004_schema.sql` (tương đương SQLite 0001→0004), `telecrate db pg-schema`, test parity 15 bảng |
+| Postgres — runtime query DAL | blocked | DAL hiện `rusqlite::Connection` trực tiếp; `serve/init/doctor` từ chối `postgres` rõ ràng thay vì fallback lén. Bước tiếp: trait repository, lease `FOR UPDATE SKIP LOCKED`, tool migrate dữ liệu, chạy lại full suite |
+
 ## Nâng cao (website, access points, batch, IAM/STS/SNS/SQS/Lambda, Glacier)
 
 unsupported ở M0-M5; mỗi mục sẽ có gap report bằng chứng trước khi đánh `unsupported` vĩnh viễn.

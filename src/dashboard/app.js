@@ -416,7 +416,7 @@ async function loadOverview() {
     if (hsDot) hsDot.className = 'state-dot' + (spoolPct > 90 ? ' err' : spoolPct > 75 ? ' warn' : '');
     $('hs-status').textContent = 'Hệ thống sẵn sàng';
     $('hs-uptime').textContent = fmtUptime(d.uptime_secs ?? d.uptime_seconds);
-    $('hs-version').textContent = d.version ? 'v' + d.version : 'v0.2.0';
+    $('hs-version').textContent = d.version ? 'v' + d.version : 'v0.3.0';
     $('app-version').textContent = d.version ? 'v' + d.version : '';
 
     // Badges in sidebar
@@ -956,6 +956,9 @@ async function loadConfig() {
     $('cfg-port').value = c.listen_port ?? 7070;
     $('cfg-encryption').value = c.encryption || 'off';
     $('cfg-workers').value = c.worker_concurrency ?? 2;
+    $('cfg-spool').value = c.spool_dir || '/var/lib/telecrate/spool';
+    $('cfg-dbbackend').value = c.db_backend || 'sqlite';
+    $('cfg-dburl').value = '';
     $('cfg-loglevel').value = c.log_level || 'info';
     $('cfg-logfile').checked = !!c.log_to_file;
     $('cfg-logdir').value = c.log_dir || '/var/lib/telecrate/logs';
@@ -992,41 +995,43 @@ $('btn-tg-test')?.addEventListener('click', async () => {
 
 $('config-form')?.addEventListener('submit', async (e) => {
   e.preventDefault();
-  const items = [
-    ['listen_port', $('cfg-port').value],
-    ['encryption', $('cfg-encryption').value],
-    ['worker_concurrency', $('cfg-workers').value],
-    ['log_level', $('cfg-loglevel').value],
-    ['log_to_file', $('cfg-logfile').checked ? 'true' : 'false'],
-    ['log_dir', $('cfg-logdir').value],
-    ['log_retention_days', $('cfg-logret').value],
-    ['telegram_chat_id', $('cfg-chat').value],
-  ];
-  if ($('cfg-token').value) items.push(['telegram_bot_token', $('cfg-token').value]);
-  if ($('cfg-adminpwd').value) items.push(['admin_password', $('cfg-adminpwd').value]);
+  // Batch nguyên tử 1 request: đổi db_backend cần backend+URL cùng lúc
+  // (gửi từng key riêng lẻ kẹt ở trạng thái trung gian không hợp lệ).
+  const updates = {
+    listen_port: $('cfg-port').value,
+    encryption: $('cfg-encryption').value,
+    worker_concurrency: $('cfg-workers').value,
+    spool_dir: $('cfg-spool').value.trim(),
+    db_backend: $('cfg-dbbackend').value,
+    log_level: $('cfg-loglevel').value,
+    log_to_file: $('cfg-logfile').checked ? 'true' : 'false',
+    log_dir: $('cfg-logdir').value,
+    log_retention_days: $('cfg-logret').value,
+    telegram_chat_id: $('cfg-chat').value,
+  };
+  if ($('cfg-token').value) updates.telegram_bot_token = $('cfg-token').value;
+  if ($('cfg-adminpwd').value) updates.admin_password = $('cfg-adminpwd').value;
+  // Postgres URL là secret: chỉ gửi khi nhập mới; về sqlite thì xóa URL cũ để khỏi mồ côi.
+  if ($('cfg-dburl').value) updates.database_url = $('cfg-dburl').value.trim();
+  else if ($('cfg-dbbackend').value === 'sqlite') updates.database_url = '';
 
-  let ok = 0, firstErr = '';
-  for (const [key, value] of items) {
-    try {
-      const r = await api('/admin/api/config', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ key, value }),
-      });
-      if (r.ok) ok++;
-      else if (!firstErr) {
-        try { firstErr = (await r.json()).error || ''; } catch {}
-      }
-    } catch (ex) {
-      if (!firstErr) firstErr = ex.message;
+  try {
+    const r = await api('/admin/api/config', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ updates }),
+    });
+    const d = await r.json().catch(() => ({}));
+    if (r.ok && d.ok) {
+      toast('Đã lưu cấu hình thành công', 'ok');
+      $('cfg-token').value = '';
+      $('cfg-adminpwd').value = '';
+      $('cfg-dburl').value = '';
+    } else {
+      toast('Lưu thất bại' + (d.error ? ' — lỗi: ' + d.error : ''), 'err');
     }
-  }
-  if (ok === items.length) {
-    toast('Đã lưu cấu hình thành công', 'ok');
-    $('cfg-token').value = '';
-    $('cfg-adminpwd').value = '';
-  } else {
-    toast(`Lưu ${ok}/${items.length}${firstErr ? ' — lỗi: ' + firstErr : ''}`, 'err');
+  } catch (ex) {
+    toast('Lưu thất bại — lỗi: ' + ex.message, 'err');
   }
   loadConfig();
 });

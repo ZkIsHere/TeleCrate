@@ -11,8 +11,8 @@
 set -euo pipefail
 
 GITHUB_REPO="ZkIsHere/TeleCrate"
-DEFAULT_VERSION="v0.2.0"
-# Cho phép pin version: TELECRATE_VERSION=v0.2.0 curl ... | bash
+DEFAULT_VERSION="v0.3.0"
+# Cho phép pin version: TELECRATE_VERSION=v0.3.0 curl ... | bash
 PINNED_VERSION="${TELECRATE_VERSION:-}"
 INSTALL_BIN="/usr/local/bin/telecrate"
 ALT_BIN="/usr/bin/telecrate"
@@ -101,7 +101,7 @@ cat << 'EOF'
     | |  __/ |  __/ |____| | | (_| | ||  __/
     |_|\___|_|\___|\_____|_|  \__,_|\__\___|
 EOF
-echo -e "${BOLD}TeleCrate v0.2.0 — S3 Storage Gateway backed by Telegram${NC}"
+echo -e "${BOLD}TeleCrate v0.3.0 — S3 Storage Gateway backed by Telegram${NC}"
 echo -e "Self-hosted · Single Instance · Systemd Native\n"
 
 # 1. Kiểm tra hệ điều hành & kiến trúc
@@ -187,7 +187,7 @@ case "$DOWNLOAD_URL" in
     https://github.com/"${GITHUB_REPO}"/releases/download/v*.[0-9]*/telecrate-linux-*.tar.gz)
         ;;
     *)
-        error "URL tải về không hợp lệ ('$DOWNLOAD_URL'). Tag release: '$LATEST_TAG'. Hãy thử: TELECRATE_VERSION=v0.2.0 bash install.sh"
+        error "URL tải về không hợp lệ ('$DOWNLOAD_URL'). Tag release: '$LATEST_TAG'. Hãy thử: TELECRATE_VERSION=v0.3.0 bash install.sh"
         ;;
 esac
 if [ "$TARGET_ARCH" = "arm64" ]; then
@@ -249,7 +249,7 @@ fi
 info "Đang cài đặt binary vào ${TARGET_BIN}..."
 $SUDO cp "$BINARY_SRC" "$TARGET_BIN"
 $SUDO chmod 755 "$TARGET_BIN"
-ok "Đã cài đặt: $($TARGET_BIN --version 2>/dev/null || echo 'TeleCrate v0.2.0')"
+ok "Đã cài đặt: $($TARGET_BIN --version 2>/dev/null || echo 'TeleCrate v0.3.0')"
 
 # 5. Tạo user & group hệ thống
 if ! id "$TELECRATE_USER" >/dev/null 2>&1; then
@@ -312,15 +312,52 @@ ask CFG_PORT "4. Cổng dịch vụ HTTP (S3 Gateway & Dashboard)" "7070"
 CFG_ENCRYPTION=""
 ask CFG_ENCRYPTION "5. Bật mã hóa ChaCha20-Poly1305 phía máy chủ (off/on)" "off"
 
-# F. Access Key & Secret Key ban đầu
+# F. Thư mục spool (chunk local trước khi worker upload Telegram).
+# Tự động hóa: TELECRATE_SPOOL_DIR=/mnt/data/spool curl ... | bash
+DEFAULT_SPOOL_DIR="${TELECRATE_SPOOL_DIR:-$SPOOL_DIR}"
+CFG_SPOOL_DIR=""
+echo -e "${YELLOW}* Spool giữ chunk pending + accepted-local; đổi sau này cần restart daemon${NC}"
+while true; do
+    ask CFG_SPOOL_DIR "6. Thư mục spool local" "$DEFAULT_SPOOL_DIR"
+    case "$CFG_SPOOL_DIR" in
+        /*)
+            case "$CFG_SPOOL_DIR" in
+                *..*)
+                    warn "Đường dẫn spool không được chứa '..'. Vui lòng nhập lại."
+                    ;;
+                *)
+                    break
+                    ;;
+            esac
+            ;;
+        *)
+            warn "Cần đường dẫn tuyệt đối (ví dụ: /var/lib/telecrate/spool). Vui lòng nhập lại."
+            ;;
+    esac
+done
+SPOOL_DIR="$CFG_SPOOL_DIR"
+
+# G. Access Key & Secret Key ban đầu
 CFG_ACCESS_KEY="AKIA$(rand_str 12 | tr '[:lower:]' '[:upper:]')"
 CFG_SECRET_KEY="$(rand_str 32)"
+
+# 7b. Đảm bảo thư mục spool (custom từ wizard) tồn tại + đúng quyền.
+# (Mục 6 đã tạo spool mặc định; nếu user đổi chỗ khác thì tạo mới ở đây.)
+info "Đảm bảo thư mục spool tại ${SPOOL_DIR}..."
+$SUDO mkdir -p "$SPOOL_DIR"
+$SUDO chown "$TELECRATE_USER":"$TELECRATE_GROUP" "$SPOOL_DIR"
+$SUDO chmod 700 "$SPOOL_DIR"
+if [ "$SPOOL_DIR" != "${DATA_DIR}/spool" ]; then
+    # Dọn thư mục mặc định nếu còn trống (không bao giờ xóa dữ liệu).
+    $SUDO rmdir "${DATA_DIR}/spool" 2>/dev/null || true
+fi
+ok "Spool sẵn sàng tại ${SPOOL_DIR}"
 
 # 8. Ghi file cấu hình /etc/telecrate/telecrate.toml
 info "Đang tạo file cấu hình ${CONFIG_FILE}..."
 $SUDO tee "$CONFIG_FILE" > /dev/null << TOML
 # ==============================================================================
-# Cấu hình TeleCrate Daemon (v0.2.0)
+# Cấu hình TeleCrate Daemon (v0.3.0)
 # Tạo tự động bởi install.sh lúc $(date '+%Y-%m-%d %H:%M:%S')
 # ==============================================================================
 
@@ -420,7 +457,7 @@ if [ -z "$SERVER_IP" ]; then SERVER_IP="127.0.0.1"; fi
 # 11. In bảng thông tin hoàn tất
 echo ""
 echo -e "${GREEN}${BOLD}================================================================${NC}"
-echo -e "${GREEN}${BOLD}       🎉 CÀI ĐẶT THÀNH CÔNG TELECRATE v0.2.0 TRÊN LINUX!        ${NC}"
+echo -e "${GREEN}${BOLD}       🎉 CÀI ĐẶT THÀNH CÔNG TELECRATE v0.3.0 TRÊN LINUX!        ${NC}"
 echo -e "${GREEN}${BOLD}================================================================${NC}"
 echo ""
 echo -e "${BOLD}1. Giao diện Quản trị (Web Dashboard):${NC}"
@@ -438,5 +475,6 @@ echo -e "   Kiểm tra trạng thái:  ${BOLD}sudo systemctl status telecrate${N
 echo -e "   Xem log thời gian thực: ${BOLD}sudo journalctl -u telecrate -f${NC}"
 echo -e "   Khởi động lại daemon: ${BOLD}sudo systemctl restart telecrate${NC}"
 echo -e "   Tập tin cấu hình:     ${BOLD}${CONFIG_FILE}${NC}"
+echo -e "   Thư mục spool:        ${BOLD}${SPOOL_DIR}${NC}"
 echo ""
 echo -e "${GREEN}${BOLD}Chúc mừng bạn đã thiết lập thành công TeleCrate Object Storage!${NC}\n"

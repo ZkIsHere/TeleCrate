@@ -1,4 +1,4 @@
-# Milestones TeleCrate (cập nhật 2026-09-15)
+# Milestones TeleCrate (cập nhật 2026-09-18)
 
 - **M0 — Bootstrap: `implemented-and-tested`**. Repo private `ZkIsHere/TeleCrate`, CI self-hosted runner `ci-cd` xanh
   (fmt/clippy/build/test/package-validate). Rust skeleton + migrations v1 + systemd unit + config mẫu.
@@ -67,6 +67,8 @@
 - **7.3: `implemented-and-tested` (2026-09-16)** — Controlled Live Telegram Production Verification guidelines and automated live test suite integration.
 - **7.4: `implemented-and-tested` (2026-09-16)** — Advanced Features Gap Report (`docs/gap-report.md`) documenting unsupported enterprise S3 features (S3 Select, Replication, Lifecycle policies, Glacier, IAM/STS/SNS/SQS, Event Notifications) with rationale and fallback recommendations.
 - **7.5: `implemented-and-tested` (2026-09-16)** — Final Code Quality & Project Completion Pass (`cargo fmt`, `clippy -D warnings`, full test suite pass). Chính thức hoàn thành Milestone M7 và hoàn thiện toàn bộ dự án TeleCrate v0.1.0!
+- **Postgres backend (ADR 0005, 2026-09-18): `partial`** — Chọn backend `sqlite`/`postgres` qua TOML/CLI/dashboard + validate fail-closed + redaction `database_url`; schema DDL Postgres (`migrations/postgres/0001_0004_schema.sql`, `telecrate db pg-schema`) tương đương SQLite 0001→0004 có test parity. Runtime query DAL vẫn SQLite-only nên `serve/init/doctor` từ chối `postgres` rõ ràng (`blocked`), cấm fallback lén.
+- **v0.3.0 (2026-09-18): `implemented-and-tested`** — Cấu hình vị trí spool (dashboard fieldset Lưu trữ + wizard `install.sh` mục 6 + `TELECRATE_SPOOL_DIR`); Admin API batch nguyên tử (`updates`) cho đổi backend; sửa lỗi parse tag release JSON 1 dòng + retry curl + pin `TELECRATE_VERSION`. Không migration SQLite mới; nâng cấp 0.2.0→0.3.0 chỉ thay binary.
 
 Không dừng ở demo upload/download rồi tuyên bố xong. Mỗi milestone chỉ sang tiếp khi required checks của SHA đó xanh.
 

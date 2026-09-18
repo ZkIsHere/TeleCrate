@@ -85,6 +85,9 @@ enum DbOp {
         #[arg(short, long)]
         passphrase: Option<String>,
     },
+    /// In DDL schema Postgres (tương đương migrations SQLite 0001→0004) cho DBA tạo schema trước.
+    /// Runtime Postgres: blocked (ADR 0005) — lệnh này chỉ xuất DDL, không kết nối DB.
+    PgSchema,
 }
 
 #[derive(Subcommand)]
@@ -151,6 +154,9 @@ async fn run(mut cli: Cli) -> Result<(), String> {
         Commands::Init => {
             println!("init: state dirs từ {}", cli.config);
             let cfg = telecrate::config::load(&cli.config).unwrap_or_default();
+            telecrate::db::ensure_backend_supported(telecrate::db::DbBackend::parse(
+                &cfg.db_backend,
+            )?)?;
             std::fs::create_dir_all(&cfg.spool_dir)
                 .map_err(|e| format!("create spool dir: {e}"))?;
             let mut conn = telecrate::db::open(&cfg.db_path)?;
@@ -163,6 +169,9 @@ async fn run(mut cli: Cli) -> Result<(), String> {
         }
         Commands::Serve => {
             let cfg = telecrate::config::load(&cli.config)?;
+            telecrate::db::ensure_backend_supported(telecrate::db::DbBackend::parse(
+                &cfg.db_backend,
+            )?)?;
             let mut conn = telecrate::db::open(&cfg.db_path)?;
             telecrate::db::apply_all_migrations(&mut conn)?;
             let active_spools = telecrate::db::active_spool_paths(&conn).unwrap_or_default();
@@ -227,6 +236,9 @@ async fn run(mut cli: Cli) -> Result<(), String> {
         Commands::Status => telecrate::cli::run_status_cli(&cli.config).await,
         Commands::Doctor => {
             let cfg = telecrate::config::load(&cli.config)?;
+            telecrate::db::ensure_backend_supported(telecrate::db::DbBackend::parse(
+                &cfg.db_backend,
+            )?)?;
             let conn = telecrate::db::open(&cfg.db_path)?;
             let rep = telecrate::doctor::run_doctor(&conn)?;
             println!("{}", serde_json::to_string_pretty(&rep).unwrap());
@@ -284,6 +296,10 @@ async fn run(mut cli: Cli) -> Result<(), String> {
                 let cfg = telecrate::config::load(&cli.config)?;
                 telecrate::db::restore_db(&input, &cfg.db_path, passphrase.as_deref())?;
                 println!("db restore ok: {}", cfg.db_path);
+                Ok(())
+            }
+            DbOp::PgSchema => {
+                print!("{}", telecrate::db::POSTGRES_SCHEMA);
                 Ok(())
             }
         },
