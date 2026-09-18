@@ -12,6 +12,8 @@ set -euo pipefail
 
 GITHUB_REPO="ZkIsHere/TeleCrate"
 DEFAULT_VERSION="v0.2.0"
+# Cho phép pin version: TELECRATE_VERSION=v0.2.0 curl ... | bash
+PINNED_VERSION="${TELECRATE_VERSION:-}"
 INSTALL_BIN="/usr/local/bin/telecrate"
 ALT_BIN="/usr/bin/telecrate"
 CONFIG_DIR="/etc/telecrate"
@@ -141,39 +143,88 @@ trap cleanup EXIT
 
 info "Đang kiểm tra phiên bản mới nhất từ GitHub..."
 LATEST_TAG=""
-if command -v curl >/dev/null 2>&1; then
-    LATEST_TAG="$(curl -fsSL -H "User-Agent: TeleCrate-Installer" "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null | grep '"tag_name":' | head -n1 | cut -d'"' -f4 || true)"
+RELEASE_JSON=""
+if [ -n "$PINNED_VERSION" ]; then
+    LATEST_TAG="$PINNED_VERSION"
+    info "Dùng phiên bản pin từ TELECRATE_VERSION=${PINNED_VERSION}, bỏ qua GitHub API."
+elif command -v curl >/dev/null 2>&1; then
+    RELEASE_JSON="$(curl -fsSL -H "User-Agent: TeleCrate-Installer" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/${GITHUB_REPO}/releases/latest" 2>/dev/null || true)"
 fi
-if [ -z "$LATEST_TAG" ]; then
-    LATEST_TAG="$DEFAULT_VERSION"
-    warn "Không lấy được tag từ GitHub API, sử dụng phiên bản mặc định: $LATEST_TAG"
+if [ -z "$LATEST_TAG" ] && [ -n "$RELEASE_JSON" ]; then
+    if command -v jq >/dev/null 2>&1; then
+        LATEST_TAG="$(printf '%s' "$RELEASE_JSON" | jq -r '.tag_name // empty' 2>/dev/null || true)"
+    elif command -v python3 >/dev/null 2>&1; then
+        LATEST_TAG="$(printf '%s' "$RELEASE_JSON" | python3 -c 'import sys,json; print(json.load(sys.stdin).get("tag_name",""))' 2>/dev/null || true)"
+    else
+        # grep -o chỉ lấy đúng đoạn "tag_name": "vX.Y.Z".
+        # (Bug cũ: grep '"tag_name":' + cut -d'"' -f4 sẽ vỡ khi GitHub trả JSON 1 dòng —
+        #  grep trả về cả blob, cut -f4 trúng field "url" => LATEST_TAG thành
+        #  https://api.github.com/repos/.../releases/390919170 rồi ghép thành URL download lỗi.)
+        LATEST_TAG="$(printf '%s' "$RELEASE_JSON" | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -n1 | cut -d'"' -f4 || true)"
+    fi
+fi
+# Validate: chỉ chấp nhận tag dạng vX.Y.Z..., mọi giá trị khác (rỗng, URL, JSON lỗi,
+# rate-limit message) đều fallback về DEFAULT_VERSION để không bao giờ ghép URL sai.
+if printf '%s' "$LATEST_TAG" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([._-][A-Za-z0-9._-]+)?$'; then
+    :
 else
-    ok "Phiên bản release mới nhất: $LATEST_TAG"
+    if [ -n "$LATEST_TAG" ]; then
+        warn "Tag release không hợp lệ, dùng phiên bản mặc định: $DEFAULT_VERSION"
+    else
+        warn "Không lấy được tag từ GitHub API, sử dụng phiên bản mặc định: $DEFAULT_VERSION"
+    fi
+    LATEST_TAG="$DEFAULT_VERSION"
 fi
+ok "Phiên bản release: $LATEST_TAG"
 
 DOWNLOAD_URL="https://github.com/${GITHUB_REPO}/releases/download/${LATEST_TAG}/telecrate-linux-${TARGET_ARCH}.tar.gz"
 ARCHIVE_PATH="${TMP_DIR}/telecrate.tar.gz"
+CURL_ERR_LOG="${TMP_DIR}/curl-err.log"
+
+# Phòng thủ: DOWNLOAD_URL phải là redirect hợp lệ tới github.com, không bao giờ là api.github.com
+# hay chứa URL lồng nhau (dấu hiệu LATEST_TAG bị parse sai thành URL).
+case "$DOWNLOAD_URL" in
+    https://github.com/"${GITHUB_REPO}"/releases/download/v*.[0-9]*/telecrate-linux-*.tar.gz)
+        ;;
+    *)
+        error "URL tải về không hợp lệ ('$DOWNLOAD_URL'). Tag release: '$LATEST_TAG'. Hãy thử: TELECRATE_VERSION=v0.2.0 bash install.sh"
+        ;;
+esac
+if [ "$TARGET_ARCH" = "arm64" ]; then
+    warn "Release hiện tại chỉ publish sẵn gói amd64; máy arm64 sẽ thử tải telecrate-linux-arm64.tar.gz và có thể cần build từ nguồn nếu 404."
+fi
 
 info "Đang tải gói TeleCrate (${DOWNLOAD_URL})..."
 DOWNLOADED=false
-if curl -fsSL -o "$ARCHIVE_PATH" "$DOWNLOAD_URL" 2>/dev/null; then
+if curl -fsSL --retry 3 --retry-delay 2 -o "$ARCHIVE_PATH" "$DOWNLOAD_URL" 2>"$CURL_ERR_LOG"; then
     DOWNLOADED=true
-elif [ -f "./target/release/telecrate" ]; then
-    # Chạy trực tiếp từ repo mã nguồn
-    info "Phát hiện binary có sẵn tại ./target/release/telecrate"
-    cp ./target/release/telecrate "${TMP_DIR}/telecrate"
-    DOWNLOADED=true
+else
+    warn "Tải tarball thất bại (tag ${LATEST_TAG}, arch ${TARGET_ARCH}). Chi tiết curl:"
+    sed 's/^/  curl: /' "$CURL_ERR_LOG" 2>/dev/null || true
+    HTTP_CODE="$(curl -sSL -o /dev/null -w '%{http_code}' "$DOWNLOAD_URL" 2>/dev/null || true)"
+    if [ -n "$HTTP_CODE" ]; then
+        warn "HTTP status khi kiểm tra lại URL: $HTTP_CODE"
+    fi
+    if [ -f "./target/release/telecrate" ]; then
+        # Chạy trực tiếp từ repo mã nguồn
+        info "Phát hiện binary có sẵn tại ./target/release/telecrate"
+        cp ./target/release/telecrate "${TMP_DIR}/telecrate"
+        DOWNLOADED=true
+    fi
 fi
 
 if [ "$DOWNLOADED" != "true" ]; then
     # Thử tìm gói .deb hoặc compile fallback nếu có cargo
     DEB_URL="https://github.com/${GITHUB_REPO}/releases/download/${LATEST_TAG}/telecrate_${LATEST_TAG#v}_${TARGET_ARCH}.deb"
-    if curl -fsSL -o "${TMP_DIR}/telecrate.deb" "$DEB_URL" 2>/dev/null; then
+    info "Thử tải gói Debian dự phòng (${DEB_URL})..."
+    if curl -fsSL --retry 2 --retry-delay 2 -o "${TMP_DIR}/telecrate.deb" "$DEB_URL" 2>"${TMP_DIR}/curl-deb-err.log"; then
         info "Đang giải nén từ gói Debian..."
         ar x "${TMP_DIR}/telecrate.deb" --output="${TMP_DIR}" 2>/dev/null || dpkg-deb -x "${TMP_DIR}/telecrate.deb" "${TMP_DIR}/deb_out"
         if [ -f "${TMP_DIR}/deb_out/usr/bin/telecrate" ]; then
             cp "${TMP_DIR}/deb_out/usr/bin/telecrate" "${TMP_DIR}/telecrate"
         fi
+    else
+        sed 's/^/  curl-deb: /' "${TMP_DIR}/curl-deb-err.log" 2>/dev/null || true
     fi
 fi
 
@@ -187,7 +238,7 @@ if [ -f "${TMP_DIR}/telecrate" ]; then
 elif [ -f "${TMP_DIR}/target/release/telecrate" ]; then
     BINARY_SRC="${TMP_DIR}/target/release/telecrate"
 else
-    error "Không thể tải hoặc giải nén binary TeleCrate. Vui lòng kiểm tra kết nối mạng hoặc tag release."
+    error "Không thể tải hoặc giải nén binary TeleCrate (tag=${LATEST_TAG}, arch=${TARGET_ARCH}). URL đã thử: ${DOWNLOAD_URL}. Kiểm tra: 1) mạng tới github.com, 2) tag tồn tại: https://github.com/${GITHUB_REPO}/releases, 3) asset telecrate-linux-${TARGET_ARCH}.tar.gz có trong release không."
 fi
 
 # 4. Cài đặt binary vào /usr/bin hoặc /usr/local/bin
