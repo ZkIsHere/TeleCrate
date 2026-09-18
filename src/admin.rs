@@ -1942,7 +1942,7 @@ pub async fn api_list_multipart_uploads(
     {
         Ok(r) => r,
         Err(e) => {
-            return Json(json!({ "uploads": [], "total": 0, "error": format!("{e}") })).into_response();
+            return Json(json!({ "uploads": [], "total": 0, "error": e })).into_response();
         }
     };
     let mut list = Vec::new();
