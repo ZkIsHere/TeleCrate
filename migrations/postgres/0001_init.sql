@@ -26,7 +26,7 @@ CREATE INDEX IF NOT EXISTS idx_objects_bucket_key ON objects(bucket, key, create
 CREATE TABLE IF NOT EXISTS chunks(
   version_id TEXT NOT NULL REFERENCES objects(version_id),
   idx BIGINT NOT NULL,
-  offset BIGINT NOT NULL,
+  "offset" BIGINT NOT NULL,
   length BIGINT NOT NULL,
   plaintext_sha256 TEXT NOT NULL DEFAULT '',
   ciphertext_sha256 TEXT NOT NULL DEFAULT '',

@@ -1080,7 +1080,7 @@ pub async fn complete_multipart_upload_txn(
     for (idx, part) in parts.iter().enumerate() {
         let spool_path = part.spool_path.as_deref().unwrap_or("");
         tx.exec(
-            "INSERT INTO chunks(version_id, idx, offset, length, plaintext_sha256, ciphertext_sha256, encryption_mode, spool_path, state) VALUES (?, ?, ?, ?, ?, ?, 'none', ?, 'pending')",
+            "INSERT INTO chunks(version_id, idx, \"offset\", length, plaintext_sha256, ciphertext_sha256, encryption_mode, spool_path, state) VALUES (?, ?, ?, ?, ?, ?, 'none', ?, 'pending')",
             &[
                 Val::text(&final_version_id),
                 Val::int(idx as i64),
@@ -1379,7 +1379,7 @@ pub async fn put_object(
     .map_err(|e| format!("insert object: {e}"))?;
     for (idx, c) in chunks.iter().enumerate() {
         tx.exec(
-            "INSERT INTO chunks(version_id, idx, offset, length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref, spool_path, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
+            "INSERT INTO chunks(version_id, idx, \"offset\", length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref, spool_path, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
             &[
                 Val::text(&final_version_id),
                 Val::int(idx as i64),
@@ -1472,8 +1472,8 @@ pub async fn copy_object_txn(
     let mut need_upload = false;
     for c in &src_chunks {
         tx.exec(
-            "INSERT INTO chunks(version_id, idx, offset, length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref, spool_path, remote_locator_json, state)
-             SELECT ?, idx, offset, length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref, spool_path, remote_locator_json, state
+            "INSERT INTO chunks(version_id, idx, \"offset\", length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref, spool_path, remote_locator_json, state)
+             SELECT ?, idx, \"offset\", length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref, spool_path, remote_locator_json, state
              FROM chunks WHERE version_id = ? AND idx = ?",
             &[Val::text(&final_version_id), Val::text(&src_version.version_id), Val::int(c.idx)],
         )

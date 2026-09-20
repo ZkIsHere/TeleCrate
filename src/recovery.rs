@@ -143,7 +143,7 @@ pub async fn export_recovery_bundle(db: &Db) -> Result<RecoveryBundle, String> {
     // 3. Chunks
     let rows = crate::db::fetch_all(
         db,
-        "SELECT version_id, idx, offset, length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref, nonce, spool_path, remote_locator_json, state FROM chunks",
+        "SELECT version_id, idx, \"offset\", length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref, nonce, spool_path, remote_locator_json, state FROM chunks",
         &[],
     )
     .await
