@@ -274,9 +274,22 @@ async fn authenticate(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("");
 
+    // Log nhánh lỗi xác thực (chỉ mã lỗi + request_id/resource, không secret/chữ ký)
+    // để lần sau khỏi đoán mù khi client lạ (vd. PBS) gửi format khác.
+    let log_auth_err = |e: &telecrate::sigv4::SigError| {
+        tracing::warn!(
+            request_id = %request_id,
+            resource = %resource,
+            error = %e,
+            "sigv4 auth failed"
+        );
+    };
+
     if !auth.is_empty() {
-        let key_id = telecrate::sigv4::extract_key_id(auth)
-            .map_err(|e| sig_error_to_s3(e, resource, request_id))?;
+        let key_id = telecrate::sigv4::extract_key_id(auth).map_err(|e| {
+            log_auth_err(&e);
+            sig_error_to_s3(e, resource, request_id)
+        })?;
         let secret = find_secret_key(state, &key_id).await.ok_or_else(|| {
             sig_error_to_s3(telecrate::sigv4::SigError::UnknownKey, resource, request_id)
         })?;
@@ -288,14 +301,18 @@ async fn authenticate(
             authorization: auth,
             body,
         };
-        let v = telecrate::sigv4::verify(&req, &secret, now_secs())
-            .map_err(|e| sig_error_to_s3(e, resource, request_id))?;
+        let v = telecrate::sigv4::verify(&req, &secret, now_secs()).map_err(|e| {
+            log_auth_err(&e);
+            sig_error_to_s3(e, resource, request_id)
+        })?;
         return Ok(v.access_key_id);
     }
 
     if query.contains("X-Amz-Algorithm") || query.contains("X-Amz-Credential") {
-        let key_id = telecrate::sigv4::extract_key_id_from_query(query)
-            .map_err(|e| sig_error_to_s3(e, resource, request_id))?;
+        let key_id = telecrate::sigv4::extract_key_id_from_query(query).map_err(|e| {
+            log_auth_err(&e);
+            sig_error_to_s3(e, resource, request_id)
+        })?;
         let secret = find_secret_key(state, &key_id).await.ok_or_else(|| {
             sig_error_to_s3(telecrate::sigv4::SigError::UnknownKey, resource, request_id)
         })?;
@@ -307,8 +324,10 @@ async fn authenticate(
             authorization: "",
             body,
         };
-        let v = telecrate::sigv4::verify_presigned(&req, &secret, now_secs())
-            .map_err(|e| sig_error_to_s3(e, resource, request_id))?;
+        let v = telecrate::sigv4::verify_presigned(&req, &secret, now_secs()).map_err(|e| {
+            log_auth_err(&e);
+            sig_error_to_s3(e, resource, request_id)
+        })?;
         return Ok(v.access_key_id);
     }
 

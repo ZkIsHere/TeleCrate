@@ -1,3 +1,33 @@
+# TeleCrate v0.3.3-beta.2 — Release Notes (pre-release)
+
+Phiên bản **beta** sửa tương thích PBS S3: `proxmox-backup-manager s3 endpoint
+list-buckets` thất bại với `AuthorizationHeaderMalformed` (HTTP 400) dù Region và
+key đã đúng.
+
+---
+
+## 🌟 Điểm nổi bật trong phiên bản v0.3.3-beta.2
+
+### 1. Parser Authorization header chịu cả 2 format dấu phẩy
+* PBS S3 client gửi `Credential=...,SignedHeaders=...,Signature=...` (phẩy không
+  space, theo source `proxmox-s3-client`), còn parser cũ chỉ tách bằng `", "`
+  nên mọi request PBS rớt ngay khâu parse. Giờ tách theo `,` + trim, đúng cả 2
+  format, kèm unit test mô phỏng header kiểu PBS (gồm `content-length` + `host`
+  có port trong SignedHeaders).
+* Thêm log `sigv4 auth failed` (chỉ mã lỗi + request-id, không secret/chữ ký) để
+  lần sau chẩn đoán client lạ không cần đoán mù.
+
+### Nâng cấp từ beta.1
+Thay binary, giữ DB/spool (không migration mới):
+```bash
+sudo systemctl stop telecrate
+curl -fsSL https://github.com/ZkIsHere/TeleCrate/releases/download/v0.3.3-beta.2/telecrate-linux-amd64.tar.gz | sudo tar -xz -C /usr/local/bin/
+sudo systemctl start telecrate
+```
+Rồi thử lại trên PBS: `proxmox-backup-manager s3 endpoint list-buckets telecrate`.
+
+---
+
 # TeleCrate v0.3.3-beta.1 — Release Notes (pre-release)
 
 Phiên bản **beta** thử nghiệm cho đường Postgres: gồm fix `rebind_pg` (viết lại placeholder

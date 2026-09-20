@@ -158,7 +158,9 @@ fn parse_auth(auth: &str) -> Result<AuthParams<'_>, SigError> {
     let mut cred = None;
     let mut signed = None;
     let mut sig = None;
-    for part in rest.split(", ") {
+    // Tách theo `,` + trim: chấp nhận cả `, ` (AWS docs) lẫn `,` (PBS S3 client).
+    for part in rest.split(',') {
+        let part = part.trim();
         if let Some(v) = part.strip_prefix("Credential=") {
             cred = Some(v);
         } else if let Some(v) = part.strip_prefix("SignedHeaders=") {
@@ -641,6 +643,59 @@ mod tests {
             verify(&tampered, secret, now).unwrap_err(),
             SigError::BadSignature
         );
+    }
+
+    /// PBS S3 client gửi `Credential=...,SignedHeaders=...,Signature=...`
+    /// (phẩy không space) — parser phải chấp nhận cả 2 format.
+    #[test]
+    fn auth_header_accepts_comma_without_space() {
+        let secret = "test-secret-key";
+        let headers = vec![
+            h("host", "172.16.0.16:7070"),
+            h("content-length", "0"),
+            h("x-amz-content-sha256", sha256_hex(b"")),
+        ];
+        let amzdate = "20260920T120000Z";
+        let now = parse_amzdate(amzdate).unwrap();
+        let signed = [
+            "host",
+            "content-length",
+            "x-amz-content-sha256",
+            "x-amz-date",
+        ];
+        let auth = sign(
+            "GET",
+            "/",
+            "",
+            &headers,
+            &signed,
+            b"",
+            "AKID",
+            secret,
+            "us-east-1",
+            amzdate,
+            &sha256_hex(b""),
+        );
+        assert!(auth.contains(", "));
+        let full = vec![
+            h("host", "172.16.0.16:7070"),
+            h("content-length", "0"),
+            h("x-amz-content-sha256", sha256_hex(b"")),
+            h("x-amz-date", amzdate),
+        ];
+        // Format PBS: bỏ space sau phẩy — vẫn verify được.
+        let pbs_style = auth.replace(", ", ",");
+        assert!(!pbs_style.contains(", "));
+        let req = SignableRequest {
+            method: "GET",
+            path: "/",
+            query: "",
+            headers: &full,
+            authorization: &pbs_style,
+            body: b"",
+        };
+        assert_eq!(extract_key_id(&pbs_style).unwrap(), "AKID");
+        assert_eq!(verify(&req, secret, now).unwrap().access_key_id, "AKID");
     }
 
     #[test]
