@@ -74,6 +74,7 @@
 - **v0.3.2 (2026-09-20): `implemented-and-tested`** — Sửa chặn đổi backend Postgres: quote cột `"offset"` (từ khóa reservé Postgres) trong DDL `migrations/postgres/0001_init.sql` + query DAL dùng chung. Không migration SQLite mới; nâng cấp 0.3.1→0.3.2 chỉ thay binary.
 - **v0.3.3-beta.1 (2026-09-20): `implemented-unverified`** — Pre-release thử đường Postgres: `rebind_pg` viết lại `?` → `$N` cho cả 4 nhánh Postgres (mọi query bind trước đó đều lỗi syntax). Chờ verify `migrations apply` + pipeline thật trên Postgres trước khi chốt stable 0.3.3.
 - **v0.3.3-beta.2 (2026-09-20): `implemented-unverified`** — Pre-release tương thích PBS S3: parser `Authorization` chịu cả `,` lẫn `, ` (PBS gửi format không space → 400 `AuthorizationHeaderMalformed` dù region/key đúng); thêm log `sigv4 auth failed` chỉ mã lỗi + request-id. Chờ verify `list-buckets` từ PBS thật.
+- **v0.3.3-beta.3 (2026-09-20): `implemented-unverified`** — Pre-release tương thích PBS S3 (tiếp): `CreationDate` trong ListBuckets chuyển sang ISO-8601 strict (`...T....000Z`) cho parser `iso8601::datetime` của PBS; format DB cũ làm PBS báo `failed to parse response body`. Chờ verify list-buckets + dropdown UI từ PBS thật.
 
 Không dừng ở demo upload/download rồi tuyên bố xong. Mỗi milestone chỉ sang tiếp khi required checks của SHA đó xanh.
 

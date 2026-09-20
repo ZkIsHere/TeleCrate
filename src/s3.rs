@@ -152,7 +152,12 @@ pub fn list_buckets_xml(buckets: &[crate::db::Bucket], owner: &str) -> String {
         o.push_str("<Bucket><Name>");
         o.push_str(&xml_escape(&b.name));
         o.push_str("</Name><CreationDate>");
-        o.push_str(&xml_escape(&b.created_at));
+        // PBS parse CreationDate bằng parser ISO-8601 strict (`YYYY-MM-DDTHH:MM:SS.mmmZ`);
+        // format DB `YYYY-MM-DD HH:MM:SS` bị từ chối (thấy thực tế trên PBS 4.2.5).
+        o.push_str(&xml_escape(&format!(
+            "{}.000Z",
+            b.created_at.replace(' ', "T")
+        )));
         o.push_str("</CreationDate></Bucket>");
     }
     o.push_str("</Buckets></ListAllMyBucketsResult>");
@@ -951,12 +956,17 @@ mod tests {
                 name: "b&1".to_string(),
                 region: "r".to_string(),
                 versioning_status: "Disabled".to_string(),
-                created_at: "2026-09-15T00:00:00".to_string(),
+                created_at: "2026-09-15 00:00:00".to_string(),
             }],
             "owner",
         );
         assert!(xml.contains("<Name>b&amp;1</Name>"));
         assert!(xml.contains("ListAllMyBucketsResult"));
+        // CreationDate phải ISO-8601 strict cho parser PBS (`YYYY-MM-DDTHH:MM:SS.mmmZ`).
+        assert!(
+            xml.contains("<CreationDate>2026-09-15T00:00:00.000Z</CreationDate>"),
+            "{xml}"
+        );
     }
 
     #[test]

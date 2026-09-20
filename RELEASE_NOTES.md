@@ -1,3 +1,32 @@
+# TeleCrate v0.3.3-beta.3 — Release Notes (pre-release)
+
+Phiên bản **beta** sửa bước ListBuckets với PBS: auth đã qua (400 hết) nhưng PBS báo
+`failed to parse response body ... expected last modified timestamp` vì `CreationDate`
+của TeleCrate dùng format DB (`YYYY-MM-DD HH:MM:SS`) trong khi parser PBS
+(`iso8601::datetime`, strict) đòi ISO-8601.
+
+---
+
+## 🌟 Điểm nổi bật trong phiên bản v0.3.3-beta.3
+
+### 1. CreationDate ISO-8601 strict
+* `ListAllMyBucketsResult` giờ trả `<CreationDate>YYYY-MM-DDTHH:MM:SS.000Z</CreationDate>`
+  (đúng AWS spec, đúng parser PBS), thay vì format DB. Các `LastModified` khác trong
+  XML (objects/parts/copy) vốn đã ISO-8601 nên giữ nguyên.
+* Unit test `list_buckets_xml_shape` assert đúng shape mới.
+
+### Nâng cấp từ beta.2
+Thay binary, giữ DB/spool (không migration mới):
+```bash
+sudo systemctl stop telecrate
+curl -fsSL https://github.com/ZkIsHere/TeleCrate/releases/download/v0.3.3-beta.3/telecrate-linux-amd64.tar.gz | sudo tar -xz -C /usr/local/bin/
+sudo systemctl start telecrate
+```
+Rồi thử lại trên PBS: `proxmox-backup-manager s3 endpoint list-buckets telecrate`
+(kỳ vọng in ra bucket `pbs`), sau đó mở dropdown trên UI.
+
+---
+
 # TeleCrate v0.3.3-beta.2 — Release Notes (pre-release)
 
 Phiên bản **beta** sửa tương thích PBS S3: `proxmox-backup-manager s3 endpoint
