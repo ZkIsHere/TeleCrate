@@ -1,6 +1,6 @@
 [package]
 name = "telecrate"
-version = "0.3.2"
+version = "0.3.3-beta.1"
 edition = "2021"
 description = "TeleCrate — S3-compatible object storage backed by Telegram (single instance, systemd-native)"
 license = "MIT"

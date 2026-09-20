@@ -1,3 +1,30 @@
+# TeleCrate v0.3.3-beta.1 — Release Notes (pre-release)
+
+Phiên bản **beta** thử nghiệm cho đường Postgres: gồm fix `rebind_pg` (viết lại placeholder
+`?` → `$1..$N`, mọi query có tham số trên Postgres trước đó đều lỗi syntax). Đánh dấu
+**pre-release** trên GitHub nên không ảnh hưởng kênh stable (`install.sh` mặc định vẫn
+lấy v0.3.2).
+
+---
+
+## 🌟 Điểm nổi bật trong phiên bản v0.3.3-beta.1
+
+### 1. Sửa toàn bộ query Postgres có tham số
+* Tiếp sau fix quote cột `"offset"` (v0.3.2): `sqlx::query` không tự rebind `?` nên
+  `INSERT INTO schema_version(version) VALUES (?)` và mọi query bind khác đều lỗi.
+* Thêm `rebind_pg` (bỏ qua `?` trong string literal) dùng ở cả 4 nhánh Postgres,
+  kèm unit test. Mục tiêu beta: verify `migrations apply` → `version=4` và pipeline
+  PUT/GET/worker thật trên Postgres.
+
+### Cài đặt bản beta (opt-in)
+```bash
+TELECRATE_VERSION=v0.3.3-beta.1 curl -fsSL https://raw.githubusercontent.com/ZkIsHere/TeleCrate/master/install.sh | bash
+```
+Hoặc thay binary thủ công từ assets release `v0.3.3-beta.1`. Không khuyến nghị cho dữ
+liệu production cho đến khi có bản stable 0.3.3.
+
+---
+
 # TeleCrate v0.3.2 — Release Notes
 
 Phiên bản **TeleCrate v0.3.2** sửa lỗi chặn đổi backend sang Postgres: `telecrate

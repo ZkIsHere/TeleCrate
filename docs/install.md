@@ -32,6 +32,9 @@ Script sẽ tự động:
      ```bash
      TELECRATE_VERSION=v0.3.2 curl -fsSL https://raw.githubusercontent.com/ZkIsHere/TeleCrate/master/install.sh | bash
      ```
+   - Bản beta (pre-release, không phải latest) phải pin tường minh, ví dụ
+     `TELECRATE_VERSION=v0.3.3-beta.1 ... | bash`. Regex validate tag đã chấp nhận
+     hậu tố `-alpha/-beta/-rc`.
 2. Thiết lập user hệ thống chuyên dụng `telecrate` và phân quyền thư mục lưu trữ `/var/lib/telecrate`.
 3. Khởi chạy **Wizard tương tác** hỏi các thông tin cần thiết:
    - Mật khẩu quản trị Dashboard (có gợi ý mật khẩu ngẫu nhiên an toàn)

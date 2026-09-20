@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Script tạo gói cài đặt Debian/Ubuntu .deb cho TeleCrate
 
-VERSION="0.3.2"
+VERSION="0.3.3-beta.1"
 BUILD_TMP_DIR="/tmp/telecrate_deb_build/telecrate_${VERSION}_amd64"
 OUT_DIR="target/debian"
 

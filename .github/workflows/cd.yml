@@ -107,8 +107,13 @@ jobs:
         run: |
           TAG="${GITHUB_REF_NAME:-v0.3.2}"
           echo "Uploading release assets for tag $TAG..."
+          # Tag beta/alpha/rc -> GitHub pre-release (không đánh dấu latest).
+          PRERELEASE=""
+          case "$TAG" in
+            *-alpha*|*-beta*|*-rc*) PRERELEASE="--prerelease" ;;
+          esac
           if [ -f "RELEASE_NOTES.md" ]; then
-            gh release create "$TAG" dist/* --title "TeleCrate $TAG" --notes-file RELEASE_NOTES.md || (gh release upload "$TAG" dist/* --clobber && gh release edit "$TAG" --notes-file RELEASE_NOTES.md)
+            gh release create "$TAG" dist/* --title "TeleCrate $TAG" $PRERELEASE --notes-file RELEASE_NOTES.md || (gh release upload "$TAG" dist/* --clobber && gh release edit "$TAG" $PRERELEASE --notes-file RELEASE_NOTES.md)
           else
-            gh release upload "$TAG" dist/* --clobber || gh release create "$TAG" dist/* --title "TeleCrate $TAG" --notes "Automated CD Build for TeleCrate $TAG"
+            gh release upload "$TAG" dist/* --clobber || gh release create "$TAG" dist/* --title "TeleCrate $TAG" $PRERELEASE --notes "Automated CD Build for TeleCrate $TAG"
           fi
