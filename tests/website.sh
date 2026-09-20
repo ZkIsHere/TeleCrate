@@ -26,6 +26,7 @@ cat > "$WORK/telecrate.toml" <<EOF
 db_path = "$WORK/index.db"
 spool_dir = "$WORK/spool"
 listen_port = $PORT
+tls_enabled = false
 encryption = "off"
 admin_password = "$ADMIN_PWD"
 log_level = "warn"

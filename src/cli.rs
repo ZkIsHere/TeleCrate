@@ -5,10 +5,25 @@
 use crate as telecrate;
 use serde_json::json;
 
+fn base_url(config: &telecrate::config::Config) -> String {
+    let scheme = if config.tls_enabled { "https" } else { "http" };
+    format!("{}://127.0.0.1:{}", scheme, config.listen_port)
+}
+
+fn insecure_client(timeout_secs: u64) -> Result<reqwest::Client, String> {
+    reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        // Self-signed mặc định: CLI local chấp nhận cert chưa verify (không log secret).
+        .danger_accept_invalid_certs(true)
+        .build()
+        .map_err(|e| format!("build http client: {e}"))
+}
+
 pub async fn is_daemon_running(config: &telecrate::config::Config) -> bool {
-    let url = format!("http://127.0.0.1:{}/health", config.listen_port);
+    let url = format!("{}/health", base_url(config));
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(1))
+        .danger_accept_invalid_certs(true)
         .build();
     if let Ok(client) = client {
         if let Ok(resp) = client.get(&url).send().await {
@@ -21,16 +36,14 @@ pub async fn is_daemon_running(config: &telecrate::config::Config) -> bool {
 pub async fn run_status_cli(config_path: &str) -> Result<(), String> {
     let cfg = telecrate::config::load(config_path).unwrap_or_default();
     if is_daemon_running(&cfg).await {
-        let url = format!("http://127.0.0.1:{}/admin/api/status", cfg.listen_port);
-        let client = reqwest::Client::new();
+        let base = base_url(&cfg);
+        let url = format!("{base}/admin/api/status");
+        let client = insecure_client(5).unwrap_or_else(|_| reqwest::Client::new());
 
         // Login first if admin_password configured
         let pwd = cfg.admin_password.as_deref().unwrap_or("telecrate-admin");
         let login_res = client
-            .post(format!(
-                "http://127.0.0.1:{}/admin/api/login",
-                cfg.listen_port
-            ))
+            .post(format!("{base}/admin/api/login"))
             .json(&json!({ "password": pwd }))
             .send()
             .await;
@@ -79,14 +92,12 @@ pub async fn run_gc_cli(config_path: &str) -> Result<(), String> {
     let cfg = telecrate::config::load(config_path)?;
     if is_daemon_running(&cfg).await {
         println!("--> Daemon đang chạy: Thực thi GC qua Admin REST API...");
-        let client = reqwest::Client::new();
+        let base = base_url(&cfg);
+        let client = insecure_client(5).unwrap_or_else(|_| reqwest::Client::new());
         let pwd = cfg.admin_password.as_deref().unwrap_or("telecrate-admin");
 
         let login_res = client
-            .post(format!(
-                "http://127.0.0.1:{}/admin/api/login",
-                cfg.listen_port
-            ))
+            .post(format!("{base}/admin/api/login"))
             .json(&json!({ "password": pwd }))
             .send()
             .await
@@ -104,7 +115,7 @@ pub async fn run_gc_cli(config_path: &str) -> Result<(), String> {
         let csrf_token = login_json["csrf_token"].as_str().unwrap_or_default();
 
         let gc_res = client
-            .post(format!("http://127.0.0.1:{}/admin/api/gc", cfg.listen_port))
+            .post(format!("{base}/admin/api/gc"))
             .header("cookie", &cookie)
             .header("x-csrf-token", csrf_token)
             .send()
@@ -167,14 +178,12 @@ pub async fn run_config_set_cli(config_path: &str, key: &str, val: &str) -> Resu
     let mut cfg = telecrate::config::load(config_path)?;
     if is_daemon_running(&cfg).await {
         println!("--> Daemon đang chạy: Cập nhật config qua Admin REST API...");
-        let client = reqwest::Client::new();
+        let base = base_url(&cfg);
+        let client = insecure_client(5).unwrap_or_else(|_| reqwest::Client::new());
         let pwd = cfg.admin_password.as_deref().unwrap_or("telecrate-admin");
 
         let login_res = client
-            .post(format!(
-                "http://127.0.0.1:{}/admin/api/login",
-                cfg.listen_port
-            ))
+            .post(format!("{base}/admin/api/login"))
             .json(&json!({ "password": pwd }))
             .send()
             .await
@@ -195,10 +204,7 @@ pub async fn run_config_set_cli(config_path: &str, key: &str, val: &str) -> Resu
             .unwrap_or("");
 
         let resp = client
-            .post(format!(
-                "http://127.0.0.1:{}/admin/api/config",
-                cfg.listen_port
-            ))
+            .post(format!("{base}/admin/api/config"))
             .header("cookie", &cookie)
             .header("x-csrf-token", csrf)
             .json(&json!({ "key": key, "value": val, "config_path": config_path }))

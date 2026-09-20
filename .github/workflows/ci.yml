@@ -106,6 +106,7 @@ jobs:
           db_path = "$WORK/index.db"
           spool_dir = "$WORK/spool"
           listen_port = 18081
+          tls_enabled = false
           encryption = "off"
           admin_password = "ci-test"
           [[access_keys]]

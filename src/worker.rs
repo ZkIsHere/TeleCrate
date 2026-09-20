@@ -208,8 +208,68 @@ async fn fail_job(db: &Db, job: &Claimed, e: &TransportError) -> Result<(), Stri
     Ok(())
 }
 
+/// Xử lý 1 job kiểu đồng bộ cho worker thread: DB qua `rt.block_on` từng bước ngắn,
+/// upload blocking GỌI NGOÀI mọi async context (reqwest blocking cấm lồng runtime —
+/// lồng `current_thread` sẽ panic "Cannot drop a runtime..." và kẹt live-e2e).
+/// `process_one_job` async giữ lại cho unit test với mock (không blocking thật).
+pub fn process_one_job_sync(
+    db: &Db,
+    rt: &tokio::runtime::Runtime,
+    transport: &dyn Transport,
+    chat_id: i64,
+    owner: &str,
+) -> Result<bool, String> {
+    let now = crate::db::now_str();
+    let claimed = rt.block_on(claim_job(db, owner, 300, &now))?;
+    let Some(job) = claimed else {
+        return Ok(false);
+    };
+    let version_alive = rt
+        .block_on(crate::db::count(
+            db,
+            "SELECT COUNT(*) FROM objects WHERE version_id = ?",
+            &[Val::text(&job.version_id)],
+        ))
+        .map_err(|e| format!("version check: {e}"))?;
+    if version_alive == 0 {
+        rt.block_on(finish_job(db, &job.job_id, true))?;
+        return Ok(true);
+    }
+    let chunks = rt.block_on(crate::db::chunks_of(db, &job.version_id))?;
+    for c in &chunks {
+        if c.state == "remote" {
+            continue;
+        }
+        let spool = c
+            .spool_path
+            .clone()
+            .ok_or_else(|| "chunk thiếu spool_path".to_string())?;
+        let bytes = std::fs::read(&spool).map_err(|e| format!("read spool: {e}"))?;
+        // NGOÀI runtime: không block_on đang giữ ở đây.
+        match transport.upload(chat_id, &bytes) {
+            Ok(loc) => rt.block_on(commit_chunk(db, &job.version_id, c.idx, &loc))?,
+            Err(e) => {
+                rt.block_on(fail_job(db, &job, &e))?;
+                return Ok(true);
+            }
+        }
+    }
+    rt.block_on(finish_job(db, &job.job_id, true))?;
+    for c in &chunks {
+        if let Some(p) = &c.spool_path {
+            let _ = std::fs::remove_file(p);
+            let _ = rt.block_on(crate::db::exec(
+                db,
+                "UPDATE chunks SET spool_path = NULL WHERE version_id = ? AND idx = ?",
+                &[Val::text(&job.version_id), Val::int(c.idx)],
+            ));
+        }
+    }
+    Ok(true)
+}
+
 /// Vòng lặp worker cho daemon: poll mỗi `interval`, xử lý tới khi hết việc.
-/// Transport blocking → caller bọc `spawn_blocking` (ADR 0002).
+/// Transport blocking → gọi NGOÀI block_on qua `process_one_job_sync` (ADR 0002).
 /// Chạy trên std thread với runtime riêng (block_on an toàn vì không lồng runtime).
 pub fn run_loop(
     db: Db,
@@ -231,10 +291,7 @@ pub fn run_loop(
         }
     };
     while !shutdown.load(Ordering::Relaxed) {
-        let step: Result<bool, String> = rt.block_on(async {
-            let now = crate::db::now_str();
-            process_one_job(&db, transport, chat_id, true, &owner, &now).await
-        });
+        let step: Result<bool, String> = process_one_job_sync(&db, &rt, transport, chat_id, &owner);
         match step {
             Ok(true) => continue, // còn việc → xử lý ngay.
             Ok(false) => std::thread::sleep(interval),
@@ -311,10 +368,8 @@ pub fn run_loop_dynamic(
 
         let transport = cached_transport.as_ref().unwrap();
 
-        let step: Result<bool, String> = rt.block_on(async {
-            let now = crate::db::now_str();
-            process_one_job(&db, transport, cached_chat_id, true, &owner, &now).await
-        });
+        let step: Result<bool, String> =
+            process_one_job_sync(&db, &rt, transport, cached_chat_id, &owner);
 
         match step {
             Ok(true) => continue,
