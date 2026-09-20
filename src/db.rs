@@ -1,6 +1,7 @@
 //! DB layer — dual backend SQLite/Postgres trên sqlx, migrations forward-only.
 //!
-//! Mọi query viết placeholder `?` + bind một lần; sqlx tự rebind `$N` cho Postgres.
+//! Mọi query viết placeholder `?` + bind một lần; nhánh Postgres viết lại `$N`
+//! qua `rebind_pg` (sqlx không tự rebind với `sqlx::query(&str)`).
 //! Datetime lưu TEXT `YYYY-MM-DD HH:MM:SS` UTC trên cả hai backend nên so sánh
 //! chuỗi tương đương so sánh thời gian. Số nguyên đọc i64 trên cả hai
 //! (DDL Postgres dùng BIGINT toàn bộ). Không giữ txn mở suốt network upload.
@@ -94,7 +95,8 @@ impl Tx<'_> {
                     .map_err(|e| format!("exec: {e}"))
             }
             Tx::Postgres(tx) => {
-                let mut q = sqlx::query(sql);
+                let sql = rebind_pg(sql);
+                let mut q = sqlx::query(&sql);
                 for a in args {
                     q = bind_pg(q, a);
                 }
@@ -120,7 +122,8 @@ impl Tx<'_> {
                 rows.iter().map(decode_sqlite_row).collect()
             }
             Tx::Postgres(tx) => {
-                let mut q = sqlx::query(sql);
+                let sql = rebind_pg(sql);
+                let mut q = sqlx::query(&sql);
                 for a in args {
                     q = bind_pg(q, a);
                 }
@@ -239,6 +242,43 @@ fn bind_pg<'q>(
     }
 }
 
+/// Viết lại placeholder `?` thành `$1..$N` cho Postgres.
+/// sqlx KHÔNG tự rebind `?` khi dùng `sqlx::query(&str)` — để nguyên `?`
+/// Postgres parse thành toán tử JSON và báo `syntax error`.
+/// Bỏ qua `?` nằm trong string literal `'...'` (kể cả escape `''`).
+fn rebind_pg(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len() + 8);
+    let mut idx = 0u32;
+    let mut chars = sql.chars().peekable();
+    let mut in_str = false;
+    while let Some(c) = chars.next() {
+        if in_str {
+            out.push(c);
+            if c == '\'' {
+                if chars.peek() == Some(&'\'') {
+                    out.push(chars.next().unwrap());
+                } else {
+                    in_str = false;
+                }
+            }
+            continue;
+        }
+        match c {
+            '\'' => {
+                in_str = true;
+                out.push(c);
+            }
+            '?' => {
+                idx += 1;
+                out.push('$');
+                out.push_str(&idx.to_string());
+            }
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
 fn decode_sqlite_row(r: &SqliteRow) -> Result<Row, String> {
     let mut vals = Vec::with_capacity(r.len());
     for i in 0..r.len() {
@@ -279,7 +319,8 @@ pub async fn fetch_all(db: &Db, sql: &str, args: &[Val]) -> Result<Vec<Row>, Str
             rows.iter().map(decode_sqlite_row).collect()
         }
         Db::Postgres(p) => {
-            let mut q = sqlx::query(sql);
+            let sql = rebind_pg(sql);
+            let mut q = sqlx::query(&sql);
             for a in args {
                 q = bind_pg(q, a);
             }
@@ -332,7 +373,8 @@ pub async fn exec(db: &Db, sql: &str, args: &[Val]) -> Result<u64, String> {
                 .map_err(|e| format!("exec: {e}"))
         }
         Db::Postgres(p) => {
-            let mut q = sqlx::query(sql);
+            let sql = rebind_pg(sql);
+            let mut q = sqlx::query(&sql);
             for a in args {
                 q = bind_pg(q, a);
             }
@@ -2588,6 +2630,24 @@ mod tests {
         assert_eq!(schema_version(&db).await.unwrap(), 3);
         apply_migration(&db, 4, MIGRATION_004).await.unwrap();
         assert_eq!(schema_version(&db).await.unwrap(), 4);
+    }
+
+    #[test]
+    fn rebind_pg_rewrites_placeholders_in_order() {
+        assert_eq!(rebind_pg("SELECT 1"), "SELECT 1");
+        assert_eq!(
+            rebind_pg("INSERT INTO schema_version(version) VALUES (?)"),
+            "INSERT INTO schema_version(version) VALUES ($1)"
+        );
+        assert_eq!(
+            rebind_pg("SELECT a FROM t WHERE x = ? AND y = ? ORDER BY z LIMIT ?"),
+            "SELECT a FROM t WHERE x = $1 AND y = $2 ORDER BY z LIMIT $3"
+        );
+        // `?` trong string literal giữ nguyên; escape `''` không lệch trạng thái.
+        assert_eq!(
+            rebind_pg("SELECT 'a?b', 'it''s ?' WHERE x = ?"),
+            "SELECT 'a?b', 'it''s ?' WHERE x = $1"
+        );
     }
 
     #[test]
