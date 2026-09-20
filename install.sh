@@ -11,8 +11,8 @@
 set -euo pipefail
 
 GITHUB_REPO="ZkIsHere/TeleCrate"
-DEFAULT_VERSION="v0.3.1"
-# Cho phép pin version: TELECRATE_VERSION=v0.3.1 curl ... | bash
+DEFAULT_VERSION="v0.3.2"
+# Cho phép pin version: TELECRATE_VERSION=v0.3.2 curl ... | bash
 PINNED_VERSION="${TELECRATE_VERSION:-}"
 INSTALL_BIN="/usr/local/bin/telecrate"
 ALT_BIN="/usr/bin/telecrate"
@@ -101,7 +101,7 @@ cat << 'EOF'
     | |  __/ |  __/ |____| | | (_| | ||  __/
     |_|\___|_|\___|\_____|_|  \__,_|\__\___|
 EOF
-echo -e "${BOLD}TeleCrate v0.3.1 — S3 Storage Gateway backed by Telegram${NC}"
+echo -e "${BOLD}TeleCrate v0.3.2 — S3 Storage Gateway backed by Telegram${NC}"
 echo -e "Self-hosted · Single Instance · Systemd Native\n"
 
 # 1. Kiểm tra hệ điều hành & kiến trúc
@@ -187,7 +187,7 @@ case "$DOWNLOAD_URL" in
     https://github.com/"${GITHUB_REPO}"/releases/download/v*.[0-9]*/telecrate-linux-*.tar.gz)
         ;;
     *)
-        error "URL tải về không hợp lệ ('$DOWNLOAD_URL'). Tag release: '$LATEST_TAG'. Hãy thử: TELECRATE_VERSION=v0.3.1 bash install.sh"
+        error "URL tải về không hợp lệ ('$DOWNLOAD_URL'). Tag release: '$LATEST_TAG'. Hãy thử: TELECRATE_VERSION=v0.3.2 bash install.sh"
         ;;
 esac
 if [ "$TARGET_ARCH" = "arm64" ]; then
@@ -249,7 +249,7 @@ fi
 info "Đang cài đặt binary vào ${TARGET_BIN}..."
 $SUDO cp "$BINARY_SRC" "$TARGET_BIN"
 $SUDO chmod 755 "$TARGET_BIN"
-ok "Đã cài đặt: $($TARGET_BIN --version 2>/dev/null || echo 'TeleCrate v0.3.1')"
+ok "Đã cài đặt: $($TARGET_BIN --version 2>/dev/null || echo 'TeleCrate v0.3.2')"
 
 # 5. Tạo user & group hệ thống
 if ! id "$TELECRATE_USER" >/dev/null 2>&1; then
@@ -357,7 +357,7 @@ ok "Spool sẵn sàng tại ${SPOOL_DIR}"
 info "Đang tạo file cấu hình ${CONFIG_FILE}..."
 $SUDO tee "$CONFIG_FILE" > /dev/null << TOML
 # ==============================================================================
-# Cấu hình TeleCrate Daemon (v0.3.1)
+# Cấu hình TeleCrate Daemon (v0.3.2)
 # Tạo tự động bởi install.sh lúc $(date '+%Y-%m-%d %H:%M:%S')
 # ==============================================================================
 
@@ -457,7 +457,7 @@ if [ -z "$SERVER_IP" ]; then SERVER_IP="127.0.0.1"; fi
 # 11. In bảng thông tin hoàn tất
 echo ""
 echo -e "${GREEN}${BOLD}================================================================${NC}"
-echo -e "${GREEN}${BOLD}       🎉 CÀI ĐẶT THÀNH CÔNG TELECRATE v0.3.1 TRÊN LINUX!        ${NC}"
+echo -e "${GREEN}${BOLD}       🎉 CÀI ĐẶT THÀNH CÔNG TELECRATE v0.3.2 TRÊN LINUX!        ${NC}"
 echo -e "${GREEN}${BOLD}================================================================${NC}"
 echo ""
 echo -e "${BOLD}1. Giao diện Quản trị (Web Dashboard — HTTPS tự sinh, trình duyệt sẽ cảnh báo self-signed lần đầu):${NC}"

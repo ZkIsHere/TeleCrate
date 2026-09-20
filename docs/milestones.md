@@ -71,6 +71,7 @@
 - **v0.3.0 (2026-09-18): `implemented-and-tested`** — Cấu hình vị trí spool (dashboard fieldset Lưu trữ + wizard `install.sh` mục 6 + `TELECRATE_SPOOL_DIR`); Admin API batch nguyên tử (`updates`) cho đổi backend; sửa lỗi parse tag release JSON 1 dòng + retry curl + pin `TELECRATE_VERSION`. Không migration SQLite mới; nâng cấp 0.2.0→0.3.0 chỉ thay binary.
 - **TLS native (phát hành v0.3.1, `implemented-and-tested`)** — Serve HTTPS mặc định, chưa có cert/key thì tự sinh self-signed lúc khởi động; PEM tay + fail-closed; tự sinh ECDSA + fingerprint SHA-256 cho PBS (`POST /admin/api/tls/generate`, key 0600); fieldset TLS/HTTPS + trạng thái xem bất cứ lúc nào; tab **Kết nối** (endpoint/port/keys/preset PBS/AWS CLI/rclone + nút chép). E2E HTTPS 200 + từ chối plain-HTTP đã kiểm chứng.
 - **v0.3.1 (2026-09-20): `implemented-and-tested`** — Phát hành DAL async dual-backend SQLite/Postgres + TLS native; sửa worker lồng runtime (tách `process_one_job_sync`, live-e2e xanh lại), sửa HTTPS-vs-HTTP ở smoke test (`tls_enabled = false` tường minh), CLI hỗ trợ cả HTTP/HTTPS theo `tls_enabled`. Không migration SQLite mới; nâng cấp 0.3.0→0.3.1 chỉ thay binary (lưu ý daemon mặc định HTTPS).
+- **v0.3.2 (2026-09-20): `implemented-and-tested`** — Sửa chặn đổi backend Postgres: quote cột `"offset"` (từ khóa reservé Postgres) trong DDL `migrations/postgres/0001_init.sql` + query DAL dùng chung. Không migration SQLite mới; nâng cấp 0.3.1→0.3.2 chỉ thay binary.
 
 Không dừng ở demo upload/download rồi tuyên bố xong. Mỗi milestone chỉ sang tiếp khi required checks của SHA đó xanh.
 

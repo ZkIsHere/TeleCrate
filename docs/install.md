@@ -22,15 +22,15 @@ curl -fsSL https://raw.githubusercontent.com/ZkIsHere/TeleCrate/master/install.s
 ```
 
 Script sẽ tự động:
-1. Nhận diện kiến trúc hệ điều hành và tải binary TeleCrate v0.3.1 mới nhất từ GitHub Releases.
+1. Nhận diện kiến trúc hệ điều hành và tải binary TeleCrate v0.3.2 mới nhất từ GitHub Releases.
    - Script tự gọi `https://api.github.com/repos/ZkIsHere/TeleCrate/releases/latest`,
      parse `tag_name` (ưu tiên `jq`, rồi `python3`, rồi `grep -o`), validate tag phải dạng
      `vX.Y.Z` rồi mới ghép URL `https://github.com/.../releases/download/<tag>/...`.
-     Mọi tag lạ (URL, rỗng, rate-limit) đều fallback về `v0.3.1` nên không bao giờ ghép URL lỗi
+     Mọi tag lạ (URL, rỗng, rate-limit) đều fallback về `v0.3.2` nên không bao giờ ghép URL lỗi
      kiểu `.../download/https://api.github.com/.../releases/390919170/...`.
    - Pin version cố định khi cần (bỏ qua GitHub API):
      ```bash
-     TELECRATE_VERSION=v0.3.1 curl -fsSL https://raw.githubusercontent.com/ZkIsHere/TeleCrate/master/install.sh | bash
+     TELECRATE_VERSION=v0.3.2 curl -fsSL https://raw.githubusercontent.com/ZkIsHere/TeleCrate/master/install.sh | bash
      ```
 2. Thiết lập user hệ thống chuyên dụng `telecrate` và phân quyền thư mục lưu trữ `/var/lib/telecrate`.
 3. Khởi chạy **Wizard tương tác** hỏi các thông tin cần thiết:

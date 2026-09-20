@@ -1,3 +1,46 @@
+# TeleCrate v0.3.2 — Release Notes
+
+Phiên bản **TeleCrate v0.3.2** sửa lỗi chặn đổi backend sang Postgres: `telecrate
+migrations apply` thất bại với `syntax error at or near "offset"` vì `offset`
+(cột bảng `chunks`) là từ khóa reservé của Postgres.
+
+---
+
+## 🌟 Điểm nổi bật trong phiên bản v0.3.2
+
+### 1. Quote cột `offset` cho Postgres
+* DDL Postgres (`migrations/postgres/0001_init.sql`) và các query DAL dùng chung
+  (`put_object`, copy chunk, recovery export) giờ dùng `"offset"` — SQLite vẫn hiểu
+  identifier có quote nên một bộ query chạy được cả hai backend.
+* Migration Postgres 0001 chưa bao giờ apply thành công ở đâu (lỗi trong transaction,
+  chưa ghi version) nên sửa tại chỗ an toàn, không cần migration mới.
+
+---
+
+## 🔄 Hướng dẫn Nâng cấp từ v0.3.1 lên v0.3.2
+
+Không có migration SQLite mới (schema giữ nguyên) — nâng cấp nhị phân, giữ DB/spool:
+
+```bash
+# 1. Dừng service
+sudo systemctl stop telecrate
+
+# 2. Tải binary v0.3.2 mới nhất và ghi đè
+curl -fsSL https://github.com/ZkIsHere/TeleCrate/releases/download/v0.3.2/telecrate-linux-amd64.tar.gz | sudo tar -xz -C /usr/local/bin/
+
+# 3. Khởi động lại service
+sudo systemctl start telecrate
+
+# 4. Kiểm tra trạng thái hoạt động
+sudo systemctl status telecrate
+```
+
+Đang ở flow đổi sang Postgres mà kẹt ở `migrations apply`: thay binary v0.3.2 rồi
+chạy lại `telecrate migrations apply` (lần lỗi trước đã rollback sạch, chạy lại từ
+version 0, kỳ vọng `migrations ok: version=4`).
+
+---
+
 # TeleCrate v0.3.1 — Release Notes
 
 Phiên bản **TeleCrate v0.3.1** là bản vá phát hành TLS native + DAL async dual-backend

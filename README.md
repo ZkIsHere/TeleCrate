@@ -1,6 +1,6 @@
 # TeleCrate
 
-[![Version](https://img.shields.io/badge/version-0.3.1-blue.svg)](https://github.com/ZkIsHere/TeleCrate/releases)
+[![Version](https://img.shields.io/badge/version-0.3.2-blue.svg)](https://github.com/ZkIsHere/TeleCrate/releases)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-stable%202021-orange.svg)](https://www.rust-lang.org)
 [![S3 Compatibility](https://img.shields.io/badge/S3-Compatible-blueviolet.svg)](docs/compatibility-matrix.md)
@@ -22,7 +22,7 @@ curl -fsSL https://raw.githubusercontent.com/ZkIsHere/TeleCrate/master/install.s
 ```
 
 Kịch bản cài đặt tự động [`install.sh`](install.sh) sẽ:
-1. Nhận diện kiến trúc hệ thống (`amd64` / `arm64`) và tải bản binary release `v0.3.1` mới nhất.
+1. Nhận diện kiến trúc hệ thống (`amd64` / `arm64`) và tải bản binary release `v0.3.2` mới nhất.
 2. Khởi tạo system user `telecrate` và thiết lập các thư mục dữ liệu với quyền hạn bảo mật nghiêm ngặt (`700/750`).
 3. Mở **Wizard tương tác thông minh**: hỏi mật khẩu Admin Dashboard, Telegram Bot Token, Chat ID, cổng dịch vụ và tự động sinh cặp S3 Access Key ban đầu.
 4. Tự động sinh file cấu hình `/etc/telecrate/telecrate.toml` (quyền `600`).
@@ -211,7 +211,7 @@ TELECRATE_BOT_TOKEN=... TELECRATE_TEST_CHAT_ID=... cargo test -- --ignored live_
 ## 📚 Tài liệu Dự án
 
 * [AGENTS.md](AGENTS.md) — Nguyên tắc cốt lõi, quy tắc lập trình, bảo mật và tiêu chuẩn nghiệm thu (Definition of Done).
-* [RELEASE_NOTES.md](RELEASE_NOTES.md) — Chi tiết các thay đổi trong phiên bản mới nhất v0.3.1.
+* [RELEASE_NOTES.md](RELEASE_NOTES.md) — Chi tiết các thay đổi trong phiên bản mới nhất v0.3.2.
 * [docs/install.md](docs/install.md) — Hướng dẫn cài đặt chi tiết trên Linux native và biên dịch từ mã nguồn.
 * [docs/architecture.md](docs/architecture.md) — Kiến trúc hệ thống, quy trình ghi bền vững (Durable Commit) và cơ chế phục hồi sau sự cố.
 * [docs/compatibility-matrix.md](docs/compatibility-matrix.md) — Ma trận tương thích chi tiết các API S3.
