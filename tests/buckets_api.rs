@@ -184,6 +184,10 @@ fn bucket_lifecycle_signed() {
     assert_eq!(s, 200);
     let (s, _, _) = signed(&client, "HEAD", &base, "/ghost", b"", KEY, SECRET, &now);
     assert_eq!(s, 404);
+    // HEAD / ký đúng method HEAD → 200 (client kiểu PBS `s3 check` HEAD service root;
+    // trước đây axum dồn vào handler GET hardcode method nên lệch chữ ký → 403).
+    let (s, _, _) = signed(&client, "HEAD", &base, "/", b"", KEY, SECRET, &now);
+    assert_eq!(s, 200);
     // ListBuckets thấy bucket.
     let (s, body, _) = signed(&client, "GET", &base, "/", b"", KEY, SECRET, &now);
     assert_eq!(s, 200);

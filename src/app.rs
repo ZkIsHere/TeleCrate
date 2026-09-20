@@ -170,7 +170,10 @@ pub fn router(
         )
         // GET / vừa là dashboard index (không auth) vừa là S3 ListBuckets (có auth) —
         // phân biệt bằng Authorization header, ghi rõ ở docs (M2.1).
-        .route("/", get(root_get))
+        // HEAD / riêng cho healthcheck kiểu PBS (`s3 check` HEAD service root):
+        // axum dồn HEAD vào handler GET, mà root_get hardcode method "GET" nên chữ ký
+        // HEAD luôn lệch → 403. Handler riêng verify đúng method "HEAD".
+        .route("/", get(root_get).head(head_root))
         // axum 0.7 dùng cú pháp `:param` (kiểu `{param}` là axum 0.8+ — đã từng 404 toàn bộ).
         .route(
             "/:bucket",
@@ -502,6 +505,38 @@ async fn root_get(
         },
         Err(e) => e.into_response(),
     }
+}
+
+/// HEAD /: kiểm tra kết nối + auth cho client kiểu PBS (`s3 check` HEAD service root).
+/// Trả 200 rỗng khi verify đúng (không liệt kê bucket như GET).
+async fn head_root(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    raw_query: RawQuery,
+) -> Response {
+    let request_id = telecrate::s3::new_request_id();
+    let query = raw_query.0.as_deref().unwrap_or("");
+    // Không Authorization → dashboard (axum tự lược body ở HEAD).
+    if !headers.contains_key("authorization") && !query.contains("X-Amz-Algorithm") {
+        return telecrate::admin::get_dashboard_html().await;
+    }
+    if let Err(e) = authenticate(
+        &state,
+        &AuthInput {
+            method: "HEAD",
+            path: "/",
+            query,
+            headers: &headers,
+            body: b"",
+            resource: "/",
+            request_id: &request_id,
+        },
+    )
+    .await
+    {
+        return e.into_response();
+    }
+    empty_ok_response(&request_id)
 }
 
 /// GET /{bucket}: ?location → GetBucketLocation; ngược lại ListObjects (→ 501 ở 2.1).

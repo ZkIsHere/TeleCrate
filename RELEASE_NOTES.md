@@ -1,3 +1,30 @@
+# TeleCrate v0.3.3-beta.4 — Release Notes (pre-release)
+
+Phiên bản **beta** sửa bước `s3 check` của PBS: `HEAD /` (service root) bị 403
+`SignatureDoesNotMatch` dù key đúng — axum dồn HEAD vào handler GET mà handler này
+hardcode method `"GET"` khi verify, nên chữ ký HEAD luôn lệch.
+
+---
+
+## 🌟 Điểm nổi bật trong phiên bản v0.3.3-beta.4
+
+### 1. Handler HEAD / riêng (`head_root`)
+* Route `/` thêm `.head(head_root)`: verify đúng method `"HEAD"`, trả 200 rỗng
+  khi auth đúng (không liệt kê bucket như GET).
+* Test hồi quy trong `tests/buckets_api.rs`: `HEAD /` ký HEAD phải 200.
+
+### Nâng cấp từ beta.3
+Thay binary, giữ DB/spool (không migration mới):
+```bash
+sudo systemctl stop telecrate
+curl -fsSL https://github.com/ZkIsHere/TeleCrate/releases/download/v0.3.3-beta.4/telecrate-linux-amd64.tar.gz | sudo tar -xz -C /usr/local/bin/
+sudo systemctl start telecrate
+```
+Rồi thử lại trên PBS: `proxmox-backup-manager s3 check telecrate pbs`
+(kỳ vọng qua `head object`, rồi tới `put/get/delete` probe `.s3-client-test`).
+
+---
+
 # TeleCrate v0.3.3-beta.3 — Release Notes (pre-release)
 
 Phiên bản **beta** sửa bước ListBuckets với PBS: auth đã qua (400 hết) nhưng PBS báo
