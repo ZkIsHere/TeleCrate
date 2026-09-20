@@ -1,3 +1,60 @@
+# TeleCrate v0.3.1 — Release Notes
+
+Phiên bản **TeleCrate v0.3.1** là bản vá phát hành TLS native + DAL async dual-backend
+SQLite/Postgres, đồng thời sửa 3 lỗi thật làm đỏ CI sau v0.3.0: worker lồng runtime
+(panic `Cannot drop a runtime...` → live-e2e timeout), daemon mặc định HTTPS trong khi
+script test gọi HTTP, và CLI hardcode HTTP.
+
+---
+
+## 🌟 Điểm nổi bật trong phiên bản v0.3.1
+
+### 1. DAL async dual-backend SQLite/Postgres + TLS native (phát hành chính thức)
+* Toàn bộ DAL chuyển sang `telecrate::db::Db` async trên sqlx, hỗ trợ song song SQLite
+  và Postgres (bind `?` một lần, tự rebind `$N`); DDL Postgres tương đương SQLite
+  0001→0004 tại `migrations/postgres/`.
+* Serve HTTPS mặc định (rustls/ring thuần Rust): chưa có cert/key thì tự sinh self-signed
+  lúc khởi động, fingerprint SHA-256 cho client S3 bắt HTTPS; dashboard có fieldset
+  TLS/HTTPS + tab **Kết nối** (preset PBS/AWS CLI/rclone).
+
+### 2. Sửa worker lồng runtime gây timeout live-e2e
+* `process_one_job` async gọi `transport.upload()` blocking bên trong `block_on`
+  `current_thread` → panic và kẹt job ở `pending`. Tách `process_one_job_sync`:
+  DB `block_on` từng bước ngắn, upload gọi **ngoài** mọi async context.
+* Live Telegram e2e xanh trở lại (PUT → GET spool → worker remote → GET Telegram → DELETE).
+
+### 3. Sửa HTTPS-vs-HTTP làm đỏ CI website/conformance
+* `tests/website.sh` và job `awscli-conformance` trong CI tạo config thiếu `tls_enabled`
+  nên rơi vào default `true` (HTTPS) trong khi curl/AWS CLI gọi `http://`.
+* Đặt `tls_enabled = false` tường minh cho smoke test HTTP; CLI (`status/gc/config`)
+  hỗ trợ cả hai scheme theo `tls_enabled`, chấp nhận self-signed local.
+
+---
+
+## 🔄 Hướng dẫn Nâng cấp từ v0.3.0 lên v0.3.1
+
+Không có migration SQLite mới (schema giữ nguyên) — nâng cấp nhị phân, giữ DB/spool:
+
+```bash
+# 1. Dừng service
+sudo systemctl stop telecrate
+
+# 2. Tải binary v0.3.1 mới nhất và ghi đè
+curl -fsSL https://github.com/ZkIsHere/TeleCrate/releases/download/v0.3.1/telecrate-linux-amd64.tar.gz | sudo tar -xz -C /usr/local/bin/
+
+# 3. Khởi động lại service
+sudo systemctl start telecrate
+
+# 4. Kiểm tra trạng thái hoạt động
+sudo systemctl status telecrate
+```
+
+Lưu ý: daemon mặc định serve **HTTPS** (tự sinh self-signed nếu chưa có cert). Dashboard
+mở qua `https://<host>:<port>/` (trình duyệt cảnh báo self-signed lần đầu); smoke test
+nội bộ dùng `tls_enabled = false` để giữ HTTP.
+
+---
+
 # TeleCrate v0.3.0 — Release Notes
 
 Phiên bản **TeleCrate v0.3.0** bổ sung cấu hình vị trí spool (dashboard + installer),
