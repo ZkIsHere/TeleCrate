@@ -188,6 +188,42 @@ fn bucket_lifecycle_signed() {
     // trước đây axum dồn vào handler GET hardcode method nên lệch chữ ký → 403).
     let (s, _, _) = signed(&client, "HEAD", &base, "/", b"", KEY, SECRET, &now);
     assert_eq!(s, 200);
+    // PBS path-style: /bucket/ (trailing slash) phải là bucket-op, verify đúng
+    // path đã ký (không strip slash trước verify).
+    let (s, body, _) = signed(
+        &client,
+        "HEAD",
+        &base,
+        "/test-bucket/",
+        b"",
+        KEY,
+        SECRET,
+        &now,
+    );
+    assert_eq!(s, 200, "HEAD /bucket/ body was: {body}");
+    let (s, body, _) = signed(
+        &client,
+        "GET",
+        &base,
+        "/test-bucket/",
+        b"",
+        KEY,
+        SECRET,
+        &now,
+    );
+    assert_eq!(s, 200, "GET /bucket/ body was: {body}");
+    let (s, body, _) = signed(
+        &client,
+        "GET",
+        &base,
+        "/test-bucket/?list-type=2",
+        b"",
+        KEY,
+        SECRET,
+        &now,
+    );
+    assert_eq!(s, 200, "GET /bucket/?list-type=2 body was: {body}");
+    assert!(body.contains("ListBucketResult"), "{body}");
     // ListBuckets thấy bucket.
     let (s, body, _) = signed(&client, "GET", &base, "/", b"", KEY, SECRET, &now);
     assert_eq!(s, 200);

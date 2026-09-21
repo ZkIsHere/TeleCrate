@@ -184,6 +184,18 @@ pub fn router(
                 .post(bucket_post)
                 .options(bucket_options),
         )
+        // Biến thể trailing slash (`/:bucket/`) cho client path-style kiểu PBS
+        // (build_uri ghép `/{bucket}/...`): cùng handler bucket, verify theo
+        // đúng path đã ký (OriginalUri) để không lệch chữ ký.
+        .route(
+            "/:bucket/",
+            get(bucket_get)
+                .put(create_bucket)
+                .delete(delete_bucket)
+                .head(head_bucket)
+                .post(bucket_post)
+                .options(bucket_options),
+        )
         // Object key có thể chứa `/` → wildcard (axum 0.7: `*key`).
         .route(
             "/:bucket/*key",
@@ -543,11 +555,14 @@ async fn head_root(
 async fn bucket_get(
     State(state): State<Arc<AppState>>,
     Path(bucket): Path<String>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     raw_query: RawQuery,
 ) -> Response {
     let request_id = telecrate::s3::new_request_id();
     let resource = format!("/{bucket}");
+    // Verify theo đúng path client đã ký (giữ trailing slash `/bucket/` của path-style).
+    let req_path = uri.path().to_string();
     let query = raw_query.0.as_deref().unwrap_or("");
     let qmap = query_map(query);
 
@@ -570,7 +585,7 @@ async fn bucket_get(
         None,
         &AuthInput {
             method: "GET",
-            path: &resource,
+            path: &req_path,
             query,
             headers: &headers,
             body: b"",
@@ -1256,7 +1271,7 @@ async fn bucket_post(
         &state,
         &AuthInput {
             method: "POST",
-            path: &format!("/{bucket}"),
+            path: uri.path(),
             query: raw_query,
             headers: &headers,
             body: &body,
@@ -1401,12 +1416,14 @@ fn parse_delete_xml(text: &str) -> Result<(Vec<String>, bool), &'static str> {
 async fn create_bucket(
     State(state): State<Arc<AppState>>,
     Path(bucket): Path<String>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     raw_query: RawQuery,
     body: Bytes,
 ) -> Response {
     let request_id = telecrate::s3::new_request_id();
     let resource = format!("/{bucket}");
+    let req_path = uri.path().to_string();
     let query = raw_query.0.as_deref().unwrap_or("");
     let qmap = query_map(query);
 
@@ -1429,7 +1446,7 @@ async fn create_bucket(
         None,
         &AuthInput {
             method: "PUT",
-            path: &resource,
+            path: &req_path,
             query,
             headers: &headers,
             body: &body,
@@ -1501,11 +1518,13 @@ async fn create_bucket(
 async fn delete_bucket(
     State(state): State<Arc<AppState>>,
     Path(bucket): Path<String>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     raw_query: RawQuery,
 ) -> Response {
     let request_id = telecrate::s3::new_request_id();
     let resource = format!("/{bucket}");
+    let req_path = uri.path().to_string();
     let query = raw_query.0.as_deref().unwrap_or("");
     let qmap = query_map(query);
 
@@ -1526,7 +1545,7 @@ async fn delete_bucket(
         None,
         &AuthInput {
             method: "DELETE",
-            path: &resource,
+            path: &req_path,
             query,
             headers: &headers,
             body: b"",
@@ -1584,17 +1603,19 @@ async fn delete_bucket(
 async fn head_bucket(
     State(state): State<Arc<AppState>>,
     Path(bucket): Path<String>,
+    OriginalUri(uri): OriginalUri,
     headers: HeaderMap,
     raw_query: RawQuery,
 ) -> Response {
     let request_id = telecrate::s3::new_request_id();
     let resource = format!("/{bucket}");
+    let req_path = uri.path().to_string();
     let query = raw_query.0.as_deref().unwrap_or("");
     if let Err(e) = authenticate(
         &state,
         &AuthInput {
             method: "HEAD",
-            path: &resource,
+            path: &req_path,
             query,
             headers: &headers,
             body: b"",

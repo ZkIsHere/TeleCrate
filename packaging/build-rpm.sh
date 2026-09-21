@@ -3,7 +3,7 @@ set -euo pipefail
 
 # Script tạo gói cài đặt Linux Tarball & RPM cho TeleCrate
 
-VERSION="0.3.3-beta.4"
+VERSION="0.3.3-beta.5"
 DIST_DIR="target/dist/telecrate-v${VERSION}-linux-amd64"
 
 echo "==> Building release binary..."

@@ -1,3 +1,32 @@
+# TeleCrate v0.3.3-beta.5 — Release Notes (pre-release)
+
+Phiên bản **beta** sửa bước `s3 check`/tạo datastore của PBS: với endpoint path-style,
+PBS gọi `HEAD /pbs/` (trailing slash) nhưng route `/:bucket` của TeleCrate không khớp
+→ axum 404 (không log) → PBS báo bucket không tồn tại.
+
+---
+
+## 🌟 Điểm nổi bật trong phiên bản v0.3.3-beta.5
+
+### 1. Route `/:bucket/` + verify đúng path đã ký
+* Thêm route `/:bucket/` mirror đủ 6 method bucket (GET/PUT/DELETE/HEAD/POST/OPTIONS).
+* Các handler bucket verify theo `OriginalUri` (giữ nguyên trailing slash client đã ký)
+  thay vì dựng lại `/{bucket}` — strip slash trước verify sẽ lệch chữ ký.
+* Test hồi quy: `HEAD /bucket/`, `GET /bucket/`, `GET /bucket/?list-type=2` đều 200.
+
+### Nâng cấp từ beta.4
+Thay binary, giữ DB/spool (không migration mới):
+```bash
+sudo systemctl stop telecrate
+curl -fsSL https://github.com/ZkIsHere/TeleCrate/releases/download/v0.3.3-beta.5/telecrate-linux-amd64.tar.gz | sudo tar -xz -C /usr/local/bin/
+sudo systemctl start telecrate
+```
+Rồi thử lại trên PBS: `proxmox-backup-manager s3 check telecrate pbs`
+(kỳ vọng qua `head`, rồi tới `put/get/delete` probe `.s3-client-test`), sau đó tạo
+datastore trên UI.
+
+---
+
 # TeleCrate v0.3.3-beta.4 — Release Notes (pre-release)
 
 Phiên bản **beta** sửa bước `s3 check` của PBS: `HEAD /` (service root) bị 403

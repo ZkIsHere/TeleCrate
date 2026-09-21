@@ -76,6 +76,7 @@
 - **v0.3.3-beta.2 (2026-09-20): `implemented-unverified`** — Pre-release tương thích PBS S3: parser `Authorization` chịu cả `,` lẫn `, ` (PBS gửi format không space → 400 `AuthorizationHeaderMalformed` dù region/key đúng); thêm log `sigv4 auth failed` chỉ mã lỗi + request-id. Chờ verify `list-buckets` từ PBS thật.
 - **v0.3.3-beta.3 (2026-09-20): `implemented-unverified`** — Pre-release tương thích PBS S3 (tiếp): `CreationDate` trong ListBuckets chuyển sang ISO-8601 strict (`...T....000Z`) cho parser `iso8601::datetime` của PBS; format DB cũ làm PBS báo `failed to parse response body`. Chờ verify list-buckets + dropdown UI từ PBS thật.
 - **v0.3.3-beta.4 (2026-09-20): `implemented-unverified`** — Pre-release tương thích PBS S3 (tiếp): handler `HEAD /` riêng (`head_root`) verify đúng method HEAD; trước đó axum dồn HEAD vào `root_get` hardcode GET → 403 `SignatureDoesNotMatch` làm `s3 check`/tạo datastore báo bucket không tồn tại. Chờ verify `s3 check` + backup thử từ PBS thật.
+- **v0.3.3-beta.5 (2026-09-21): `implemented-unverified`** — Pre-release tương thích PBS S3 (tiếp): route `/:bucket/` cho path-style (`HEAD /pbs/` của `s3 check` trước đó 404 câm lặng vì không khớp route); handler bucket verify theo `OriginalUri` giữ trailing slash đã ký. Chờ verify `s3 check` + tạo datastore + backup thử từ PBS thật.
 
 Không dừng ở demo upload/download rồi tuyên bố xong. Mỗi milestone chỉ sang tiếp khi required checks của SHA đó xanh.
 
