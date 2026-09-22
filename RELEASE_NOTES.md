@@ -1,3 +1,49 @@
+# TeleCrate v0.3.3-beta.8 — Release Notes (pre-release)
+
+Phiên bản **beta** dọn schema DB (migration 0005) + 3 bug fix GC/jobs/delete.
+**Bản này CÓ migration — đọc kỹ mục nâng cấp trước khi restart daemon.**
+
+---
+
+## 🌟 Điểm nổi bật trong phiên bản v0.3.3-beta.8
+
+### 1. Migration 0005: dọn bảng/cột chết (audit toàn diện schema)
+* Xóa bảng chết `kv`, `recovery_checkpoints` (không code path nào dùng).
+* Xóa cột chết: `chunks.nonce`/`offset`, `buckets.encryption_override`,
+  `upload_jobs.generation`, `multipart_parts.remote_locator_json`/`state`.
+* Thêm index `upload_jobs(state, next_attempt)` cho worker claim poll.
+
+### 2. Ba bug fix đi kèm audit
+* GC spool trước đây tìm chunk `telegram-committed` (giá trị không bao giờ được
+  set) nên rò rỉ spool khi crash — giờ quét chunk `remote` còn spool.
+* Dashboard "Hoàn tất" luôn 0 vì đếm state `completed` không tồn tại — giờ đếm
+  `done` thật.
+* Xóa bucket còn multipart upload dở dang nổ lỗi FK 500 — giờ chặn 409
+  `BucketNotEmpty` đúng S3.
+
+### Nâng cấp từ beta.7 — patches tự áp dụng đúng không?
+**Có.** Daemon tự chạy `apply_all_migrations` mỗi lần khởi động: phát hiện DB
+đang ở version 4 → apply đúng 0005 → lên version 5. Không cần chạy lệnh migrate
+tay. Kiểm chứng sau restart:
+```bash
+telecrate status   # kỳ vọng: migrations version=5, integrity ok
+```
+(Muốn migrate tay có backup file tự động: `telecrate migrations apply`.)
+An toàn dữ liệu: 0005 chỉ DROP bảng/cột đã chứng minh không dùng (toàn NULL/
+default) + CREATE INDEX — không động tới dữ liệu objects/chunks/jobs. Tuy vậy
+migration là forward-only (không downgrade về beta.7 sau khi lên 5, vì binary
+cũ query cột đã xóa), nên **backup trước khi nâng cấp**:
+```bash
+sudo systemctl stop telecrate
+telecrate db backup /var/backups/telecrate-pre-beta8.db
+curl -fsSL https://github.com/ZkIsHere/TeleCrate/releases/download/v0.3.3-beta.8/telecrate-linux-amd64.tar.gz | sudo tar -xz -C /usr/local/bin/
+sudo systemctl start telecrate
+```
+(Postgres: `pg_dump` thay cho `db backup`; migration Postgres tương đương chạy
+tự động như SQLite.)
+
+---
+
 # TeleCrate v0.3.3-beta.7 — Release Notes (pre-release)
 
 Phiên bản **beta** migrate toàn bộ DB layer sang SeaORM + SeaQuery (ADR 0006):

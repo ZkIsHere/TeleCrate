@@ -3211,6 +3211,125 @@ mod tests {
             .is_none());
     }
 
+    /// Mô phỏng nâng cấp production v4 → 5: DB cũ có dữ liệu + bảng chết,
+    /// apply_all_migrations phải lên 5, giữ dữ liệu, xóa đúng schema thừa.
+    #[tokio::test]
+    async fn migration_0005_upgrades_v4_db_keeps_data() {
+        use sea_orm::{ConnectionTrait, Statement};
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("v4.db");
+        let db = Db::open_sqlite(db_path.to_str().unwrap()).await.unwrap();
+        // Dừng ở version 4 như production beta.7.
+        apply_migration(&db, 1, MIGRATION_001).await.unwrap();
+        apply_migration(&db, 2, MIGRATION_002).await.unwrap();
+        apply_migration(&db, 3, MIGRATION_003).await.unwrap();
+        apply_migration(&db, 4, MIGRATION_004).await.unwrap();
+        assert_eq!(schema_version(&db).await.unwrap(), 4);
+
+        create_bucket(&db, "up-bkt", "us-east-1").await.unwrap();
+        // Ghi dữ liệu bằng đúng schema v4 (gồm cột `offset` sắp bị xóa) —
+        // mô phỏng DB production do binary beta.7 ghi.
+        db.sea_conn()
+            .execute_unprepared(
+                "INSERT INTO objects(bucket, key, version_id, is_delete_marker, storage_state, size, etag, content_type) \
+                 VALUES ('up-bkt', 'k', 'v1', 0, 'accepted-local', 3, 'etag', 'text/plain')",
+            )
+            .await
+            .unwrap();
+        db.sea_conn()
+            .execute_unprepared(
+                "INSERT INTO chunks(version_id, idx, \"offset\", length, plaintext_sha256, ciphertext_sha256, encryption_mode, spool_path, state) \
+                 VALUES ('v1', 0, 0, 3, 'p', 'c', 'none', 'spool/x.chunk', 'pending')",
+            )
+            .await
+            .unwrap();
+        db.sea_conn()
+            .execute_unprepared(
+                "INSERT INTO upload_jobs(job_id, version_id, state) VALUES ('job-up', 'v1', 'pending')",
+            )
+            .await
+            .unwrap();
+        // Hàng trong bảng chết (sẽ bị DROP cùng bảng).
+        db.sea_conn()
+            .execute_unprepared("INSERT INTO kv(key, value) VALUES ('a', 'b')")
+            .await
+            .unwrap();
+
+        // Nâng cấp: chỉ apply đúng delta 4 → 5.
+        assert_eq!(apply_all_migrations(&db).await.unwrap(), 5);
+        assert_eq!(schema_version(&db).await.unwrap(), 5);
+
+        // Dữ liệu thật còn nguyên, đọc được qua DAL mới.
+        assert!(head_bucket(&db, "up-bkt").await.unwrap());
+        let v = latest_version(&db, "up-bkt", "k").await.unwrap().unwrap();
+        assert_eq!(v.version_id, "v1");
+        assert_eq!(v.size, 3);
+        let (jobs, _) = list_jobs(&db).await.unwrap();
+        assert_eq!(jobs.len(), 1);
+
+        // Bảng chết đã mất.
+        let tables: Vec<String> = db
+            .sea_conn()
+            .query_all(Statement::from_string(
+                sea_orm::DbBackend::Sqlite,
+                "SELECT name AS name FROM sqlite_master WHERE type = 'table'".to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.try_get::<String>("", "name").unwrap())
+            .collect();
+        assert!(!tables
+            .iter()
+            .any(|t| t == "kv" || t == "recovery_checkpoints"));
+
+        // Cột chết đã mất, cột sống còn đủ.
+        let cols: Vec<String> = db
+            .sea_conn()
+            .query_all(Statement::from_string(
+                sea_orm::DbBackend::Sqlite,
+                "SELECT name AS name FROM pragma_table_info('chunks')".to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.try_get::<String>("", "name").unwrap())
+            .collect();
+        for gone in ["nonce", "offset"] {
+            assert!(
+                !cols.iter().any(|c| c == gone),
+                "column chunks.{gone} should be gone"
+            );
+        }
+        for kept in [
+            "version_id",
+            "idx",
+            "length",
+            "spool_path",
+            "remote_locator_json",
+            "state",
+        ] {
+            assert!(
+                cols.iter().any(|c| c == kept),
+                "column chunks.{kept} must survive"
+            );
+        }
+
+        // Index mới cho worker claim poll.
+        let idx: Vec<String> = db
+            .sea_conn()
+            .query_all(Statement::from_string(
+                sea_orm::DbBackend::Sqlite,
+                "SELECT name AS name FROM sqlite_master WHERE type = 'index' AND name = 'idx_upload_jobs_state_next'".to_string(),
+            ))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|r| r.try_get::<String>("", "name").unwrap())
+            .collect();
+        assert_eq!(idx.len(), 1);
+    }
+
     #[tokio::test]
     async fn pragmas_wal_fk_busy_timeout() {
         let (_d, db) = test_db().await;
