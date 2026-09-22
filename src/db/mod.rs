@@ -1338,6 +1338,7 @@ pub struct ChunkRow {
     pub state: String,
     pub encryption_mode: String,
     pub key_ref: Option<String>,
+    pub remote_locator_json: Option<String>,
 }
 
 /// Chunk mới để ghi trong `put_object`. Tách bạch plaintext checksum / ciphertext
@@ -1617,6 +1618,7 @@ pub async fn chunks_of(db: &Db, version_id: &str) -> Result<Vec<ChunkRow>, Strin
             state: m.state,
             encryption_mode: m.encryption_mode,
             key_ref: m.key_ref,
+            remote_locator_json: m.remote_locator_json,
         })
         .collect())
 }
@@ -2298,6 +2300,298 @@ pub async fn job_summary(db: &Db) -> Result<JobSummary, String> {
         completed: count(&conn, "completed").await.unwrap_or(0),
         failed: count(&conn, "failed").await.unwrap_or(0),
     })
+}
+
+// Worker job-lease ops (M2.2) — SQL nguyên tử tập trung tại DAL (ADR 0006 Phase 3b).
+// worker.rs chỉ gọi các hàm này, không viết SQL inline. Không giữ txn mở suốt
+// network upload: mỗi op là 1 statement độc lập, lease chống giành nhau.
+
+/// Job vừa claim được.
+#[derive(Debug, Clone)]
+pub struct ClaimedJob {
+    pub job_id: String,
+    pub version_id: String,
+    pub retry_count: i64,
+}
+
+/// Claim 1 job sẵn sàng bằng lease. Lấy job `pending` tới hạn, hoặc job
+/// `uploading` mà lease đã hết (worker cũ chết giữa chừng — reclaim).
+/// `now` chấp nhận cả ISO-8601 và chuẩn TEXT, chuẩn hóa trước khi so sánh.
+pub async fn claim_job(
+    db: &Db,
+    owner: &str,
+    lease_secs: i64,
+    now: &str,
+) -> Result<Option<ClaimedJob>, String> {
+    use entities::upload_jobs::Column as J;
+    use sea_orm::Condition;
+    let normalized = now.replace('T', " ").trim_end_matches('Z').to_string();
+    let now = normalized.as_str();
+    let conn = db.sea_conn();
+    let row = entities::upload_jobs::Entity::find()
+        .select_only()
+        .column(J::JobId)
+        .column(J::VersionId)
+        .column(J::RetryCount)
+        .filter(J::NextAttempt.lte(now))
+        .filter(
+            Condition::any().add(J::State.eq("pending")).add(
+                Condition::all()
+                    .add(J::State.eq("uploading"))
+                    .add(J::LeaseExpires.is_not_null())
+                    .add(J::LeaseExpires.lte(now)),
+            ),
+        )
+        .order_by_asc(J::NextAttempt)
+        .into_tuple::<(String, String, i64)>()
+        .one(&conn)
+        .await
+        .map_err(|e| format!("poll: {e}"))?;
+    let Some((job_id, version_id, retry_count)) = row else {
+        return Ok(None);
+    };
+    // Claim nguyên tử: chỉ thắng khi job pending, hoặc uploading mà lease đã hết.
+    let lease_until = now_plus_str(lease_secs);
+    let res = entities::upload_jobs::Entity::update_many()
+        .col_expr(J::State, Expr::value("uploading".to_string()))
+        .col_expr(J::LeaseOwner, Expr::value(Some(owner.to_string())))
+        .col_expr(J::LeaseExpires, Expr::value(Some(lease_until)))
+        .filter(J::JobId.eq(job_id.as_str()))
+        .filter(
+            Condition::any().add(J::State.eq("pending")).add(
+                Condition::all().add(J::State.eq("uploading")).add(
+                    Condition::any()
+                        .add(J::LeaseExpires.is_null())
+                        .add(J::LeaseExpires.lte(now)),
+                ),
+            ),
+        )
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("claim: {e}"))?;
+    if res.rows_affected == 0 {
+        return Ok(None); // worker khác claim trước.
+    }
+    Ok(Some(ClaimedJob {
+        job_id,
+        version_id,
+        retry_count,
+    }))
+}
+
+/// Version còn tồn tại không (có thể đã bị DELETE sau khi job tạo).
+pub async fn object_version_exists(db: &Db, version_id: &str) -> Result<bool, String> {
+    use entities::objects::Column as O;
+    let conn = db.sea_conn();
+    entities::objects::Entity::find()
+        .select_only()
+        .column(O::VersionId)
+        .filter(O::VersionId.eq(version_id))
+        .into_tuple::<(String,)>()
+        .one(&conn)
+        .await
+        .map(|r| r.is_some())
+        .map_err(|e| format!("version check: {e}"))
+}
+
+/// Commit locator 1 chunk (giữ spool_path để GC xóa file sau).
+pub async fn commit_chunk_locator(
+    db: &Db,
+    version_id: &str,
+    idx: i64,
+    locator_json: &str,
+) -> Result<(), String> {
+    use entities::chunks::Column as C;
+    let conn = db.sea_conn();
+    entities::chunks::Entity::update_many()
+        .col_expr(C::State, Expr::value("remote".to_string()))
+        .col_expr(
+            C::RemoteLocatorJson,
+            Expr::value(Some(locator_json.to_string())),
+        )
+        .filter(C::VersionId.eq(version_id))
+        .filter(C::Idx.eq(idx))
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("commit chunk: {e}"))?;
+    Ok(())
+}
+
+/// Xóa file spool xong thì set `spool_path = NULL` (best-effort, caller bỏ qua lỗi).
+pub async fn clear_chunk_spool_path(db: &Db, version_id: &str, idx: i64) -> Result<(), String> {
+    use entities::chunks::Column as C;
+    let conn = db.sea_conn();
+    entities::chunks::Entity::update_many()
+        .col_expr(C::SpoolPath, Expr::value(None::<String>))
+        .filter(C::VersionId.eq(version_id))
+        .filter(C::Idx.eq(idx))
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("clear spool: {e}"))?;
+    Ok(())
+}
+
+/// Kết thúc job: version remote → objects `remote`; job `done` (hoặc `pending`
+/// lại) + xóa lease.
+pub async fn finish_upload_job(db: &Db, job_id: &str, done: bool) -> Result<(), String> {
+    use entities::upload_jobs::Column as J;
+    let conn = db.sea_conn();
+    if done {
+        if let Some(m) = entities::upload_jobs::Entity::find_by_id(job_id)
+            .one(&conn)
+            .await
+            .map_err(|e| format!("finish lookup: {e}"))?
+        {
+            use entities::objects::Column as O;
+            let _ = entities::objects::Entity::update_many()
+                .col_expr(O::StorageState, Expr::value("remote".to_string()))
+                .filter(O::VersionId.eq(m.version_id))
+                .exec(&conn)
+                .await;
+        }
+    }
+    entities::upload_jobs::Entity::update_many()
+        .col_expr(
+            J::State,
+            Expr::value(if done { "done" } else { "pending" }.to_string()),
+        )
+        .col_expr(J::LeaseOwner, Expr::value(None::<String>))
+        .col_expr(J::LeaseExpires, Expr::value(None::<String>))
+        .filter(J::JobId.eq(job_id))
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("finish job: {e}"))?;
+    Ok(())
+}
+
+/// Job lỗi transient: pending lại + retry_count tăng + lùi next_attempt.
+pub async fn fail_job_transient(
+    db: &Db,
+    job_id: &str,
+    retry_count: i64,
+    next_attempt: &str,
+    err_debug: &str,
+) -> Result<(), String> {
+    use entities::upload_jobs::Column as J;
+    let conn = db.sea_conn();
+    entities::upload_jobs::Entity::update_many()
+        .col_expr(J::State, Expr::value("pending".to_string()))
+        .col_expr(J::LeaseOwner, Expr::value(None::<String>))
+        .col_expr(J::LeaseExpires, Expr::value(None::<String>))
+        .col_expr(J::RetryCount, Expr::value(retry_count + 1))
+        .col_expr(J::NextAttempt, Expr::value(next_attempt.to_string()))
+        .col_expr(J::LastError, Expr::value(Some(err_debug.to_string())))
+        .filter(J::JobId.eq(job_id))
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("fail job: {e}"))?;
+    Ok(())
+}
+
+/// Job lỗi permanent: `failed` + xóa lease, giữ last_error.
+pub async fn fail_job_permanent(db: &Db, job_id: &str, err_debug: &str) -> Result<(), String> {
+    use entities::upload_jobs::Column as J;
+    let conn = db.sea_conn();
+    entities::upload_jobs::Entity::update_many()
+        .col_expr(J::State, Expr::value("failed".to_string()))
+        .col_expr(J::LeaseOwner, Expr::value(None::<String>))
+        .col_expr(J::LeaseExpires, Expr::value(None::<String>))
+        .col_expr(J::LastError, Expr::value(Some(err_debug.to_string())))
+        .filter(J::JobId.eq(job_id))
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("fail job: {e}"))?;
+    Ok(())
+}
+
+/// Đưa mọi job `failed` về `pending` (worker reset khi có transport mới).
+pub async fn reset_failed_jobs(db: &Db) -> Result<(), String> {
+    use entities::upload_jobs::Column as J;
+    let conn = db.sea_conn();
+    entities::upload_jobs::Entity::update_many()
+        .col_expr(J::State, Expr::value("pending".to_string()))
+        .col_expr(J::RetryCount, Expr::value(0i64))
+        .filter(J::State.eq("failed"))
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("reset failed jobs: {e}"))?;
+    Ok(())
+}
+
+/// Giờ DB hiện tại ở chuẩn TEXT (SQLite `datetime('now')`, Postgres `to_char`
+/// UTC) — cho worker/tests so sánh chuỗi với `next_attempt`/`lease_expires`.
+pub async fn db_now_str(db: &Db) -> Result<String, String> {
+    use sea_orm::{ConnectionTrait, Statement};
+    let sql = match db.backend() {
+        DbBackend::Sqlite => "SELECT datetime('now') AS now",
+        DbBackend::Postgres => {
+            "SELECT to_char(now() AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS') AS now"
+        }
+    };
+    db.sea_conn()
+        .query_one(Statement::from_string(sea_backend(db), sql.to_string()))
+        .await
+        .map_err(|e| format!("db now: {e}"))?
+        .ok_or_else(|| "db now: no row".to_string())?
+        .try_get("", "now")
+        .map_err(|e| format!("db now: {e}"))
+}
+
+/// Đọc state 1 job (cho tests/assert).
+pub async fn job_state(db: &Db, job_id: &str) -> Result<String, String> {
+    use entities::upload_jobs::Column as J;
+    let conn = db.sea_conn();
+    entities::upload_jobs::Entity::find()
+        .select_only()
+        .column(J::State)
+        .filter(J::JobId.eq(job_id))
+        .into_tuple::<(String,)>()
+        .one(&conn)
+        .await
+        .map_err(|e| format!("job state: {e}"))?
+        .map(|(s,)| s)
+        .ok_or_else(|| "job state: not found".to_string())
+}
+
+/// Đọc (state, retry_count) 1 job (cho tests/assert).
+pub async fn job_state_retry(db: &Db, job_id: &str) -> Result<(String, i64), String> {
+    use entities::upload_jobs::Column as J;
+    let conn = db.sea_conn();
+    entities::upload_jobs::Entity::find()
+        .select_only()
+        .column(J::State)
+        .column(J::RetryCount)
+        .filter(J::JobId.eq(job_id))
+        .into_tuple::<(String, i64)>()
+        .one(&conn)
+        .await
+        .map_err(|e| format!("job state: {e}"))?
+        .ok_or_else(|| "job state: not found".to_string())
+}
+
+/// Ép lease/state job (cho tests giả lập worker chết).
+pub async fn force_job_lease(
+    db: &Db,
+    job_id: &str,
+    state: &str,
+    owner: Option<&str>,
+    expires: Option<&str>,
+    next_attempt: Option<&str>,
+) -> Result<(), String> {
+    use entities::upload_jobs::Column as J;
+    let conn = db.sea_conn();
+    let mut q = entities::upload_jobs::Entity::update_many()
+        .col_expr(J::State, Expr::value(state.to_string()))
+        .col_expr(J::LeaseOwner, Expr::value(owner.map(|s| s.to_string())))
+        .col_expr(J::LeaseExpires, Expr::value(expires.map(|s| s.to_string())))
+        .filter(J::JobId.eq(job_id));
+    if let Some(n) = next_attempt {
+        q = q.col_expr(J::NextAttempt, Expr::value(n.to_string()));
+    }
+    q.exec(&conn)
+        .await
+        .map_err(|e| format!("force lease: {e}"))?;
+    Ok(())
 }
 
 // Bucket Policy

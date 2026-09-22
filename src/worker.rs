@@ -4,63 +4,18 @@
 //! commit locator. Job dùng lease để nhiều worker không giành nhau (M2.2 chạy 1 worker;
 //! lease/timeout bảo vệ khi process chết giữa chừng).
 
-use crate::db::{Db, Val};
+use crate::db::{ClaimedJob, Db};
 use crate::telegram::{RemoteLocator, Transport, TransportError};
 
-/// Claim 1 job sẵn sàng bằng lease. Lấy job `pending` tới hạn, hoặc job `uploading`
-/// mà lease đã hết (worker cũ chết giữa chừng — reclaim, chống kẹt hàng đợi).
-///
-/// `now` so sánh chuỗi với cột datetime TEXT (`YYYY-MM-DD HH:MM:SS`); hàm chấp nhận
-/// cả ISO-8601 (`YYYY-MM-DDTHH:MM:SSZ`) và chuẩn hóa trước khi so sánh để caller
-/// khác format không claim sai lặng lẽ.
+/// Claim 1 job sẵn sàng bằng lease — SQL nguyên tử nằm ở DAL
+/// (`crate::db::claim_job`), worker chỉ gọi.
 async fn claim_job(
     db: &Db,
     owner: &str,
     lease_secs: i64,
     now: &str,
-) -> Result<Option<Claimed>, String> {
-    let normalized = now.replace('T', " ").trim_end_matches('Z').to_string();
-    let now = normalized.as_str();
-    let rows = crate::db::fetch_all(
-        db,
-        "SELECT job_id, version_id, retry_count FROM upload_jobs WHERE next_attempt <= ? AND ((state = 'pending') OR (state = 'uploading' AND lease_expires IS NOT NULL AND lease_expires <= ?)) ORDER BY next_attempt LIMIT 1",
-        &[Val::text(now), Val::text(now)],
-    )
-    .await
-    .map_err(|e| format!("poll: {e}"))?;
-    let Some(row) = rows.into_iter().next() else {
-        return Ok(None);
-    };
-    let job = Claimed {
-        job_id: row.get_string(0).map_err(|e| format!("row: {e}"))?,
-        version_id: row.get_string(1).map_err(|e| format!("row: {e}"))?,
-        retry_count: row.get_i64(2).map_err(|e| format!("row: {e}"))?,
-    };
-    // Claim atomic: chỉ thắng khi job pending, hoặc uploading mà lease đã hết.
-    // (Nếu khớp cả uploading còn lease, 2 worker sẽ xử lý trùng job.)
-    let lease_until = crate::db::now_plus_str(lease_secs);
-    let n = crate::db::exec(
-        db,
-        "UPDATE upload_jobs SET state = 'uploading', lease_owner = ?, lease_expires = ? WHERE job_id = ? AND (state = 'pending' OR (state = 'uploading' AND (lease_expires IS NULL OR lease_expires <= ?)))",
-        &[
-            Val::text(owner),
-            Val::text(&lease_until),
-            Val::text(&job.job_id),
-            Val::text(now),
-        ],
-    )
-    .await
-    .map_err(|e| format!("claim: {e}"))?;
-    if n == 0 {
-        return Ok(None); // worker khác claim trước.
-    }
-    Ok(Some(job))
-}
-
-struct Claimed {
-    job_id: String,
-    version_id: String,
-    retry_count: i64,
+) -> Result<Option<ClaimedJob>, String> {
+    crate::db::claim_job(db, owner, lease_secs, now).await
 }
 
 /// Xử lý 1 job đã claim: upload từng chunk pending → commit locator → xong job → GC spool.
@@ -77,14 +32,7 @@ pub async fn process_one_job(
         return Ok(false);
     };
     // Version còn tồn tại không (có thể đã bị DELETE sau khi job tạo)?
-    let version_alive = crate::db::count(
-        db,
-        "SELECT COUNT(*) FROM objects WHERE version_id = ?",
-        &[Val::text(&job.version_id)],
-    )
-    .await
-    .map_err(|e| format!("version check: {e}"))?;
-    if version_alive == 0 {
+    if !crate::db::object_version_exists(db, &job.version_id).await? {
         finish_job(db, &job.job_id, true).await?;
         return Ok(true);
     }
@@ -112,12 +60,7 @@ pub async fn process_one_job(
         for c in &chunks {
             if let Some(p) = &c.spool_path {
                 let _ = std::fs::remove_file(p);
-                let _ = crate::db::exec(
-                    db,
-                    "UPDATE chunks SET spool_path = NULL WHERE version_id = ? AND idx = ?",
-                    &[Val::text(&job.version_id), Val::int(c.idx)],
-                )
-                .await;
+                let _ = crate::db::clear_chunk_spool_path(db, &job.version_id, c.idx).await;
             }
         }
     }
@@ -136,47 +79,14 @@ async fn commit_chunk(
     loc: &RemoteLocator,
 ) -> Result<(), String> {
     // Giữ spool_path để GC xóa file sau; read fallback sang Telegram khi file mất.
-    crate::db::exec(
-        db,
-        "UPDATE chunks SET state = 'remote', remote_locator_json = ? WHERE version_id = ? AND idx = ?",
-        &[Val::text(&locator_json(loc)), Val::text(version_id), Val::int(idx)],
-    )
-    .await
-    .map_err(|e| format!("commit chunk: {e}"))?;
-    Ok(())
+    crate::db::commit_chunk_locator(db, version_id, idx, &locator_json(loc)).await
 }
 
 async fn finish_job(db: &Db, job_id: &str, done: bool) -> Result<(), String> {
-    if done {
-        if let Some(r) = crate::db::fetch_opt(
-            db,
-            "SELECT version_id FROM upload_jobs WHERE job_id = ?",
-            &[Val::text(job_id)],
-        )
-        .await
-        .map_err(|e| format!("finish lookup: {e}"))?
-        {
-            if let Ok(v_id) = r.get_string(0) {
-                let _ = crate::db::exec(
-                    db,
-                    "UPDATE objects SET storage_state = 'remote' WHERE version_id = ?",
-                    &[Val::text(&v_id)],
-                )
-                .await;
-            }
-        }
-    }
-    crate::db::exec(
-        db,
-        "UPDATE upload_jobs SET state = ?, lease_owner = NULL, lease_expires = NULL WHERE job_id = ?",
-        &[Val::text(if done { "done" } else { "pending" }), Val::text(job_id)],
-    )
-    .await
-    .map_err(|e| format!("finish job: {e}"))?;
-    Ok(())
+    crate::db::finish_upload_job(db, job_id, done).await
 }
 
-async fn fail_job(db: &Db, job: &Claimed, e: &TransportError) -> Result<(), String> {
+async fn fail_job(db: &Db, job: &ClaimedJob, e: &TransportError) -> Result<(), String> {
     match e {
         TransportError::Transient {
             retry_after_secs, ..
@@ -187,25 +97,19 @@ async fn fail_job(db: &Db, job: &Claimed, e: &TransportError) -> Result<(), Stri
                 .max(30 << job.retry_count.min(6))
                 .min(3600);
             let next = crate::db::now_plus_str(backoff as i64);
-            crate::db::exec(
+            crate::db::fail_job_transient(
                 db,
-                "UPDATE upload_jobs SET state = 'pending', lease_owner = NULL, lease_expires = NULL, retry_count = retry_count + 1, next_attempt = ?, last_error = ? WHERE job_id = ?",
-                &[Val::text(&next), Val::text(&format!("{e:?}")), Val::text(&job.job_id)],
+                &job.job_id,
+                job.retry_count,
+                &next,
+                &format!("{e:?}"),
             )
             .await
-            .map_err(|e| format!("fail job: {e}"))?;
         }
         TransportError::Permanent { .. } => {
-            crate::db::exec(
-                db,
-                "UPDATE upload_jobs SET state = 'failed', lease_owner = NULL, lease_expires = NULL, last_error = ? WHERE job_id = ?",
-                &[Val::text(&format!("{e:?}")), Val::text(&job.job_id)],
-            )
-            .await
-            .map_err(|e| format!("fail job: {e}"))?;
+            crate::db::fail_job_permanent(db, &job.job_id, &format!("{e:?}")).await
         }
     }
-    Ok(())
 }
 
 /// Xử lý 1 job kiểu đồng bộ cho worker thread: DB qua `rt.block_on` từng bước ngắn,
@@ -224,14 +128,7 @@ pub fn process_one_job_sync(
     let Some(job) = claimed else {
         return Ok(false);
     };
-    let version_alive = rt
-        .block_on(crate::db::count(
-            db,
-            "SELECT COUNT(*) FROM objects WHERE version_id = ?",
-            &[Val::text(&job.version_id)],
-        ))
-        .map_err(|e| format!("version check: {e}"))?;
-    if version_alive == 0 {
+    if !rt.block_on(crate::db::object_version_exists(db, &job.version_id))? {
         rt.block_on(finish_job(db, &job.job_id, true))?;
         return Ok(true);
     }
@@ -258,10 +155,10 @@ pub fn process_one_job_sync(
     for c in &chunks {
         if let Some(p) = &c.spool_path {
             let _ = std::fs::remove_file(p);
-            let _ = rt.block_on(crate::db::exec(
+            let _ = rt.block_on(crate::db::clear_chunk_spool_path(
                 db,
-                "UPDATE chunks SET spool_path = NULL WHERE version_id = ? AND idx = ?",
-                &[Val::text(&job.version_id), Val::int(c.idx)],
+                &job.version_id,
+                c.idx,
             ));
         }
     }
@@ -347,16 +244,7 @@ pub fn run_loop_dynamic(
                     cached_token = bot_token;
                     cached_chat_id = chat_id;
                     cached_transport = Some(t);
-                    let reset: Result<(), String> = rt.block_on(async {
-                        crate::db::exec(
-                            &db,
-                            "UPDATE upload_jobs SET state = 'pending', retry_count = 0 WHERE state = 'failed'",
-                            &[],
-                        )
-                        .await
-                        .map(|_| ())
-                    });
-                    let _ = reset;
+                    let _ = rt.block_on(crate::db::reset_failed_jobs(&db));
                 }
                 Err(e) => {
                     tracing::warn!("Worker '{owner}' khởi tạo transport thất bại: {e:?}");
@@ -452,9 +340,7 @@ mod tests {
 
     /// Giờ DB hiện tại để job tới hạn claim được.
     async fn db_now(conn: &Db) -> String {
-        crate::db::query_scalar_string(conn, "SELECT datetime('now')", &[])
-            .await
-            .unwrap()
+        crate::db::db_now_str(conn).await.unwrap()
     }
 
     #[tokio::test]
@@ -499,22 +385,12 @@ mod tests {
         let chunks = crate::db::chunks_of(&conn, "v1").await.unwrap();
         assert_eq!(chunks[0].state, "remote");
         assert!(!spool.exists());
-        let loc: String = crate::db::query_scalar_string(
-            &conn,
-            "SELECT remote_locator_json FROM chunks WHERE version_id = 'v1'",
-            &[],
-        )
-        .await
-        .unwrap();
+        let loc = crate::db::chunks_of(&conn, "v1").await.unwrap()[0]
+            .remote_locator_json
+            .clone()
+            .unwrap();
         assert!(loc.contains("\"file_id\":\"f1\""), "{loc}");
-        let st: String = crate::db::query_scalar_string(
-            &conn,
-            "SELECT state FROM upload_jobs WHERE job_id = 'job1'",
-            &[],
-        )
-        .await
-        .unwrap();
-        assert_eq!(st, "done");
+        assert_eq!(crate::db::job_state(&conn, "job1").await.unwrap(), "done");
     }
 
     #[tokio::test]
@@ -588,15 +464,7 @@ mod tests {
                 .await
                 .unwrap()
         );
-        let row = crate::db::query_row(
-            &conn,
-            "SELECT state, retry_count FROM upload_jobs WHERE job_id = 'job2'",
-            &[],
-        )
-        .await
-        .unwrap();
-        let st = row.get_string(0).unwrap();
-        let retry = row.get_i64(1).unwrap();
+        let (st, retry) = crate::db::job_state_retry(&conn, "job2").await.unwrap();
         assert_eq!(st, "pending");
         assert_eq!(retry, 1);
         // Spool KHÔNG bị GC khi upload lỗi.
@@ -633,10 +501,13 @@ mod tests {
         .await
         .unwrap();
         // Giả lập worker cũ chết: uploading + lease hết từ lâu.
-        crate::db::exec(
+        crate::db::force_job_lease(
             &conn,
-            "UPDATE upload_jobs SET state = 'uploading', lease_owner = 'dead', lease_expires = '2000-01-01 00:00:00', next_attempt = '2000-01-01 00:00:00' WHERE job_id = 'jobreclaim'",
-            &[],
+            "jobreclaim",
+            "uploading",
+            Some("dead"),
+            Some("2000-01-01 00:00:00"),
+            Some("2000-01-01 00:00:00"),
         )
         .await
         .unwrap();
@@ -647,14 +518,10 @@ mod tests {
                 .unwrap()
         );
         assert_eq!(*t.uploads.lock().unwrap(), 1);
-        let st: String = crate::db::query_scalar_string(
-            &conn,
-            "SELECT state FROM upload_jobs WHERE job_id = 'jobreclaim'",
-            &[],
-        )
-        .await
-        .unwrap();
-        assert_eq!(st, "done");
+        assert_eq!(
+            crate::db::job_state(&conn, "jobreclaim").await.unwrap(),
+            "done"
+        );
     }
 
     #[tokio::test]
@@ -709,10 +576,7 @@ mod tests {
             let errs = errors.clone();
             handles.push(tokio::spawn(async move {
                 let conn = crate::db::Db::open_sqlite(&dbp).await.unwrap();
-                let now: String =
-                    crate::db::query_scalar_string(&conn, "SELECT datetime('now')", &[])
-                        .await
-                        .unwrap();
+                let now: String = crate::db::db_now_str(&conn).await.unwrap();
                 // Mỗi worker xử lý tới khi hết việc.
                 let mut n = 0;
                 loop {
