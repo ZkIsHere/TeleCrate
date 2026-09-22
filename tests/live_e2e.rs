@@ -225,12 +225,9 @@ fn run_e2e(cfg: Config, token: &str, chat: i64, payload_len: u32, label: &str) {
         .unwrap();
     loop {
         let st: String = check_rt
-            .block_on(telecrate::db::query_scalar_string(
-                &check_db,
-                "SELECT state FROM upload_jobs LIMIT 1",
-                &[],
-            ))
-            .unwrap();
+            .block_on(telecrate::db::first_upload_job_state(&check_db))
+            .unwrap()
+            .unwrap_or_default();
         if st == "done" || st == "failed" {
             assert_eq!(st, "done", "worker failed — xem last_error trong DB");
             break;

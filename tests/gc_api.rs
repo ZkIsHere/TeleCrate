@@ -51,13 +51,9 @@ async fn test_integration_gc_spool_remote_and_multipart() {
     .await
     .unwrap();
 
-    telecrate::db::exec(
-        &conn,
-        "UPDATE chunks SET state = 'telegram-committed' WHERE version_id = 'v1'",
-        &[],
-    )
-    .await
-    .unwrap();
+    telecrate::db::set_chunk_state(&conn, "v1", "telegram-committed")
+        .await
+        .unwrap();
 
     // 2. Deleted object version with remote locator -> should be deleted on Telegram
     put_object(
@@ -84,21 +80,13 @@ async fn test_integration_gc_spool_remote_and_multipart() {
     .await
     .unwrap();
 
-    telecrate::db::exec(
-        &conn,
-        "UPDATE chunks SET remote_locator_json = ? WHERE version_id = 'v2-del'",
-        &[Val::text(&loc_json)],
-    )
-    .await
-    .unwrap();
+    telecrate::db::set_chunk_locator(&conn, "v2-del", 0, &loc_json)
+        .await
+        .unwrap();
 
-    telecrate::db::exec(
-        &conn,
-        "UPDATE objects SET is_delete_marker = 1 WHERE version_id = 'v2-del'",
-        &[],
-    )
-    .await
-    .unwrap();
+    telecrate::db::flag_object_delete_marker(&conn, "v2-del", true)
+        .await
+        .unwrap();
 
     // 3. Orphan multipart part -> should be cleaned up
     let orphan_part_spool = spool_dir.join("orphan_part.chunk");

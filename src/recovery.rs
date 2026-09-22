@@ -434,15 +434,9 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        let _chunks = chunks_of(&restored_conn, &ver.version_id).await.unwrap();
+        let chunks = chunks_of(&restored_conn, &ver.version_id).await.unwrap();
         assert_eq!(ver.version_id, "v100");
-        let p1_count = count(
-            &restored_conn,
-            "SELECT COUNT(*) FROM chunks WHERE plaintext_sha256 = 'p1'",
-            &[],
-        )
-        .await
-        .unwrap();
+        let p1_count = chunks.iter().filter(|c| c.plaintext_sha256 == "p1").count();
         assert_eq!(p1_count, 1);
         assert!(
             get_object_legal_hold(&restored_conn, "rec-bucket", "hello.txt", "v100")

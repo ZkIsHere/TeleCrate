@@ -239,10 +239,13 @@ async fn crash_point_5_worker_crash_before_remote_db_commit() {
     .unwrap();
 
     // Giả lập worker 1 claim lease và crash (để lease hết hạn trong quá khứ)
-    db::exec(
+    db::force_job_lease(
         &conn,
-        "UPDATE upload_jobs SET state = 'uploading', lease_owner = 'worker-dead', lease_expires = '2000-01-01 00:00:00', next_attempt = '2000-01-01 00:00:00' WHERE job_id = 'job-w-1'",
-        &[],
+        "job-w-1",
+        "uploading",
+        Some("worker-dead"),
+        Some("2000-01-01 00:00:00"),
+        Some("2000-01-01 00:00:00"),
     )
     .await
     .unwrap();

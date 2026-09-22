@@ -276,26 +276,32 @@ async fn test_entity_parity_sqlite_applied_schema() {
         .unwrap();
     telecrate::db::apply_all_migrations(&db).await.unwrap();
 
-    // Đọc schema thật sau migrate.
-    let rows = telecrate::db::fetch_all(
-        &db,
-        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
-        &[],
-    )
-    .await
-    .unwrap();
+    // Đọc schema thật sau migrate (qua sea Statement — PRAGMA là intrinsic).
+    use sea_orm::{ConnectionTrait, Statement};
+    let conn = db.sea_conn();
+    let rows = conn
+        .query_all(Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "SELECT name AS name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%'".to_string(),
+        ))
+        .await
+        .unwrap();
     let mut real: HashMap<String, ColSet> = HashMap::new();
     for r in rows {
-        let t = r.get_string(0).unwrap();
-        let info = telecrate::db::fetch_all(&db, &format!("PRAGMA table_info(\"{t}\")"), &[])
+        let t: String = r.try_get("", "name").unwrap();
+        let info = conn
+            .query_all(Statement::from_string(
+                sea_orm::DbBackend::Sqlite,
+                format!("PRAGMA table_info(\"{t}\")"),
+            ))
             .await
             .unwrap();
         let mut cols = ColSet::new();
         for c in info {
-            let name = norm_name(&c.get_string(1).unwrap());
-            let typ = c.get_string(2).unwrap_or_default();
+            let name: String = c.try_get("", "name").unwrap();
+            let typ: String = c.try_get("", "type").unwrap_or_default();
             if let Some(cls) = type_class(&typ) {
-                cols.insert(name, cls.to_string());
+                cols.insert(norm_name(&name), cls.to_string());
             }
         }
         real.insert(t, cols);

@@ -60,13 +60,9 @@ async fn test_integration_doctor_recovery_bundle_and_scrub() {
     .await
     .unwrap();
 
-    telecrate::db::exec(
-        &conn,
-        "UPDATE chunks SET remote_locator_json = ? WHERE version_id = 'v_doc_1'",
-        &[Val::text(&loc_json)],
-    )
-    .await
-    .unwrap();
+    telecrate::db::set_chunk_locator(&conn, "v_doc_1", 0, &loc_json)
+        .await
+        .unwrap();
 
     // 1. Doctor Report
     let doc_rep = run_doctor(&conn).await.unwrap();

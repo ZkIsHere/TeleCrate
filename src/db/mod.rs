@@ -17,12 +17,9 @@ use sea_orm::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::postgres::{PgPoolOptions, PgRow};
-use sqlx::query::Query;
-use sqlx::sqlite::{
-    SqliteArguments, SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteRow,
-};
-use sqlx::{Pool, Postgres, Row as SqlxRow, Sqlite};
+use sqlx::postgres::PgPoolOptions;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use sqlx::{Pool, Postgres, Sqlite};
 use std::path::Path;
 
 pub mod entities;
@@ -82,326 +79,6 @@ impl Db {
         match self {
             Db::Sqlite(p) => sea_orm::SqlxSqliteConnector::from_sqlx_sqlite_pool(p.clone()),
             Db::Postgres(p) => sea_orm::SqlxPostgresConnector::from_sqlx_postgres_pool(p.clone()),
-        }
-    }
-
-    /// Mở transaction backend-tương ứng (không giữ xuyên network upload).
-    pub async fn begin(&self) -> Result<Tx<'_>, String> {
-        match self {
-            Db::Sqlite(p) => p.begin().await.map(Tx::Sqlite),
-            Db::Postgres(p) => p.begin().await.map(|tx| Tx::Postgres(Box::new(tx))),
-        }
-        .map_err(|e| format!("begin txn: {e}"))
-    }
-}
-
-/// Transaction backend-tương ứng (một txn mỗi hàm, không truyền xuyên hàm).
-pub enum Tx<'a> {
-    Sqlite(sqlx::Transaction<'a, Sqlite>),
-    Postgres(Box<sqlx::Transaction<'a, Postgres>>),
-}
-
-impl Tx<'_> {
-    pub async fn exec(&mut self, sql: &str, args: &[Val]) -> Result<u64, String> {
-        match self {
-            Tx::Sqlite(tx) => {
-                let mut q = sqlx::query(sql);
-                for a in args {
-                    q = bind_sqlite(q, a);
-                }
-                q.execute(&mut **tx)
-                    .await
-                    .map(|r| r.rows_affected())
-                    .map_err(|e| format!("exec: {e}"))
-            }
-            Tx::Postgres(tx) => {
-                let sql = rebind_pg(sql);
-                let mut q = sqlx::query(&sql);
-                for a in args {
-                    q = bind_pg(q, a);
-                }
-                q.execute(&mut ***tx)
-                    .await
-                    .map(|r| r.rows_affected())
-                    .map_err(|e| format!("exec: {e}"))
-            }
-        }
-    }
-
-    pub async fn fetch_all(&mut self, sql: &str, args: &[Val]) -> Result<Vec<Row>, String> {
-        match self {
-            Tx::Sqlite(tx) => {
-                let mut q = sqlx::query(sql);
-                for a in args {
-                    q = bind_sqlite(q, a);
-                }
-                let rows = q
-                    .fetch_all(&mut **tx)
-                    .await
-                    .map_err(|e| format!("query: {e}"))?;
-                rows.iter().map(decode_sqlite_row).collect()
-            }
-            Tx::Postgres(tx) => {
-                let sql = rebind_pg(sql);
-                let mut q = sqlx::query(&sql);
-                for a in args {
-                    q = bind_pg(q, a);
-                }
-                let rows = q
-                    .fetch_all(&mut ***tx)
-                    .await
-                    .map_err(|e| format!("query: {e}"))?;
-                rows.iter().map(decode_pg_row).collect()
-            }
-        }
-    }
-
-    pub async fn fetch_opt(&mut self, sql: &str, args: &[Val]) -> Result<Option<Row>, String> {
-        let mut rows = self.fetch_all(sql, args).await?;
-        Ok(rows.pop())
-    }
-
-    pub async fn commit(self) -> Result<(), String> {
-        match self {
-            Tx::Sqlite(tx) => tx.commit().await,
-            Tx::Postgres(tx) => tx.commit().await,
-        }
-        .map_err(|e| format!("commit: {e}"))
-    }
-}
-
-/// Giá trị bind/decode tối giản. Schema chỉ dùng TEXT / BIGINT / NULL nên
-/// decode thử TEXT trước (tránh TEXT số bị đọc nhầm thành Int).
-#[derive(Debug, Clone)]
-pub enum Val {
-    Null,
-    Int(i64),
-    Text(String),
-}
-
-impl Val {
-    pub fn int(v: i64) -> Self {
-        Val::Int(v)
-    }
-    pub fn text(s: &str) -> Self {
-        Val::Text(s.to_string())
-    }
-    pub fn opt_text(v: Option<&str>) -> Self {
-        v.map(|s| Val::Text(s.to_string())).unwrap_or(Val::Null)
-    }
-}
-
-/// Một hàng kết quả đã decode, đọc theo index như rusqlite trước đây.
-#[derive(Debug, Clone)]
-pub struct Row {
-    vals: Vec<Val>,
-}
-
-impl Row {
-    pub fn get_string(&self, i: usize) -> Result<String, String> {
-        match self.vals.get(i) {
-            Some(Val::Text(s)) => Ok(s.clone()),
-            other => Err(format!("row col {i} is not text: {other:?}")),
-        }
-    }
-    pub fn get_i64(&self, i: usize) -> Result<i64, String> {
-        match self.vals.get(i) {
-            Some(Val::Int(n)) => Ok(*n),
-            other => Err(format!("row col {i} is not int: {other:?}")),
-        }
-    }
-    pub fn get_i32(&self, i: usize) -> Result<i32, String> {
-        let n = self.get_i64(i)?;
-        n.try_into()
-            .map_err(|_| format!("row col {i} out of i32 range: {n}"))
-    }
-    pub fn get_opt_i32(&self, i: usize) -> Result<Option<i32>, String> {
-        match self.vals.get(i) {
-            None => Err(format!("row col {i} out of range")),
-            Some(Val::Null) => Ok(None),
-            Some(Val::Int(n)) => {
-                Ok(Some((*n).try_into().map_err(|_| {
-                    format!("row col {i} out of i32 range: {n}")
-                })?))
-            }
-            other => Err(format!("row col {i} is not nullable int: {other:?}")),
-        }
-    }
-    pub fn get_bool(&self, i: usize) -> Result<bool, String> {
-        self.get_i64(i).map(|n| n != 0)
-    }
-    pub fn get_opt_string(&self, i: usize) -> Result<Option<String>, String> {
-        match self.vals.get(i) {
-            None => Err(format!("row col {i} out of range")),
-            Some(Val::Null) => Ok(None),
-            Some(Val::Text(s)) => Ok(Some(s.clone())),
-            other => Err(format!("row col {i} is not nullable text: {other:?}")),
-        }
-    }
-}
-
-fn bind_sqlite<'q>(
-    q: Query<'q, Sqlite, SqliteArguments<'q>>,
-    a: &Val,
-) -> Query<'q, Sqlite, SqliteArguments<'q>> {
-    match a {
-        Val::Null => q.bind(Option::<String>::None),
-        Val::Int(n) => q.bind(*n),
-        Val::Text(s) => q.bind(s.clone()),
-    }
-}
-
-fn bind_pg<'q>(
-    q: Query<'q, Postgres, sqlx::postgres::PgArguments>,
-    a: &Val,
-) -> Query<'q, Postgres, sqlx::postgres::PgArguments> {
-    match a {
-        Val::Null => q.bind(Option::<String>::None),
-        Val::Int(n) => q.bind(*n),
-        Val::Text(s) => q.bind(s.clone()),
-    }
-}
-
-/// Viết lại placeholder `?` thành `$1..$N` cho Postgres.
-/// sqlx KHÔNG tự rebind `?` khi dùng `sqlx::query(&str)` — để nguyên `?`
-/// Postgres parse thành toán tử JSON và báo `syntax error`.
-/// Bỏ qua `?` nằm trong string literal `'...'` (kể cả escape `''`).
-fn rebind_pg(sql: &str) -> String {
-    let mut out = String::with_capacity(sql.len() + 8);
-    let mut idx = 0u32;
-    let mut chars = sql.chars().peekable();
-    let mut in_str = false;
-    while let Some(c) = chars.next() {
-        if in_str {
-            out.push(c);
-            if c == '\'' {
-                if chars.peek() == Some(&'\'') {
-                    out.push(chars.next().unwrap());
-                } else {
-                    in_str = false;
-                }
-            }
-            continue;
-        }
-        match c {
-            '\'' => {
-                in_str = true;
-                out.push(c);
-            }
-            '?' => {
-                idx += 1;
-                out.push('$');
-                out.push_str(&idx.to_string());
-            }
-            _ => out.push(c),
-        }
-    }
-    out
-}
-
-fn decode_sqlite_row(r: &SqliteRow) -> Result<Row, String> {
-    let mut vals = Vec::with_capacity(r.len());
-    for i in 0..r.len() {
-        if let Ok(Some(s)) = r.try_get::<Option<String>, _>(i) {
-            vals.push(Val::Text(s));
-        } else if let Ok(Some(n)) = r.try_get::<Option<i64>, _>(i) {
-            vals.push(Val::Int(n));
-        } else {
-            vals.push(Val::Null);
-        }
-    }
-    Ok(Row { vals })
-}
-
-fn decode_pg_row(r: &PgRow) -> Result<Row, String> {
-    let mut vals = Vec::with_capacity(r.len());
-    for i in 0..r.len() {
-        if let Ok(Some(s)) = r.try_get::<Option<String>, _>(i) {
-            vals.push(Val::Text(s));
-        } else if let Ok(Some(n)) = r.try_get::<Option<i64>, _>(i) {
-            vals.push(Val::Int(n));
-        } else {
-            vals.push(Val::Null);
-        }
-    }
-    Ok(Row { vals })
-}
-
-/// SELECT nhiều hàng trên pool (không txn).
-pub async fn fetch_all(db: &Db, sql: &str, args: &[Val]) -> Result<Vec<Row>, String> {
-    match db {
-        Db::Sqlite(p) => {
-            let mut q = sqlx::query(sql);
-            for a in args {
-                q = bind_sqlite(q, a);
-            }
-            let rows = q.fetch_all(p).await.map_err(|e| format!("query: {e}"))?;
-            rows.iter().map(decode_sqlite_row).collect()
-        }
-        Db::Postgres(p) => {
-            let sql = rebind_pg(sql);
-            let mut q = sqlx::query(&sql);
-            for a in args {
-                q = bind_pg(q, a);
-            }
-            let rows = q.fetch_all(p).await.map_err(|e| format!("query: {e}"))?;
-            rows.iter().map(decode_pg_row).collect()
-        }
-    }
-}
-
-/// SELECT 0..1 hàng trên pool.
-pub async fn fetch_opt(db: &Db, sql: &str, args: &[Val]) -> Result<Option<Row>, String> {
-    let mut rows = fetch_all(db, sql, args).await?;
-    Ok(rows.pop())
-}
-
-/// SELECT COUNT(*) tiện lợi (thiếu hàng → 0).
-pub async fn count(db: &Db, sql: &str, args: &[Val]) -> Result<i64, String> {
-    match fetch_opt(db, sql, args).await? {
-        Some(r) => r.get_i64(0),
-        None => Ok(0),
-    }
-}
-
-/// SELECT 1 dòng dạng chuỗi từ cột đầu tiên (tiện cho test & scalar query).
-pub async fn query_scalar_string(db: &Db, sql: &str, args: &[Val]) -> Result<String, String> {
-    match fetch_opt(db, sql, args).await? {
-        Some(r) => r.get_string(0),
-        None => Err("no row found for scalar query".into()),
-    }
-}
-
-/// SELECT 1 dòng (tiện cho test).
-pub async fn query_row(db: &Db, sql: &str, args: &[Val]) -> Result<Row, String> {
-    fetch_opt(db, sql, args)
-        .await?
-        .ok_or_else(|| "no row returned".to_string())
-}
-
-/// INSERT/UPDATE/DELETE trên pool. Trả số hàng ảnh hưởng.
-pub async fn exec(db: &Db, sql: &str, args: &[Val]) -> Result<u64, String> {
-    match db {
-        Db::Sqlite(p) => {
-            let mut q = sqlx::query(sql);
-            for a in args {
-                q = bind_sqlite(q, a);
-            }
-            q.execute(p)
-                .await
-                .map(|r| r.rows_affected())
-                .map_err(|e| format!("exec: {e}"))
-        }
-        Db::Postgres(p) => {
-            let sql = rebind_pg(sql);
-            let mut q = sqlx::query(&sql);
-            for a in args {
-                q = bind_pg(q, a);
-            }
-            q.execute(p)
-                .await
-                .map(|r| r.rows_affected())
-                .map_err(|e| format!("exec: {e}"))
         }
     }
 }
@@ -511,17 +188,19 @@ pub const POSTGRES_SCHEMA: &str = concat!(
 
 /// Lấy version migration hiện tại (0 nếu chưa có bảng).
 pub async fn schema_version(db: &Db) -> Result<i64, String> {
-    match fetch_opt(
-        db,
-        "SELECT COALESCE(MAX(version), 0) FROM schema_version",
-        &[],
-    )
-    .await
+    match entities::schema_version::Entity::find()
+        .all(&db.sea_conn())
+        .await
     {
-        Ok(Some(r)) => r.get_i64(0),
-        Ok(None) => Ok(0),
-        Err(e) if is_missing_table(&e) => Ok(0),
-        Err(e) => Err(e),
+        Ok(rows) => Ok(rows.into_iter().map(|m| m.version).max().unwrap_or(0)),
+        Err(e) => {
+            let s = e.to_string();
+            if is_missing_table(&s) {
+                Ok(0)
+            } else {
+                Err(s)
+            }
+        }
     }
 }
 
@@ -552,20 +231,23 @@ fn split_statements(sql: &str) -> Vec<String> {
 }
 
 /// Apply migration SQL một lần trong txn, ghi schema_version cùng txn.
+/// DDL chạy qua `execute_unprepared` (không params) trên sea_conn.
 pub async fn apply_migration(db: &Db, version: i64, sql: &str) -> Result<(), String> {
-    let mut tx = db.begin().await?;
+    let conn = db.sea_conn();
+    let txn = conn.begin().await.map_err(|e| format!("begin txn: {e}"))?;
     for stmt in split_statements(sql) {
-        tx.exec(&stmt, &[])
+        txn.execute_unprepared(&stmt)
             .await
             .map_err(|e| format!("migration {version}: {e}"))?;
     }
-    tx.exec(
-        "INSERT INTO schema_version(version) VALUES (?)",
-        &[Val::int(version)],
-    )
+    entities::schema_version::ActiveModel {
+        version: Set(version),
+        ..Default::default()
+    }
+    .insert(&txn)
     .await
     .map_err(|e| format!("record version: {e}"))?;
-    tx.commit().await?;
+    txn.commit().await.map_err(|e| format!("commit: {e}"))?;
     Ok(())
 }
 
@@ -614,7 +296,11 @@ pub async fn backup_db(db: &Db, target_path: &str) -> Result<(), String> {
     match db {
         Db::Sqlite(_) => {
             let escaped = target_path.replace('\'', "''");
-            exec(db, &format!("VACUUM INTO '{escaped}'"), &[]).await?;
+            db.sea_conn()
+                .execute_unprepared(&format!("VACUUM INTO '{escaped}'"))
+                .await
+                .map(|_| ())
+                .map_err(|e| format!("exec: {e}"))?;
             Ok(())
         }
         Db::Postgres(_) => Err(
@@ -715,10 +401,7 @@ pub async fn restore_db(
 
     // Kiểm tra integrity và schema_version của file DB sau giải mã
     let restored = Db::open_sqlite(temp_restored.to_str().unwrap()).await?;
-    let integrity = fetch_opt(&restored, "PRAGMA integrity_check", &[])
-        .await?
-        .and_then(|r| r.get_string(0).ok())
-        .unwrap_or_default();
+    let integrity = sqlite_integrity_check(&restored).await.unwrap_or_default();
     if integrity != "ok" {
         return Err(format!("backup DB integrity check failed: {integrity}"));
     }
@@ -1339,6 +1022,8 @@ pub struct ChunkRow {
     pub encryption_mode: String,
     pub key_ref: Option<String>,
     pub remote_locator_json: Option<String>,
+    pub plaintext_sha256: String,
+    pub ciphertext_sha256: String,
 }
 
 /// Chunk mới để ghi trong `put_object`. Tách bạch plaintext checksum / ciphertext
@@ -1619,6 +1304,8 @@ pub async fn chunks_of(db: &Db, version_id: &str) -> Result<Vec<ChunkRow>, Strin
             encryption_mode: m.encryption_mode,
             key_ref: m.key_ref,
             remote_locator_json: m.remote_locator_json,
+            plaintext_sha256: m.plaintext_sha256,
+            ciphertext_sha256: m.ciphertext_sha256,
         })
         .collect())
 }
@@ -2569,6 +2256,20 @@ pub async fn job_state_retry(db: &Db, job_id: &str) -> Result<(String, i64), Str
         .ok_or_else(|| "job state: not found".to_string())
 }
 
+/// State job bất kỳ (live_e2e poll daemon). Không ORDER BY — như SQL cũ.
+pub async fn first_upload_job_state(db: &Db) -> Result<Option<String>, String> {
+    use entities::upload_jobs::Column as J;
+    let conn = db.sea_conn();
+    entities::upload_jobs::Entity::find()
+        .select_only()
+        .column(J::State)
+        .into_tuple::<(String,)>()
+        .one(&conn)
+        .await
+        .map(|r| r.map(|(s,)| s))
+        .map_err(|e| format!("first job state: {e}"))
+}
+
 /// Ép lease/state job (cho tests giả lập worker chết).
 pub async fn force_job_lease(
     db: &Db,
@@ -3278,24 +2979,6 @@ mod tests {
     }
 
     #[test]
-    fn rebind_pg_rewrites_placeholders_in_order() {
-        assert_eq!(rebind_pg("SELECT 1"), "SELECT 1");
-        assert_eq!(
-            rebind_pg("INSERT INTO schema_version(version) VALUES (?)"),
-            "INSERT INTO schema_version(version) VALUES ($1)"
-        );
-        assert_eq!(
-            rebind_pg("SELECT a FROM t WHERE x = ? AND y = ? ORDER BY z LIMIT ?"),
-            "SELECT a FROM t WHERE x = $1 AND y = $2 ORDER BY z LIMIT $3"
-        );
-        // `?` trong string literal giữ nguyên; escape `''` không lệch trạng thái.
-        assert_eq!(
-            rebind_pg("SELECT 'a?b', 'it''s ?' WHERE x = ?"),
-            "SELECT 'a?b', 'it''s ?' WHERE x = $1"
-        );
-    }
-
-    #[test]
     fn backend_parse_and_guard() {
         assert_eq!(DbBackend::parse("sqlite").unwrap(), DbBackend::Sqlite);
         assert_eq!(DbBackend::parse("postgres").unwrap(), DbBackend::Postgres);
@@ -3502,12 +3185,19 @@ mod tests {
     #[tokio::test]
     async fn pragmas_wal_fk_busy_timeout() {
         let (_d, db) = test_db().await;
-        // WAL mode kiểm tra qua sqlx query.
-        let row = fetch_opt(&db, "PRAGMA journal_mode", &[])
+        // WAL mode kiểm tra qua sea Statement (PRAGMA là intrinsic SQLite).
+        use sea_orm::{ConnectionTrait, Statement};
+        let journal: String = db
+            .sea_conn()
+            .query_one(Statement::from_string(
+                sea_orm::DbBackend::Sqlite,
+                "PRAGMA journal_mode".to_string(),
+            ))
             .await
             .unwrap()
+            .unwrap()
+            .try_get("", "journal_mode")
             .unwrap();
-        let journal = row.get_string(0).unwrap();
         assert_eq!(journal.to_lowercase(), "wal");
     }
 
@@ -3552,10 +3242,18 @@ mod tests {
         );
         // Bucket có object → 409 NotEmpty.
         create_bucket(&db, "bucket-2", "r").await.unwrap();
-        exec(
+        put_object(
             &db,
-            "INSERT INTO objects(bucket, key, version_id) VALUES (?, ?, ?)",
-            &[Val::text("bucket-2"), Val::text("k"), Val::text("v1")],
+            "bucket-2",
+            "k",
+            "v1",
+            0,
+            "",
+            "application/octet-stream",
+            None,
+            None,
+            &[],
+            "job-notempty",
         )
         .await
         .unwrap();

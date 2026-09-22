@@ -68,9 +68,7 @@ async fn test_high_density_scale_simulation_25k_objects() {
     );
 
     // Verify DB count
-    let count = telecrate::db::count(&conn, "SELECT COUNT(*) FROM objects", &[])
-        .await
-        .unwrap();
+    let count = telecrate::db::table_counts(&conn).await.1;
     assert_eq!(count, 25_000);
 
     // Benchmark 1: ListObjectsV2 with prefix & delimiter
