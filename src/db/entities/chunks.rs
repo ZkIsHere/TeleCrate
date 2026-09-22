@@ -28,6 +28,14 @@ pub enum Relation {
         to = "super::objects::Column::VersionId"
     )]
     Objects,
+    // object_locks.version_id REFERENCES objects(version_id); version_id toàn
+    // cục duy nhất nên join theo version_id là 1:1 (phục vụ GC guard WORM).
+    #[sea_orm(
+        belongs_to = "super::object_locks::Entity",
+        from = "Column::VersionId",
+        to = "super::object_locks::Column::VersionId"
+    )]
+    ObjectLocks,
 }
 
 impl ActiveModelBehavior for ActiveModel {}

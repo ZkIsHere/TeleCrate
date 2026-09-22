@@ -39,28 +39,16 @@ pub async fn run_doctor(db: &Db) -> Result<DoctorReport, String> {
 
     let (db_integrity_ok, foreign_keys_ok) = match db.backend() {
         DbBackend::Sqlite => {
-            let integrity = crate::db::fetch_opt(db, "PRAGMA integrity_check", &[])
+            let integrity = crate::db::sqlite_integrity_check(db)
                 .await
-                .ok()
-                .flatten()
-                .and_then(|r| r.get_string(0).ok())
-                .unwrap_or_else(|| "error".to_string());
+                .unwrap_or_else(|_| "error".to_string());
             let ok = integrity == "ok";
             if !ok {
                 issues.push(format!("DB integrity failure: {integrity}"));
             }
             // foreign_key_check trả về các dòng vi phạm (rỗng = sạch).
-            let fk_rows = crate::db::fetch_all(db, "PRAGMA foreign_key_check", &[])
+            let fk_rows = crate::db::sqlite_fk_violations(db)
                 .await
-                .map(|rows| {
-                    rows.iter()
-                        .filter_map(|r| {
-                            let t = r.get_string(0).ok()?;
-                            let id = r.get_i64(1).ok()?;
-                            Some(format!("table {t} rowid {id}"))
-                        })
-                        .collect::<Vec<_>>()
-                })
                 .unwrap_or_default();
             let fk_ok = fk_rows.is_empty();
             if !fk_ok {
@@ -80,15 +68,10 @@ pub async fn run_doctor(db: &Db) -> Result<DoctorReport, String> {
         issues.push(format!("Invalid schema_version: {ver}"));
     }
 
-    let bucket_count: usize = crate::db::count(db, "SELECT COUNT(*) FROM buckets", &[])
-        .await
-        .unwrap_or(0) as usize;
-    let object_count: usize = crate::db::count(db, "SELECT COUNT(*) FROM objects", &[])
-        .await
-        .unwrap_or(0) as usize;
-    let chunk_count: usize = crate::db::count(db, "SELECT COUNT(*) FROM chunks", &[])
-        .await
-        .unwrap_or(0) as usize;
+    let (b, o, c) = crate::db::table_counts(db).await;
+    let bucket_count: usize = b as usize;
+    let object_count: usize = o as usize;
+    let chunk_count: usize = c as usize;
 
     Ok(DoctorReport {
         db_integrity_ok,
@@ -108,31 +91,11 @@ pub async fn run_verify_spool(db: &Db, spool_dir: &Path) -> Result<SpoolVerifyRe
     let mut orphan_files = Vec::new();
 
     // 1. Kiểm tra các chunk trong DB có spool_path IS NOT NULL
-    let rows = crate::db::fetch_all(
-        db,
-        "SELECT version_id, idx, spool_path, plaintext_sha256, ciphertext_sha256, encryption_mode FROM chunks WHERE spool_path IS NOT NULL",
-        &[],
-    )
-    .await
-    .map_err(|e| format!("query verify spool: {e}"))?;
+    let rows = crate::db::spool_verify_rows(db)
+        .await
+        .map_err(|e| format!("query verify spool: {e}"))?;
 
-    for r in &rows {
-        let version_id = r
-            .get_string(0)
-            .map_err(|e| format!("row verify spool: {e}"))?;
-        let idx = r.get_i64(1).map_err(|e| format!("row verify spool: {e}"))?;
-        let spool_path = r
-            .get_string(2)
-            .map_err(|e| format!("row verify spool: {e}"))?;
-        let plain_sha = r
-            .get_string(3)
-            .map_err(|e| format!("row verify spool: {e}"))?;
-        let cipher_sha = r
-            .get_string(4)
-            .map_err(|e| format!("row verify spool: {e}"))?;
-        let enc_mode = r
-            .get_string(5)
-            .map_err(|e| format!("row verify spool: {e}"))?;
+    for (version_id, idx, spool_path, plain_sha, cipher_sha, enc_mode) in &rows {
         let path = Path::new(&spool_path);
         if !path.exists() {
             missing_spool_chunks.push(format!("{version_id}/{idx}: {spool_path}"));
@@ -147,7 +110,7 @@ pub async fn run_verify_spool(db: &Db, spool_dir: &Path) -> Result<SpoolVerifyRe
                 &cipher_sha
             };
 
-            if !expected_sha.is_empty() && &actual_sha != expected_sha {
+            if !expected_sha.is_empty() && actual_sha.as_str() != expected_sha.as_str() {
                 corrupt_checksum_files.push(format!(
                     "{version_id}/{idx}: {spool_path} (expected {expected_sha}, got {actual_sha})"
                 ));
@@ -188,21 +151,14 @@ pub async fn run_scrub_remote(db: &Db, transport: &dyn Transport) -> Result<Scru
     let mut verified_ok = 0;
     let mut missing_or_corrupt_remote = Vec::new();
 
-    let rows = crate::db::fetch_all(
-        db,
-        "SELECT version_id, idx, remote_locator_json FROM chunks WHERE remote_locator_json IS NOT NULL",
-        &[],
-    )
-    .await
-    .map_err(|e| format!("query scrub rows: {e}"))?;
+    let rows = crate::db::remote_scrub_rows(db)
+        .await
+        .map_err(|e| format!("query scrub rows: {e}"))?;
 
     let mut total_remote_chunks = 0;
-    for r in &rows {
+    for (version_id, idx, locator_json) in &rows {
         total_remote_chunks += 1;
-        let version_id = r.get_string(0).map_err(|e| format!("row scrub: {e}"))?;
-        let idx = r.get_i64(1).map_err(|e| format!("row scrub: {e}"))?;
-        let locator_json = r.get_string(2).map_err(|e| format!("row scrub: {e}"))?;
-        if let Ok(locator) = serde_json::from_str::<RemoteLocator>(&locator_json) {
+        if let Ok(locator) = serde_json::from_str::<RemoteLocator>(locator_json) {
             match transport.download(&locator) {
                 Ok(_) => {
                     verified_ok += 1;
@@ -305,13 +261,9 @@ mod tests {
         let loc = mock.upload(100, b"data").unwrap();
         let loc_json = serde_json::to_string(&loc).unwrap();
 
-        crate::db::exec(
-            &conn,
-            "UPDATE chunks SET remote_locator_json = ? WHERE version_id = 'v1' AND idx = 0",
-            &[Val::text(&loc_json)],
-        )
-        .await
-        .unwrap();
+        crate::db::set_chunk_locator(&conn, "v1", 0, &loc_json)
+            .await
+            .unwrap();
 
         let scrub_rep = run_scrub_remote(&conn, &mock).await.unwrap();
         assert_eq!(scrub_rep.total_remote_chunks, 1);

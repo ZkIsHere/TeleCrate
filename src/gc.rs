@@ -1,6 +1,6 @@
 //! Module Garbage Collection (GC Engine) — dọn dẹp spool local và message Telegram.
 
-use crate::db::{Db, Val};
+use crate::db::Db;
 use crate::telegram::{RemoteLocator, Transport};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -23,7 +23,7 @@ pub async fn run_gc(
     let mut stats = GcStats::default();
 
     // 1. Spool GC: Dọn dẹp spool file của các chunk đã telegram-committed
-    if let Ok(spool_rows) = get_committed_spool_chunks(db).await {
+    if let Ok(spool_rows) = crate::db::committed_spool_chunks(db).await {
         for (chunk_version_id, idx, spool_path) in spool_rows {
             let path = Path::new(&spool_path);
             if path.exists() {
@@ -32,20 +32,10 @@ pub async fn run_gc(
                 }
                 if std::fs::remove_file(path).is_ok() {
                     stats.spool_files_deleted += 1;
-                    let _ = crate::db::exec(
-                        db,
-                        "UPDATE chunks SET spool_path = NULL WHERE version_id = ? AND idx = ?",
-                        &[Val::text(&chunk_version_id), Val::int(idx)],
-                    )
-                    .await;
+                    let _ = crate::db::clear_chunk_spool_path(db, &chunk_version_id, idx).await;
                 }
             } else {
-                let _ = crate::db::exec(
-                    db,
-                    "UPDATE chunks SET spool_path = NULL WHERE version_id = ? AND idx = ?",
-                    &[Val::text(&chunk_version_id), Val::int(idx)],
-                )
-                .await;
+                let _ = crate::db::clear_chunk_spool_path(db, &chunk_version_id, idx).await;
             }
         }
     }
@@ -74,18 +64,13 @@ pub async fn run_gc(
     if let Some(tr) = transport {
         let now_iso = crate::db::now_str();
 
-        if let Ok(locators) = get_deletable_telegram_locators(db, &now_iso).await {
+        if let Ok(locators) = crate::db::deletable_telegram_locators(db, &now_iso).await {
             for (version_id, idx, locator_json) in locators {
                 if let Ok(locator) = serde_json::from_str::<RemoteLocator>(&locator_json) {
                     match tr.delete(&locator) {
                         Ok(_) => {
                             stats.telegram_messages_deleted += 1;
-                            let _ = crate::db::exec(
-                                db,
-                                "UPDATE chunks SET remote_locator_json = NULL WHERE version_id = ? AND idx = ?",
-                                &[Val::text(&version_id), Val::int(idx)],
-                            )
-                            .await;
+                            let _ = crate::db::clear_chunk_locator(db, &version_id, idx).await;
                         }
                         Err(e) => {
                             stats.errors.push(format!(
@@ -99,96 +84,11 @@ pub async fn run_gc(
     }
 
     // 3. Multipart GC: Dọn dẹp parts của multipart upload bị abort hoặc expired
-    if let Ok(cleaned) = clean_expired_or_aborted_multipart_parts(db).await {
+    if let Ok(cleaned) = crate::db::clean_orphan_multipart_parts(db).await {
         stats.orphaned_parts_cleaned += cleaned;
     }
 
     Ok(stats)
-}
-
-/// Lấy danh sách (version_id, idx, spool_path) của các chunk đã `telegram-committed` nhưng vẫn còn `spool_path`.
-async fn get_committed_spool_chunks(db: &Db) -> Result<Vec<(String, i64, String)>, String> {
-    let rows = crate::db::fetch_all(
-        db,
-        "SELECT version_id, idx, spool_path FROM chunks WHERE state = 'telegram-committed' AND spool_path IS NOT NULL",
-        &[],
-    )
-    .await
-    .map_err(|e| format!("query map: {e}"))?;
-
-    let mut res = Vec::new();
-    for r in rows {
-        res.push((
-            r.get_string(0).map_err(|e| format!("row: {e}"))?,
-            r.get_i64(1).map_err(|e| format!("row: {e}"))?,
-            r.get_string(2).map_err(|e| format!("row: {e}"))?,
-        ));
-    }
-    Ok(res)
-}
-
-/// Lấy danh sách các Telegram remote locator của các chunk thuộc version đã bị xóa/không còn reference
-/// và KHÔNG bị Object Lock retention/legal hold bảo vệ.
-async fn get_deletable_telegram_locators(
-    db: &Db,
-    now_iso: &str,
-) -> Result<Vec<(String, i64, String)>, String> {
-    let rows = crate::db::fetch_all(
-        db,
-        "SELECT c.version_id, c.idx, c.remote_locator_json 
-             FROM chunks c
-             JOIN objects o ON c.version_id = o.version_id
-             LEFT JOIN object_locks ol ON o.bucket = ol.bucket AND o.key = ol.key AND o.version_id = ol.version_id
-             WHERE c.remote_locator_json IS NOT NULL
-               AND (o.is_delete_marker = 1)
-               AND (ol.legal_hold IS NULL OR ol.legal_hold = 0)
-               AND (ol.retain_until_date IS NULL OR ol.retain_until_date <= ?)",
-        &[Val::text(now_iso)],
-    )
-    .await
-    .map_err(|e| format!("query map locators: {e}"))?;
-
-    let mut res = Vec::new();
-    for r in rows {
-        res.push((
-            r.get_string(0).map_err(|e| format!("row: {e}"))?,
-            r.get_i64(1).map_err(|e| format!("row: {e}"))?,
-            r.get_string(2).map_err(|e| format!("row: {e}"))?,
-        ));
-    }
-    Ok(res)
-}
-
-/// Dọn dẹp các part mồ côi của multipart upload bị abort hoặc đã hủy.
-async fn clean_expired_or_aborted_multipart_parts(db: &Db) -> Result<usize, String> {
-    let rows = crate::db::fetch_all(
-        db,
-        "SELECT p.spool_path FROM multipart_parts p 
-             LEFT JOIN multipart_uploads u ON p.upload_id = u.upload_id 
-             WHERE u.upload_id IS NULL AND p.spool_path IS NOT NULL",
-        &[],
-    )
-    .await
-    .map_err(|e| format!("query map multipart clean: {e}"))?;
-
-    for r in &rows {
-        if let Ok(p) = r.get_string(0) {
-            let p = Path::new(&p);
-            if p.exists() {
-                let _ = std::fs::remove_file(p);
-            }
-        }
-    }
-
-    let deleted_rows = crate::db::exec(
-        db,
-        "DELETE FROM multipart_parts WHERE upload_id NOT IN (SELECT upload_id FROM multipart_uploads)",
-        &[],
-    )
-    .await
-    .unwrap_or(0);
-
-    Ok(deleted_rows as usize)
 }
 
 #[cfg(test)]
@@ -237,13 +137,9 @@ mod tests {
         .unwrap();
 
         // Mark chunk state as telegram-committed
-        crate::db::exec(
-            &conn,
-            "UPDATE chunks SET state = 'telegram-committed' WHERE version_id = 'v1'",
-            &[],
-        )
-        .await
-        .unwrap();
+        crate::db::set_chunk_state(&conn, "v1", "telegram-committed")
+            .await
+            .unwrap();
 
         // Create an orphan chunk file on disk
         let orphan_path = spool_dir.join("orphan.chunk");
@@ -295,20 +191,12 @@ mod tests {
         )
         .await
         .unwrap();
-        crate::db::exec(
-            &conn,
-            "UPDATE chunks SET remote_locator_json = ? WHERE version_id = 'v-locked'",
-            &[Val::text(&loc_json)],
-        )
-        .await
-        .unwrap();
-        crate::db::exec(
-            &conn,
-            "UPDATE objects SET is_delete_marker = 1 WHERE version_id = 'v-locked'",
-            &[],
-        )
-        .await
-        .unwrap();
+        crate::db::set_chunk_locator(&conn, "v-locked", 0, &loc_json)
+            .await
+            .unwrap();
+        crate::db::flag_object_delete_marker(&conn, "v-locked", true)
+            .await
+            .unwrap();
         set_bucket_object_lock_config(
             &conn,
             "bkt-lock",

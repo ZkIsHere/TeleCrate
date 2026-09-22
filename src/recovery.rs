@@ -1,6 +1,6 @@
 //! Module Standalone Recovery Bundle — Export/Import toàn bộ metadata index để tái tạo DB khi hỏng.
 
-use crate::db::{apply_all_migrations, Db, Val};
+use crate::db::{apply_all_migrations, Db};
 use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -70,157 +70,84 @@ pub struct RecoveryBundle {
 pub async fn export_recovery_bundle(db: &Db) -> Result<RecoveryBundle, String> {
     let now_iso = crate::db::now_str();
 
+    use crate::db::entities::{buckets, chunks, object_locks, objects};
+    use sea_orm::EntityTrait;
+    let conn = db.sea_conn();
+
     // 1. Buckets
-    let rows = crate::db::fetch_all(
-        db,
-        "SELECT name, region, versioning_status, encryption_override, created_at FROM buckets",
-        &[],
-    )
-    .await
-    .map_err(|e| format!("query buckets export: {e}"))?;
-    let mut buckets = Vec::new();
-    for r in &rows {
-        buckets.push(BucketRecord {
-            name: r
-                .get_string(0)
-                .map_err(|e| format!("row buckets export: {e}"))?,
-            region: r
-                .get_string(1)
-                .map_err(|e| format!("row buckets export: {e}"))?,
-            versioning_status: r
-                .get_string(2)
-                .map_err(|e| format!("row buckets export: {e}"))?,
-            encryption_override: r
-                .get_opt_string(3)
-                .map_err(|e| format!("row buckets export: {e}"))?,
-            created_at: r
-                .get_string(4)
-                .map_err(|e| format!("row buckets export: {e}"))?,
-        });
-    }
+    let buckets = buckets::Entity::find()
+        .all(&conn)
+        .await
+        .map_err(|e| format!("query buckets export: {e}"))?
+        .into_iter()
+        .map(|m| BucketRecord {
+            name: m.name,
+            region: m.region,
+            versioning_status: m.versioning_status,
+            encryption_override: m.encryption_override,
+            created_at: m.created_at,
+        })
+        .collect();
 
     // 2. Objects
-    let rows = crate::db::fetch_all(
-        db,
-        "SELECT bucket, key, version_id, is_delete_marker, storage_state, size, etag, content_type, created_at FROM objects",
-        &[],
-    )
-    .await
-    .map_err(|e| format!("query objects export: {e}"))?;
-    let mut objects = Vec::new();
-    for r in &rows {
-        objects.push(ObjectRecord {
-            bucket: r
-                .get_string(0)
-                .map_err(|e| format!("row objects export: {e}"))?,
-            key: r
-                .get_string(1)
-                .map_err(|e| format!("row objects export: {e}"))?,
-            version_id: r
-                .get_string(2)
-                .map_err(|e| format!("row objects export: {e}"))?,
-            is_delete_marker: r
-                .get_bool(3)
-                .map_err(|e| format!("row objects export: {e}"))?,
-            storage_state: r
-                .get_string(4)
-                .map_err(|e| format!("row objects export: {e}"))?,
-            size: r
-                .get_i64(5)
-                .map_err(|e| format!("row objects export: {e}"))?,
-            etag: r
-                .get_string(6)
-                .map_err(|e| format!("row objects export: {e}"))?,
-            content_type: r
-                .get_string(7)
-                .map_err(|e| format!("row objects export: {e}"))?,
-            created_at: r
-                .get_string(8)
-                .map_err(|e| format!("row objects export: {e}"))?,
-        });
-    }
+    let objects = objects::Entity::find()
+        .all(&conn)
+        .await
+        .map_err(|e| format!("query objects export: {e}"))?
+        .into_iter()
+        .map(|m| ObjectRecord {
+            bucket: m.bucket,
+            key: m.key,
+            version_id: m.version_id,
+            is_delete_marker: m.is_delete_marker != 0,
+            storage_state: m.storage_state,
+            size: m.size,
+            etag: m.etag,
+            content_type: m.content_type,
+            created_at: m.created_at,
+        })
+        .collect();
 
     // 3. Chunks
-    let rows = crate::db::fetch_all(
-        db,
-        "SELECT version_id, idx, \"offset\", length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref, nonce, spool_path, remote_locator_json, state FROM chunks",
-        &[],
-    )
-    .await
-    .map_err(|e| format!("query chunks export: {e}"))?;
-    let mut chunks = Vec::new();
-    for r in &rows {
-        chunks.push(ChunkRecord {
-            version_id: r
-                .get_string(0)
-                .map_err(|e| format!("row chunks export: {e}"))?,
-            idx: r
-                .get_i32(1)
-                .map_err(|e| format!("row chunks export: {e}"))?,
-            offset: r
-                .get_i64(2)
-                .map_err(|e| format!("row chunks export: {e}"))?,
-            length: r
-                .get_i64(3)
-                .map_err(|e| format!("row chunks export: {e}"))?,
-            plaintext_sha256: r
-                .get_string(4)
-                .map_err(|e| format!("row chunks export: {e}"))?,
-            ciphertext_sha256: r
-                .get_string(5)
-                .map_err(|e| format!("row chunks export: {e}"))?,
-            encryption_mode: r
-                .get_string(6)
-                .map_err(|e| format!("row chunks export: {e}"))?,
-            key_ref: r
-                .get_opt_string(7)
-                .map_err(|e| format!("row chunks export: {e}"))?,
-            nonce: r
-                .get_opt_string(8)
-                .map_err(|e| format!("row chunks export: {e}"))?,
-            spool_path: r
-                .get_opt_string(9)
-                .map_err(|e| format!("row chunks export: {e}"))?,
-            remote_locator_json: r
-                .get_opt_string(10)
-                .map_err(|e| format!("row chunks export: {e}"))?,
-            state: r
-                .get_string(11)
-                .map_err(|e| format!("row chunks export: {e}"))?,
-        });
-    }
+    let chunks = chunks::Entity::find()
+        .all(&conn)
+        .await
+        .map_err(|e| format!("query chunks export: {e}"))?
+        .into_iter()
+        .map(|m| {
+            Ok::<_, String>(ChunkRecord {
+                version_id: m.version_id,
+                idx: i32::try_from(m.idx)
+                    .map_err(|_| "row chunks export: idx out of i32 range".to_string())?,
+                offset: m.offset,
+                length: m.length,
+                plaintext_sha256: m.plaintext_sha256,
+                ciphertext_sha256: m.ciphertext_sha256,
+                encryption_mode: m.encryption_mode,
+                key_ref: m.key_ref,
+                nonce: m.nonce,
+                spool_path: m.spool_path,
+                remote_locator_json: m.remote_locator_json,
+                state: m.state,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     // 4. Object Locks
-    let rows = crate::db::fetch_all(
-        db,
-        "SELECT bucket, key, version_id, retain_until_date, mode, legal_hold FROM object_locks",
-        &[],
-    )
-    .await
-    .map_err(|e| format!("query locks export: {e}"))?;
-    let mut object_locks = Vec::new();
-    for r in &rows {
-        object_locks.push(ObjectLockRecord {
-            bucket: r
-                .get_string(0)
-                .map_err(|e| format!("row locks export: {e}"))?,
-            key: r
-                .get_string(1)
-                .map_err(|e| format!("row locks export: {e}"))?,
-            version_id: r
-                .get_string(2)
-                .map_err(|e| format!("row locks export: {e}"))?,
-            retain_until_date: r
-                .get_opt_string(3)
-                .map_err(|e| format!("row locks export: {e}"))?,
-            mode: r
-                .get_opt_string(4)
-                .map_err(|e| format!("row locks export: {e}"))?,
-            legal_hold: r
-                .get_bool(5)
-                .map_err(|e| format!("row locks export: {e}"))?,
-        });
-    }
+    let object_locks = object_locks::Entity::find()
+        .all(&conn)
+        .await
+        .map_err(|e| format!("query locks export: {e}"))?
+        .into_iter()
+        .map(|m| ObjectLockRecord {
+            bucket: m.bucket,
+            key: m.key,
+            version_id: m.version_id,
+            retain_until_date: m.retain_until_date,
+            mode: m.mode,
+            legal_hold: m.legal_hold != 0,
+        })
+        .collect();
 
     Ok(RecoveryBundle {
         version: 1,
@@ -324,95 +251,119 @@ pub async fn import_recovery_bundle_file(
     // Apply migrations trên DB đích rồi import trong 1 txn.
     apply_all_migrations(db).await?;
 
-    let mut tx = db.begin().await?;
+    use sea_orm::sea_query::OnConflict;
+    use sea_orm::{EntityTrait, Set, TransactionTrait};
+    let conn = db.sea_conn();
+    let txn = conn.begin().await.map_err(|e| format!("begin txn: {e}"))?;
 
     // Restore Buckets
     for b in bundle.buckets {
-        tx.exec(
-            "INSERT INTO buckets(name, region, versioning_status, encryption_override, created_at)
-             VALUES (?, ?, ?, ?, ?)
-             ON CONFLICT(name) DO UPDATE SET
-               region=excluded.region,
-               versioning_status=excluded.versioning_status",
-            &[
-                Val::text(&b.name),
-                Val::text(&b.region),
-                Val::text(&b.versioning_status),
-                Val::opt_text(b.encryption_override.as_deref()),
-                Val::text(&b.created_at),
-            ],
+        crate::db::entities::buckets::Entity::insert(crate::db::entities::buckets::ActiveModel {
+            name: Set(b.name.clone()),
+            region: Set(b.region.clone()),
+            versioning_status: Set(b.versioning_status.clone()),
+            encryption_override: Set(b.encryption_override.clone()),
+            created_at: Set(b.created_at.clone()),
+        })
+        .on_conflict(
+            OnConflict::columns([crate::db::entities::buckets::Column::Name])
+                .update_columns([
+                    crate::db::entities::buckets::Column::Region,
+                    crate::db::entities::buckets::Column::VersioningStatus,
+                ])
+                .to_owned(),
         )
+        .exec(&txn)
         .await
         .map_err(|e| format!("restore bucket {}: {e}", b.name))?;
     }
 
     // Restore Objects
     for o in bundle.objects {
-        tx.exec(
-            "INSERT INTO objects(bucket, key, version_id, is_delete_marker, storage_state, size, etag, content_type, created_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(version_id) DO NOTHING",
-            &[
-                Val::text(&o.bucket),
-                Val::text(&o.key),
-                Val::text(&o.version_id),
-                Val::int(o.is_delete_marker as i64),
-                Val::text(&o.storage_state),
-                Val::int(o.size),
-                Val::text(&o.etag),
-                Val::text(&o.content_type),
-                Val::text(&o.created_at),
-            ],
+        crate::db::entities::objects::Entity::insert(crate::db::entities::objects::ActiveModel {
+            bucket: Set(o.bucket.clone()),
+            key: Set(o.key.clone()),
+            version_id: Set(o.version_id.clone()),
+            is_delete_marker: Set(o.is_delete_marker as i64),
+            storage_state: Set(o.storage_state.clone()),
+            size: Set(o.size),
+            etag: Set(o.etag.clone()),
+            content_type: Set(o.content_type.clone()),
+            created_at: Set(o.created_at.clone()),
+            ..Default::default()
+        })
+        .on_conflict(
+            OnConflict::columns([crate::db::entities::objects::Column::VersionId])
+                .do_nothing()
+                .to_owned(),
         )
+        .exec(&txn)
         .await
         .map_err(|e| format!("restore object {}: {e}", o.version_id))?;
     }
 
     // Restore Chunks
     for c in bundle.chunks {
-        tx.exec(
-            "INSERT INTO chunks(version_id, idx, offset, length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref, nonce, spool_path, remote_locator_json, state)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-             ON CONFLICT(version_id, idx) DO NOTHING",
-            &[
-                Val::text(&c.version_id),
-                Val::int(c.idx as i64),
-                Val::int(c.offset),
-                Val::int(c.length),
-                Val::text(&c.plaintext_sha256),
-                Val::text(&c.ciphertext_sha256),
-                Val::text(&c.encryption_mode),
-                Val::opt_text(c.key_ref.as_deref()),
-                Val::opt_text(c.nonce.as_deref()),
-                Val::opt_text(c.spool_path.as_deref()),
-                Val::opt_text(c.remote_locator_json.as_deref()),
-                Val::text(&c.state),
-            ],
-        )
-        .await
-        .map_err(|e| format!("restore chunk {}/{}: {e}", c.version_id, c.idx))?;
+        // Mọi cột đều Set tường minh (khớp SQL cũ); `..Default` chỉ để đủ field.
+        #[allow(clippy::needless_update)]
+        let am = crate::db::entities::chunks::ActiveModel {
+            version_id: Set(c.version_id.clone()),
+            idx: Set(c.idx as i64),
+            offset: Set(c.offset),
+            length: Set(c.length),
+            plaintext_sha256: Set(c.plaintext_sha256.clone()),
+            ciphertext_sha256: Set(c.ciphertext_sha256.clone()),
+            encryption_mode: Set(c.encryption_mode.clone()),
+            key_ref: Set(c.key_ref.clone()),
+            nonce: Set(c.nonce.clone()),
+            spool_path: Set(c.spool_path.clone()),
+            remote_locator_json: Set(c.remote_locator_json.clone()),
+            state: Set(c.state.clone()),
+            ..Default::default()
+        };
+        crate::db::entities::chunks::Entity::insert(am)
+            .on_conflict(
+                OnConflict::columns([
+                    crate::db::entities::chunks::Column::VersionId,
+                    crate::db::entities::chunks::Column::Idx,
+                ])
+                .do_nothing()
+                .to_owned(),
+            )
+            .exec(&txn)
+            .await
+            .map_err(|e| format!("restore chunk {}/{}: {e}", c.version_id, c.idx))?;
     }
 
     // Restore Object Locks
     for l in bundle.object_locks {
-        tx.exec(
-            "INSERT INTO object_locks(bucket, key, version_id, retain_until_date, mode, legal_hold)
-             VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(bucket, key, version_id) DO NOTHING",
-            &[
-                Val::text(&l.bucket),
-                Val::text(&l.key),
-                Val::text(&l.version_id),
-                Val::opt_text(l.retain_until_date.as_deref()),
-                Val::opt_text(l.mode.as_deref()),
-                Val::int(l.legal_hold as i64),
-            ],
-        )
-        .await
-        .map_err(|e| format!("restore lock {}/{}: {e}", l.bucket, l.key))?;
+        // `..Default` giữ `updated_at` theo DB default (như SQL cũ không set).
+        #[allow(clippy::needless_update)]
+        let am = crate::db::entities::object_locks::ActiveModel {
+            bucket: Set(l.bucket.clone()),
+            key: Set(l.key.clone()),
+            version_id: Set(l.version_id.clone()),
+            retain_until_date: Set(l.retain_until_date.clone()),
+            mode: Set(l.mode.clone()),
+            legal_hold: Set(l.legal_hold as i64),
+            ..Default::default()
+        };
+        crate::db::entities::object_locks::Entity::insert(am)
+            .on_conflict(
+                OnConflict::columns([
+                    crate::db::entities::object_locks::Column::Bucket,
+                    crate::db::entities::object_locks::Column::Key,
+                    crate::db::entities::object_locks::Column::VersionId,
+                ])
+                .do_nothing()
+                .to_owned(),
+            )
+            .exec(&txn)
+            .await
+            .map_err(|e| format!("restore lock {}/{}: {e}", l.bucket, l.key))?;
     }
 
-    tx.commit()
+    txn.commit()
         .await
         .map_err(|e| format!("commit import tx: {e}"))?;
     Ok(())

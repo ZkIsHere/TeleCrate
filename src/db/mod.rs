@@ -2594,6 +2594,283 @@ pub async fn force_job_lease(
     Ok(())
 }
 
+// GC/doctor helpers — SQL dọn dẹp/kiểm tra tập trung tại DAL (ADR 0006 Phase 4a).
+
+/// Set state 1 version (GC/tests).
+pub async fn set_chunk_state(db: &Db, version_id: &str, state: &str) -> Result<(), String> {
+    use entities::chunks::Column as C;
+    let conn = db.sea_conn();
+    entities::chunks::Entity::update_many()
+        .col_expr(C::State, Expr::value(state.to_string()))
+        .filter(C::VersionId.eq(version_id))
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("set chunk state: {e}"))?;
+    Ok(())
+}
+
+/// Set locator remote 1 chunk (không đổi state — khác commit_chunk_locator).
+pub async fn set_chunk_locator(
+    db: &Db,
+    version_id: &str,
+    idx: i64,
+    locator_json: &str,
+) -> Result<(), String> {
+    use entities::chunks::Column as C;
+    let conn = db.sea_conn();
+    entities::chunks::Entity::update_many()
+        .col_expr(
+            C::RemoteLocatorJson,
+            Expr::value(Some(locator_json.to_string())),
+        )
+        .filter(C::VersionId.eq(version_id))
+        .filter(C::Idx.eq(idx))
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("set chunk locator: {e}"))?;
+    Ok(())
+}
+
+/// Gắn/bỏ cờ delete-marker trên version (GC/tests tombstone).
+pub async fn flag_object_delete_marker(
+    db: &Db,
+    version_id: &str,
+    is_delete_marker: bool,
+) -> Result<(), String> {
+    use entities::objects::Column as O;
+    let conn = db.sea_conn();
+    entities::objects::Entity::update_many()
+        .col_expr(O::IsDeleteMarker, Expr::value(is_delete_marker as i64))
+        .filter(O::VersionId.eq(version_id))
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("flag delete marker: {e}"))?;
+    Ok(())
+}
+
+/// Các chunk đã `telegram-committed` nhưng vẫn còn `spool_path`.
+pub async fn committed_spool_chunks(db: &Db) -> Result<Vec<(String, i64, String)>, String> {
+    use entities::chunks::Column as C;
+    let conn = db.sea_conn();
+    let out: Vec<(String, i64, String)> = entities::chunks::Entity::find()
+        .select_only()
+        .column(C::VersionId)
+        .column(C::Idx)
+        .column(C::SpoolPath)
+        .filter(C::State.eq("telegram-committed"))
+        .filter(C::SpoolPath.is_not_null())
+        .into_tuple::<(String, i64, Option<String>)>()
+        .all(&conn)
+        .await
+        .map_err(|e| format!("query map: {e}"))?
+        .into_iter()
+        .filter_map(|(v, i, s)| s.map(|s| (v, i, s)))
+        .collect::<Vec<_>>();
+    Ok(out)
+}
+
+/// Locator remote của chunk thuộc version đã xóa, KHÔNG bị Object Lock
+/// retention/legal-hold bảo vệ. Join 3 bảng qua relations (version_id duy nhất
+/// toàn cục nên 1:1).
+pub async fn deletable_telegram_locators(
+    db: &Db,
+    now_iso: &str,
+) -> Result<Vec<(String, i64, String)>, String> {
+    use entities::chunks::Column as C;
+    use entities::object_locks::Column as L;
+    use entities::objects::Column as O;
+    use sea_orm::Condition;
+    let conn = db.sea_conn();
+    let rows = entities::chunks::Entity::find()
+        .select_only()
+        .column(C::VersionId)
+        .column(C::Idx)
+        .column(C::RemoteLocatorJson)
+        .join(
+            JoinType::InnerJoin,
+            entities::chunks::Relation::Objects.def(),
+        )
+        .join(
+            JoinType::LeftJoin,
+            entities::chunks::Relation::ObjectLocks.def(),
+        )
+        .filter(C::RemoteLocatorJson.is_not_null())
+        .filter(O::IsDeleteMarker.eq(1))
+        .filter(
+            Condition::any()
+                .add(L::LegalHold.is_null())
+                .add(L::LegalHold.eq(0)),
+        )
+        .filter(
+            Condition::any()
+                .add(L::RetainUntilDate.is_null())
+                .add(L::RetainUntilDate.lte(now_iso)),
+        )
+        .into_tuple::<(String, i64, Option<String>)>()
+        .all(&conn)
+        .await
+        .map_err(|e| format!("query map locators: {e}"))?;
+    let out: Vec<(String, i64, String)> = rows
+        .into_iter()
+        .filter_map(|(v, i, l)| l.map(|l| (v, i, l)))
+        .collect();
+    Ok(out)
+}
+
+/// Spool path của part mồ côi (upload đã abort/mất) + xóa rows mồ côi.
+/// Trả số rows đã xóa.
+pub async fn clean_orphan_multipart_parts(db: &Db) -> Result<usize, String> {
+    use entities::multipart_parts::Column as P;
+    use entities::multipart_uploads::Column as U;
+    let conn = db.sea_conn();
+    let spools: Vec<(Option<String>,)> = entities::multipart_parts::Entity::find()
+        .select_only()
+        .column(P::SpoolPath)
+        .filter(P::SpoolPath.is_not_null())
+        .join(
+            JoinType::LeftJoin,
+            entities::multipart_parts::Relation::Uploads.def(),
+        )
+        .filter(U::UploadId.is_null())
+        .into_tuple()
+        .all(&conn)
+        .await
+        .map_err(|e| format!("query map multipart clean: {e}"))?;
+    for (s,) in &spools {
+        if let Some(p) = s {
+            let p = std::path::Path::new(p);
+            if p.exists() {
+                let _ = std::fs::remove_file(p);
+            }
+        }
+    }
+    // NOT IN subquery là SQL chuẩn, portable cả hai backend.
+    let res = entities::multipart_parts::Entity::delete_many()
+        .filter(Expr::cust(
+            "upload_id NOT IN (SELECT upload_id FROM multipart_uploads)",
+        ))
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("delete orphan parts: {e}"))?;
+    Ok(res.rows_affected as usize)
+}
+
+/// Đọc verify spool: mọi chunk còn `spool_path` (kèm checksum + mode).
+pub async fn spool_verify_rows(
+    db: &Db,
+) -> Result<Vec<(String, i64, String, String, String, String)>, String> {
+    use entities::chunks::Column as C;
+    let conn = db.sea_conn();
+    let rows = entities::chunks::Entity::find()
+        .select_only()
+        .column(C::VersionId)
+        .column(C::Idx)
+        .column(C::SpoolPath)
+        .column(C::PlaintextSha256)
+        .column(C::CiphertextSha256)
+        .column(C::EncryptionMode)
+        .filter(C::SpoolPath.is_not_null())
+        .into_tuple::<(String, i64, Option<String>, String, String, String)>()
+        .all(&conn)
+        .await
+        .map_err(|e| format!("query verify spool: {e}"))?;
+    let out: Vec<(String, i64, String, String, String, String)> = rows
+        .into_iter()
+        .filter_map(|(v, i, s, p, c, e)| s.map(|s| (v, i, s, p, c, e)))
+        .collect();
+    Ok(out)
+}
+
+/// Đọc scrub remote: mọi chunk còn `remote_locator_json`.
+pub async fn remote_scrub_rows(db: &Db) -> Result<Vec<(String, i64, String)>, String> {
+    use entities::chunks::Column as C;
+    let conn = db.sea_conn();
+    let rows = entities::chunks::Entity::find()
+        .select_only()
+        .column(C::VersionId)
+        .column(C::Idx)
+        .column(C::RemoteLocatorJson)
+        .filter(C::RemoteLocatorJson.is_not_null())
+        .into_tuple::<(String, i64, Option<String>)>()
+        .all(&conn)
+        .await
+        .map_err(|e| format!("query scrub rows: {e}"))?;
+    let out: Vec<(String, i64, String)> = rows
+        .into_iter()
+        .filter_map(|(v, i, l)| l.map(|l| (v, i, l)))
+        .collect();
+    Ok(out)
+}
+
+/// Xóa locator remote sau khi GC xóa message (best-effort, caller bỏ qua lỗi).
+pub async fn clear_chunk_locator(db: &Db, version_id: &str, idx: i64) -> Result<(), String> {
+    use entities::chunks::Column as C;
+    let conn = db.sea_conn();
+    entities::chunks::Entity::update_many()
+        .col_expr(C::RemoteLocatorJson, Expr::value(None::<String>))
+        .filter(C::VersionId.eq(version_id))
+        .filter(C::Idx.eq(idx))
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("clear locator: {e}"))?;
+    Ok(())
+}
+
+/// PRAGMA SQLite (intrinsic backend — giữ raw Statement trên sea_conn).
+/// Trả chuỗi `integrity_check` ("ok" khi sạch).
+pub async fn sqlite_integrity_check(db: &Db) -> Result<String, String> {
+    use sea_orm::{ConnectionTrait, Statement};
+    db.sea_conn()
+        .query_one(Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "PRAGMA integrity_check".to_string(),
+        ))
+        .await
+        .map_err(|e| format!("pragma: {e}"))?
+        .ok_or_else(|| "pragma: no row".to_string())?
+        .try_get("", "integrity_check")
+        .map_err(|e| format!("pragma: {e}"))
+}
+
+/// PRAGMA foreign_key_check — danh sách "table ... rowid ..." vi phạm.
+pub async fn sqlite_fk_violations(db: &Db) -> Result<Vec<String>, String> {
+    use sea_orm::{ConnectionTrait, Statement};
+    let rows = db
+        .sea_conn()
+        .query_all(Statement::from_string(
+            sea_orm::DbBackend::Sqlite,
+            "PRAGMA foreign_key_check".to_string(),
+        ))
+        .await
+        .map_err(|e| format!("pragma: {e}"))?;
+    let mut out = Vec::new();
+    for r in rows {
+        let t: String = r.try_get("", "table").map_err(|e| format!("pragma: {e}"))?;
+        let id: i64 = r.try_get("", "rowid").map_err(|e| format!("pragma: {e}"))?;
+        out.push(format!("table {t} rowid {id}"));
+    }
+    Ok(out)
+}
+
+/// Đếm (buckets, objects, chunks) cho doctor.
+pub async fn table_counts(db: &Db) -> (i64, i64, i64) {
+    use sea_orm::{EntityTrait, PaginatorTrait};
+    let conn = db.sea_conn();
+    let b = entities::buckets::Entity::find()
+        .count(&conn)
+        .await
+        .unwrap_or(0) as i64;
+    let o = entities::objects::Entity::find()
+        .count(&conn)
+        .await
+        .unwrap_or(0) as i64;
+    let c = entities::chunks::Entity::find()
+        .count(&conn)
+        .await
+        .unwrap_or(0) as i64;
+    (b, o, c)
+}
+
 // Bucket Policy
 pub async fn set_bucket_policy(db: &Db, bucket: &str, policy_json: &str) -> Result<(), String> {
     if !head_bucket(db, bucket).await? {
