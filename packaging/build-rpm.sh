@@ -3,7 +3,13 @@ set -euo pipefail
 
 # Script tạo gói cài đặt Linux Tarball & RPM cho TeleCrate
 
-VERSION="0.3.3-beta.5"
+# Version lấy từ Cargo.toml (single source of truth) — không hardcode để khỏi
+# gắn nhãn sai cho release sau (vd. build beta.6 nhưng deb ghi beta.5).
+VERSION="$(awk -F'"' '/^version = /{print $2; exit}' Cargo.toml)"
+if [ -z "${VERSION}" ]; then
+  echo "ERROR: khong doc duoc version tu Cargo.toml" >&2
+  exit 1
+fi
 DIST_DIR="target/dist/telecrate-v${VERSION}-linux-amd64"
 
 echo "==> Building release binary..."
