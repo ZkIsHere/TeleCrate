@@ -85,8 +85,8 @@ enum DbOp {
         #[arg(short, long)]
         passphrase: Option<String>,
     },
-    /// In DDL schema Postgres (tương đương migrations SQLite 0001→0004) cho DBA tạo schema trước.
-    /// Runtime Postgres: blocked (ADR 0005) — lệnh này chỉ xuất DDL, không kết nối DB.
+    /// In DDL schema Postgres (tương đương migrations SQLite 0001→0005) cho DBA tạo schema trước.
+    /// Lệnh này chỉ xuất DDL, không kết nối DB.
     PgSchema,
 }
 

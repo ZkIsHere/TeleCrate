@@ -35,7 +35,7 @@ migration là forward-only (không downgrade về beta.7 sau khi lên 5, vì bin
 cũ query cột đã xóa), nên **backup trước khi nâng cấp**:
 ```bash
 sudo systemctl stop telecrate
-telecrate db backup /var/backups/telecrate-pre-beta8.db
+telecrate db backup --output /var/backups/telecrate-pre-beta8.db
 curl -fsSL https://github.com/ZkIsHere/TeleCrate/releases/download/v0.3.3-beta.8/telecrate-linux-amd64.tar.gz | sudo tar -xz -C /usr/local/bin/
 sudo systemctl start telecrate
 ```
