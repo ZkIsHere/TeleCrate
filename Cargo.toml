@@ -24,7 +24,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "registry", "fmt", "std"] }
 # Log file daily-rotation cho daemon (stdout vẫn giữ cho journald).
 tracing-appender = "0.2"
-rusqlite = { version = "0.31", features = ["bundled", "backup"] }
+# rusqlite 0.32 (libsqlite3-sys 0.30) để chung native lib với sqlx-sqlite 0.8
+# (0.31 kéo libsqlite3-sys 0.28 → cargo báo xung đột `links = "sqlite3"`).
+# Chỉ dùng cho: mở file DB trực tiếp trong tests + giữ feature backup.
+rusqlite = { version = "0.32", features = ["bundled", "backup"] }
 sha2 = "0.10"
 hex = "0.4"
 uuid = { version = "1", features = ["v4"] }
@@ -50,5 +53,11 @@ x509-parser = "0.16"
 # DAL hợp nhất SQLite + Postgres: viết query `?` + bind một lần, sqlx tự
 # rebind `$N` cho Postgres. Không dùng sqlx macros (cần DATABASE_URL lúc compile).
 sqlx = { version = "0.8", default-features = false, features = ["sqlite", "postgres", "runtime-tokio-rustls"] }
+# ADR 0006: SeaORM 1.x (sqlx 0.8) + SeaQuery — entities là single source of truth
+# cho cấu trúc bảng, mirror migrations SQL (không thay migrator). Entities viết
+# tay để build offline; datetime TEXT map sang String (zero behavior change).
+sea-orm = { version = "1", default-features = false, features = ["sqlx-sqlite", "sqlx-postgres", "runtime-tokio-rustls", "macros"] }
+# SeaQuery trực tiếp: build/đối chiếu DDL trong test parity + query tường minh ở phase sau.
+sea-query = "0.32"
 
 [dev-dependencies]

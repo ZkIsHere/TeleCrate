@@ -5,6 +5,9 @@
 //! Datetime lưu TEXT `YYYY-MM-DD HH:MM:SS` UTC trên cả hai backend nên so sánh
 //! chuỗi tương đương so sánh thời gian. Số nguyên đọc i64 trên cả hai
 //! (DDL Postgres dùng BIGINT toàn bộ). Không giữ txn mở suốt network upload.
+//!
+//! ADR 0006: `entities` là single source of truth cho cấu trúc bảng (SeaORM +
+//! SeaQuery), mirror migrations SQL — xem `entities/mod.rs`.
 
 use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
 use serde::{Deserialize, Serialize};
@@ -16,6 +19,8 @@ use sqlx::sqlite::{
 };
 use sqlx::{Pool, Postgres, Row as SqlxRow, Sqlite};
 use std::path::Path;
+
+pub mod entities;
 
 /// Handle DB hợp nhất hai backend (ADR 0005 — Postgres giờ runnable).
 #[derive(Debug, Clone)]
@@ -466,27 +471,27 @@ pub fn ensure_backend_supported(backend: DbBackend) -> Result<(), String> {
 }
 
 /// DDL SQLite versioned, migrations forward-only.
-pub const MIGRATION_001: &str = include_str!("../migrations/0001_init.sql");
-pub const MIGRATION_002: &str = include_str!("../migrations/0002_m3_multipart_versioning.sql");
-pub const MIGRATION_003: &str = include_str!("../migrations/0003_m4_auth_policy_cors_lock.sql");
-pub const MIGRATION_004: &str = include_str!("../migrations/0004_dashboard_enhancements.sql");
+pub const MIGRATION_001: &str = include_str!("../../migrations/0001_init.sql");
+pub const MIGRATION_002: &str = include_str!("../../migrations/0002_m3_multipart_versioning.sql");
+pub const MIGRATION_003: &str = include_str!("../../migrations/0003_m4_auth_policy_cors_lock.sql");
+pub const MIGRATION_004: &str = include_str!("../../migrations/0004_dashboard_enhancements.sql");
 
 /// DDL Postgres versioned, song song migrations SQLite 0001→0004
 /// (cùng quy ước file SQL forward-only). Runtime apply theo version.
-pub const PG_MIGRATION_001: &str = include_str!("../migrations/postgres/0001_init.sql");
+pub const PG_MIGRATION_001: &str = include_str!("../../migrations/postgres/0001_init.sql");
 pub const PG_MIGRATION_002: &str =
-    include_str!("../migrations/postgres/0002_m3_multipart_versioning.sql");
+    include_str!("../../migrations/postgres/0002_m3_multipart_versioning.sql");
 pub const PG_MIGRATION_003: &str =
-    include_str!("../migrations/postgres/0003_m4_auth_policy_cors_lock.sql");
+    include_str!("../../migrations/postgres/0003_m4_auth_policy_cors_lock.sql");
 pub const PG_MIGRATION_004: &str =
-    include_str!("../migrations/postgres/0004_dashboard_enhancements.sql");
+    include_str!("../../migrations/postgres/0004_dashboard_enhancements.sql");
 
 /// DDL Postgres đầy đủ cho DBA tạo schema trước (`telecrate db pg-schema`).
 pub const POSTGRES_SCHEMA: &str = concat!(
-    include_str!("../migrations/postgres/0001_init.sql"),
-    include_str!("../migrations/postgres/0002_m3_multipart_versioning.sql"),
-    include_str!("../migrations/postgres/0003_m4_auth_policy_cors_lock.sql"),
-    include_str!("../migrations/postgres/0004_dashboard_enhancements.sql"),
+    include_str!("../../migrations/postgres/0001_init.sql"),
+    include_str!("../../migrations/postgres/0002_m3_multipart_versioning.sql"),
+    include_str!("../../migrations/postgres/0003_m4_auth_policy_cors_lock.sql"),
+    include_str!("../../migrations/postgres/0004_dashboard_enhancements.sql"),
 );
 
 /// Lấy version migration hiện tại (0 nếu chưa có bảng).
