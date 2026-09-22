@@ -215,9 +215,30 @@ impl SessionStore {
     }
 }
 
+/// Random bytes an toàn cho key/session id.
+/// Không bao giờ lặng lẽ trả về buffer toàn 0 khi OS RNG lỗi (nguyên nhân
+/// gây trùng `access_key_id` + `ON CONFLICT DO UPDATE` ghi đè lẫn nhau):
+/// fallback trộn thời gian/pid/counter để mỗi lần gọi vẫn khác nhau.
 fn crypto_random_bytes(len: usize) -> Vec<u8> {
+    static FALLBACK_CTR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let mut buf = vec![0u8; len];
-    let _ = getrandom::getrandom(&mut buf);
+    let ok = getrandom::getrandom(&mut buf).is_ok() && !buf.iter().all(|&b| b == 0);
+    if !ok {
+        use std::hash::{Hash, Hasher};
+        let ctr = FALLBACK_CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        for (i, b) in buf.iter_mut().enumerate() {
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            (now, std::process::id(), ctr, i).hash(&mut h);
+            *b = (h.finish() >> ((i % 8) * 8)) as u8;
+        }
+        if buf.iter().all(|&b| b == 0) {
+            buf[0] = 0x01;
+        }
+    }
     buf
 }
 
@@ -484,9 +505,24 @@ pub async fn api_get_status(
     let spool_used = dir_size(FilePath::new(&config.spool_dir));
     let spool_total = 10 * 1024 * 1024 * 1024u64; // Default 10 GB indicator
 
-    let db_size = std::fs::metadata(&config.db_path)
-        .map(|m| m.len())
-        .unwrap_or(0);
+    // Kích thước metadata DB theo backend: SQLite = file index.db;
+    // Postgres không có file local nên hỏi trực tiếp `pg_database_size`
+    // (đọc metadata file lúc đó luôn ra 0/sai).
+    let db_backend = db.backend();
+    let db_size: u64 = match db_backend {
+        telecrate::db::DbBackend::Sqlite => std::fs::metadata(&config.db_path)
+            .map(|m| m.len())
+            .unwrap_or(0),
+        telecrate::db::DbBackend::Postgres => {
+            crate::db::fetch_opt(&db, "SELECT pg_database_size(current_database())", &[])
+                .await
+                .ok()
+                .flatten()
+                .and_then(|r| r.get_i64(0).ok())
+                .map(|n| n.max(0) as u64)
+                .unwrap_or(0)
+        }
+    };
 
     let mut total_buckets = 0;
     let mut total_access_keys = 0;
@@ -521,13 +557,17 @@ pub async fn api_get_status(
     Json(json!({
         "version": telecrate::VERSION,
         "uptime_seconds": store.uptime_secs(),
+        "uptime_secs": store.uptime_secs(),
         "spool": {
             "total_bytes": spool_total,
+            "quota_bytes": spool_total,
             "used_bytes": spool_used,
+            "spool_used_bytes": spool_used,
             "free_bytes": spool_total.saturating_sub(spool_used),
             "reserved_free_space_bytes": 100 * 1024 * 1024,
         },
         "db_size_bytes": db_size,
+        "db_backend": db_backend.as_str(),
         "workers": {
             "active_worker_count": config.worker_concurrency,
             "pending_jobs_count": pending_jobs,
@@ -757,6 +797,27 @@ pub async fn api_list_access_keys(
 #[derive(Deserialize)]
 pub struct CreateKeyPayload {
     pub user_id: Option<String>,
+    /// Dashboard gửi thêm nhưng backend cũ lặng lẽ bỏ qua — giờ persist thật.
+    pub allowed_buckets: Option<serde_json::Value>,
+    pub policy: Option<String>,
+    pub description: Option<String>,
+}
+
+/// Sinh `access_key_id` duy nhất: thử tối đa N lần, mỗi lần kiểm tra DB để
+/// loại trừ va chạm (kể cả khi OS RNG suy biến trả hằng số).
+async fn generate_unique_access_key_id(db: &telecrate::db::Db) -> String {
+    for _ in 0..8 {
+        let cand = format!("AKIA{}", hex::encode(crypto_random_bytes(8)).to_uppercase());
+        match telecrate::db::get_access_key(db, &cand).await {
+            Ok(None) => return cand,
+            _ => continue,
+        }
+    }
+    // Dự phòng cuối: UUID đảm bảo duy nhất tuyệt đối.
+    format!(
+        "AKIA{}",
+        uuid::Uuid::new_v4().simple().to_string().to_uppercase()
+    )
 }
 
 /// `POST /admin/api/access-keys`
@@ -769,24 +830,71 @@ pub async fn api_create_access_key(
         return err_resp.into_response();
     }
 
-    let user_id = payload.user_id.unwrap_or_else(|| "admin".to_string());
-    let access_key_id = format!("AKIA{}", hex::encode(crypto_random_bytes(8)).to_uppercase());
+    let user_id = payload
+        .user_id
+        .or(payload.description)
+        .unwrap_or_else(|| "admin".to_string());
+    let access_key_id = generate_unique_access_key_id(&db).await;
     let secret_key = hex::encode(crypto_random_bytes(20));
+
+    // Chuẩn hóa allowed_buckets: "*" / rỗng / null = unrestricted (NULL);
+    // còn lại lưu chuỗi CSV gọn để tương thích DAL hiện tại.
+    let allowed_buckets: Option<String> = match payload.allowed_buckets {
+        None => None,
+        Some(v) => {
+            if v.is_null() {
+                None
+            } else if let Some(s) = v.as_str() {
+                let t = s.trim();
+                if t.is_empty() || t == "*" {
+                    None
+                } else {
+                    Some(t.to_string())
+                }
+            } else if let Some(arr) = v.as_array() {
+                let parts: Vec<String> = arr
+                    .iter()
+                    .filter_map(|x| x.as_str().map(|s| s.trim().to_string()))
+                    .filter(|s| !s.is_empty() && s != "*")
+                    .collect();
+                if parts.is_empty() {
+                    None
+                } else {
+                    Some(parts.join(","))
+                }
+            } else {
+                None
+            }
+        }
+    };
 
     match telecrate::db::create_access_key(&db, &access_key_id, &secret_key, Some(&user_id)).await {
         Ok(_) => {
+            if let Some(ref ab) = allowed_buckets {
+                let _ = telecrate::db::update_access_key_allowed_buckets(
+                    &db,
+                    &access_key_id,
+                    Some(ab.as_str()),
+                )
+                .await;
+            }
             // Audit KHÔNG ghi secret_key — chỉ id + user (secret chỉ trả 1 lần trong response).
+            let policy = payload.policy.unwrap_or_else(|| "read-write".to_string());
             store.audit(
                 AuditLevel::Info,
                 "admin",
                 "key.create",
-                format!("id='{access_key_id}' user='{user_id}'"),
+                format!(
+                    "id='{access_key_id}' user='{user_id}' policy='{policy}' buckets='{}'",
+                    allowed_buckets.as_deref().unwrap_or("*")
+                ),
             );
             Json(json!({
                 "ok": true,
                 "access_key_id": access_key_id,
                 "secret_key": secret_key,
-                "user_id": user_id
+                "user_id": user_id,
+                "allowed_buckets": allowed_buckets,
             }))
             .into_response()
         }
@@ -1463,6 +1571,9 @@ pub async fn api_list_buckets_v2(
             "versioning": versioning,
             "object_count": obj_count,
             "total_size_bytes": total_size,
+            // Alias cho JS dashboard cũ còn đọc `total_bytes`.
+            "total_bytes": total_size,
+            "size": total_size,
         }));
     }
     Json(list).into_response()

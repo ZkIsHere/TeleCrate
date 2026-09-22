@@ -118,7 +118,7 @@
           <div class="stat"><div class="stat-label">Access keys</div><div class="stat-value" id="ov-keys">—</div></div>
           <div class="stat"><div class="stat-label">Chunks</div><div class="stat-value" id="ov-chunks">—</div></div>
           <div class="stat"><div class="stat-label">Spool usage</div><div class="stat-value" id="ov-spool">—</div><div class="stat-sub" id="ov-spool-detail"></div></div>
-          <div class="stat"><div class="stat-label">DB size</div><div class="stat-value" id="ov-db">—</div></div>
+          <div class="stat"><div class="stat-label" id="ov-db-label">DB size</div><div class="stat-value" id="ov-db">—</div></div>
           <div class="stat"><div class="stat-label">Pending jobs</div><div class="stat-value" id="ov-pending">—</div></div>
           <div class="stat"><div class="stat-label">Workers</div><div class="stat-value" id="ov-workers">—</div></div>
         </div>
@@ -235,7 +235,7 @@
             <legend>Lưu trữ</legend>
             <label class="field"><span>Thư mục spool <em class="tag-restart">⟳ restart</em></span><input id="cfg-spool" placeholder="/var/lib/telecrate/spool"></label>
             <label class="field"><span>DB backend <em class="tag-restart">⟳ restart</em></span>
-              <select id="cfg-dbbackend"><option value="sqlite">sqlite (runnable)</option><option value="postgres">postgres (partial — xem ADR 0005)</option></select>
+              <select id="cfg-dbbackend"><option value="sqlite">sqlite (runnable)</option><option value="postgres">postgres (runnable)</option></select>
             </label>
             <label class="field"><span>Postgres URL <em>(để trống = giữ nguyên/xóa khi về sqlite)</em></span><input id="cfg-dburl" type="password" autocomplete="new-password" placeholder="postgresql://user:pass@host:5432/telecrate"></label>
           </fieldset>

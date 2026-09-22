@@ -52,11 +52,20 @@ function esc(s) {
 function fmtBytes(n) {
   n = Number(n) || 0;
   if (n <= 0) return '0 B';
-  if (n < 1024) return n + ' B';
+  // Trục Y truyền float (vd 0.33) — làm tròn gọn để không bị cắt chữ
+  // kiểu "66666 B" (thực ra là "0.66666 B" bị clip).
+  if (n < 1024) return (n >= 100 ? Math.round(n) : Math.round(n * 10) / 10) + ' B';
   const u = ['KB', 'MB', 'GB', 'TB', 'PB'];
   let i = -1;
   do { n /= 1024; i++; } while (n >= 1024 && i < u.length - 1);
-  return n.toFixed(1) + ' ' + u[i];
+  return (n >= 100 ? Math.round(n) : Math.round(n * 10) / 10) + ' ' + u[i];
+}
+
+/** Formatter số nguyên cho trục Y dạng count (objects/jobs) — tránh 26206.33. */
+function fmtInt(n) {
+  n = Number(n) || 0;
+  if (Math.abs(n) >= 10000) return Math.round(n).toLocaleString('en-US').replace(/,/g, ' ');
+  return String(Math.round(n));
 }
 
 function fmtUptime(s) {
@@ -70,9 +79,26 @@ function fmtUptime(s) {
 }
 
 function fmtTime(ts) {
-  if (!ts) return '—';
-  const d = new Date(typeof ts === 'number' ? ts * 1000 : ts);
+  if (!ts && ts !== 0) return '—';
+  let v = ts;
+  if (typeof ts === 'number') {
+    // Backend có nơi trả epoch giây, có nơi trả chuỗi SQLite.
+    v = ts < 1e12 ? ts * 1000 : ts;
+  } else if (typeof ts === 'string') {
+    // SQLite "YYYY-MM-DD HH:MM:SS" → ISO để Safari/Firefox parse được.
+    if (/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}/.test(ts)) v = ts.replace(' ', 'T');
+    else if (/^\d+$/.test(ts)) v = Number(ts) * 1000;
+  }
+  const d = new Date(v);
   return isNaN(d.getTime()) ? '—' : d.toLocaleString();
+}
+
+/** Giờ:phút gọn cho nhãn trục X của biểu đồ (ts epoch giây). */
+function fmtClock(ts) {
+  if (!ts && ts !== 0) return '';
+  const d = new Date(Number(ts) * 1000);
+  if (isNaN(d.getTime())) return '';
+  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
 function toast(msg, kind) {
@@ -297,19 +323,19 @@ function drawLineChart(canvasId, points, formatVal, color) {
     return;
   }
 
-  const padLeft = 46, padRight = 14, padTop = 14, padBottom = 24;
+  const padLeft = 64, padRight = 14, padTop = 14, padBottom = 24;
   const plotW = w - padLeft - padRight;
   const plotH = h - padTop - padBottom;
 
-  const vals = points.map((p) => p.val);
+  const vals = points.map((p) => Number(p.val) || 0);
   let minV = Math.min(...vals);
   let maxV = Math.max(...vals);
   if (minV === maxV) { minV = Math.max(0, minV - 1); maxV += 1; }
 
-  // Draw subtle horizontal grid lines
+  // Draw subtle horizontal grid lines (nhãn đã làm tròn — không còn "66666 B")
   const gridColor = isDark ? 'rgba(255,255,255,0.06)' : 'rgba(0,0,0,0.06)';
   const textColor = isDark ? '#9198a1' : '#59636e';
-  ctx.font = '10.5px monospace';
+  ctx.font = '10px monospace';
   ctx.textAlign = 'right';
   ctx.fillStyle = textColor;
 
@@ -323,13 +349,32 @@ function drawLineChart(canvasId, points, formatVal, color) {
     ctx.moveTo(padLeft, yPos);
     ctx.lineTo(w - padRight, yPos);
     ctx.stroke();
-    ctx.fillText(formatVal ? formatVal(yVal) : Math.round(yVal), padLeft - 6, yPos + 3.5);
+    ctx.fillText(formatVal ? formatVal(yVal) : fmtInt(yVal), padLeft - 6, yPos + 3.5);
   }
 
-  // Calculate coordinates
-  const coords = points.map((p, idx) => {
-    const x = padLeft + (idx / (points.length - 1 || 1)) * plotW;
-    const y = padTop + plotH - ((p.val - minV) / (maxV - minV)) * plotH;
+  // Nhãn thời gian X (điểm đầu/cuối) nếu có ts epoch giây.
+  if (points[0] && points[0].ts) {
+    ctx.textAlign = 'left';
+    ctx.fillText(fmtClock(points[0].ts), padLeft, h - 8);
+    if (points.length > 1 && points[points.length - 1].ts) {
+      ctx.textAlign = 'right';
+      ctx.fillText(fmtClock(points[points.length - 1].ts), w - padRight, h - 8);
+    }
+  }
+
+  // Gợi ý khi chưa đủ lịch sử (sampler 10s/điểm — vừa restart thì chỉ 1 điểm).
+  if (points.length < 2) {
+    ctx.textAlign = 'center';
+    ctx.fillText('đang thu thập lịch sử…', padLeft + plotW / 2, h - 8);
+  }
+
+  // Calculate coordinates — 1 điểm duy nhất vẽ đường ngang + chấm cuối
+  // (trước đây chấm dồn sát mép trái, trông như "chạy sai").
+  const coords = vals.map((v, idx) => {
+    const x = points.length === 1
+      ? padLeft + plotW
+      : padLeft + (idx / (points.length - 1)) * plotW;
+    const y = padTop + plotH - ((v - minV) / (maxV - minV)) * plotH;
     return { x, y };
   });
 
@@ -367,12 +412,12 @@ function drawLineChart(canvasId, points, formatVal, color) {
 
 function drawAllCharts() {
   if (!cachedMetrics || cachedMetrics.length === 0) return;
-  const isDark = document.documentElement.dataset.theme === 'dark';
+  const isDark = document.documentElement.dataset.theme !== 'light';
 
-  drawLineChart('chart-objects', cachedMetrics.map((m) => ({ val: m.objects || 0 })), (v) => Math.round(v), isDark ? '#4493f8' : '#0969da');
-  drawLineChart('chart-spool', cachedMetrics.map((m) => ({ val: m.spool_used_bytes ?? m.spool_bytes ?? 0 })), fmtBytes, isDark ? '#d29922' : '#9a6700');
-  drawLineChart('chart-storage', cachedMetrics.map((m) => ({ val: m.total_size_bytes ?? m.db_bytes ?? 0 })), fmtBytes, isDark ? '#3fb950' : '#1a7f37');
-  drawLineChart('chart-jobs', cachedMetrics.map((m) => ({ val: (m.pending_jobs || 0) + (m.uploading_jobs || 0) })), (v) => Math.round(v), isDark ? '#f85149' : '#cf222e');
+  drawLineChart('chart-objects', cachedMetrics.map((m) => ({ val: m.objects || 0, ts: m.ts })), fmtInt, isDark ? '#4493f8' : '#0969da');
+  drawLineChart('chart-spool', cachedMetrics.map((m) => ({ val: m.spool_used_bytes ?? m.spool_bytes ?? 0, ts: m.ts })), fmtBytes, isDark ? '#d29922' : '#9a6700');
+  drawLineChart('chart-storage', cachedMetrics.map((m) => ({ val: m.total_size_bytes ?? m.db_bytes ?? 0, ts: m.ts })), fmtBytes, isDark ? '#3fb950' : '#1a7f37');
+  drawLineChart('chart-jobs', cachedMetrics.map((m) => ({ val: (m.pending_jobs || 0) + (m.uploading_jobs || 0), ts: m.ts })), fmtInt, isDark ? '#f85149' : '#cf222e');
 }
 
 /* ==========================================================================
@@ -396,8 +441,10 @@ async function loadOverview() {
     $('ov-keys').textContent = v(c.total_access_keys, d.total_access_keys);
     $('ov-chunks').textContent = v(c.total_chunks, 0);
 
-    const spoolBytes = Number(v(s.used_bytes, d.spool_used_bytes)) || 0;
-    const spoolQuota = Number(s.quota_bytes) || 0;
+    const spoolBytes = Number(v(s.used_bytes, s.spool_used_bytes ?? d.spool_used_bytes)) || 0;
+    // Backend trả `total_bytes` (+ alias `quota_bytes` mới) — trước đây JS chỉ
+    // đọc `quota_bytes` nên thanh Spool luôn 0% / "Không giới hạn" sai.
+    const spoolQuota = Number(s.quota_bytes ?? s.total_bytes) || 0;
     $('ov-spool').textContent = fmtBytes(spoolBytes);
     $('ov-spool-detail').textContent = spoolQuota > 0 ? `Hạn mức: ${fmtBytes(spoolQuota)}` : 'Không giới hạn';
 
@@ -409,7 +456,8 @@ async function loadOverview() {
       fill.className = 'progress-fill' + (spoolPct > 90 ? ' err' : spoolPct > 70 ? ' warn' : '');
     }
 
-    $('ov-db').textContent = fmtBytes(d.db_size_bytes || 0);
+    $('ov-db').textContent = d.db_size_bytes > 0 ? fmtBytes(d.db_size_bytes) : '—';
+    if (d.db_backend && $('ov-db-label')) $('ov-db-label').textContent = `DB size (${d.db_backend})`;
     $('ov-pending').textContent = `${v(w.pending_jobs_count, d.pending_jobs || 0)} chờ / ${v(w.uploading_jobs_count, d.uploading_jobs || 0)} chạy`;
     $('ov-workers').textContent = v(w.active_worker_count, d.worker_concurrency || 2);
 
@@ -483,7 +531,7 @@ function renderBuckets() {
     <td>${esc(b.region || 'us-east-1')}</td>
     <td><span class="badge ${b.versioning === 'Enabled' ? 'ok' : ''}">${esc(b.versioning || 'Disabled')}</span></td>
     <td class="num mono">${b.object_count ?? '—'}</td>
-    <td class="num mono">${fmtBytes(b.total_bytes ?? 0)}</td>
+    <td class="num mono" title="${b.total_size_bytes ?? b.total_bytes ?? 0} bytes">${fmtBytes(b.total_size_bytes ?? b.total_bytes ?? b.size ?? 0)}</td>
     <td class="mono small">${esc(fmtTime(b.created_at))}</td>
     <td>
       <button class="btn sm ghost btn-open-bucket" data-b="${esc(b.name)}">Xem files</button>
@@ -846,25 +894,30 @@ function renderKeys() {
     return;
   }
 
-  tb.innerHTML = list.map((k) => `<tr>
-    <td class="mono"><strong>${esc(k.access_key_id)}</strong></td>
+  // Backend trả status "Active"/"Inactive" (viết hoa) — so sánh case-insensitive
+  // (trước đây so `=== 'active'` nên badge luôn đỏ + nút toggle gửi sai).
+  tb.innerHTML = list.map((k) => {
+    const active = String(k.status || 'active').toLowerCase() === 'active';
+    return `<tr>
+    <td class="mono" title="${esc(k.access_key_id)}"><strong>${esc(k.access_key_id)}</strong></td>
     <td>${esc(k.user_id || 'admin')}</td>
-    <td><span class="badge ${k.status === 'active' ? 'ok' : 'err'}">${esc(k.status || 'active')}</span></td>
+    <td><span class="badge ${active ? 'ok' : 'err'}">${esc(k.status || 'active')}</span></td>
     <td class="mono small">${esc(k.allowed_buckets || '*')}</td>
     <td class="mono small">${k.last_used_at ? esc(fmtTime(k.last_used_at)) : '<span class="muted">chưa dùng</span>'}</td>
     <td class="mono small">${esc(fmtTime(k.created_at))}</td>
     <td>
       <button class="btn sm ghost btn-toggle-key" data-id="${esc(k.access_key_id)}" data-status="${esc(k.status || 'active')}">
-        ${k.status === 'active' ? 'Tạm dừng' : 'Kích hoạt'}
+        ${active ? 'Tạm dừng' : 'Kích hoạt'}
       </button>
       <button class="btn sm danger btn-revoke-key" data-id="${esc(k.access_key_id)}">Thu hồi</button>
     </td>
-  </tr>`).join('');
+  </tr>`;
+  }).join('');
 
   tb.querySelectorAll('.btn-toggle-key').forEach((btn) => {
     btn.addEventListener('click', async () => {
       const id = btn.dataset.id;
-      const nextStatus = btn.dataset.status === 'active' ? 'inactive' : 'active';
+      const nextStatus = String(btn.dataset.status || '').toLowerCase() === 'active' ? 'inactive' : 'active';
       try {
         const r = await api(`/admin/api/access-keys/${encodeURIComponent(id)}`, {
           method: 'PATCH',
@@ -1163,7 +1216,9 @@ async function loadConnect() {
     // Keys vào select (giữ lựa chọn hiện tại nếu còn).
     const sel = $('conn-key');
     const prev = sel.value;
-    const keys = Array.isArray(rk) ? rk.filter((k) => (k.status || 'Active') === 'Active') : [];
+    const keys = Array.isArray(rk)
+      ? rk.filter((k) => String(k.status || 'Active').toLowerCase() === 'active')
+      : (Array.isArray(rk.access_keys) ? rk.access_keys.filter((k) => String(k.status || 'Active').toLowerCase() === 'active') : []);
     sel.innerHTML = keys.length
       ? keys.map((k) => `<option value="${esc(k.access_key_id)}">${esc(k.access_key_id)}</option>`).join('')
       : '<option value="">(chưa có key — bấm Tạo key mới)</option>';
@@ -1269,7 +1324,10 @@ async function loadJobs() {
     const r = await api('/admin/api/jobs?' + p.toString());
     const d = await r.json();
 
-    const counts = d.counts || { pending: 0, uploading: 0, completed: 0, failed: 0 };
+    // Backend trả `summary` (+ alias `counts`); job dùng `job_id`,
+    // `next_attempt`, `lease_owner` — JS cũ đọc `id`/`next_attempt_at`/
+    // `worker_id` nên bảng Jobs hiện "#undefined".
+    const counts = d.counts || d.summary || { pending: 0, uploading: 0, completed: 0, failed: 0 };
     renderPipelineBar(counts);
 
     const list = d.jobs || [];
@@ -1278,15 +1336,20 @@ async function loadJobs() {
       return;
     }
 
-    tb.innerHTML = list.map((j) => `<tr>
-      <td class="mono small">#${esc(j.id)}</td>
-      <td class="mono"><strong>${esc(j.bucket)}</strong> / ${esc(j.key)}</td>
+    tb.innerHTML = list.map((j) => {
+      const jid = j.job_id ?? j.id ?? '—';
+      const next = j.next_attempt ?? j.next_attempt_at;
+      const lease = j.lease_owner ?? j.worker_id;
+      return `<tr>
+      <td class="mono small" title="${esc(j.version_id || '')}">#${esc(String(jid).slice(0, 8))}</td>
+      <td class="mono"><strong>${esc(j.bucket || '—')}</strong> / ${esc(j.key || '—')}</td>
       <td><span class="badge ${j.state === 'completed' ? 'ok' : j.state === 'uploading' ? 'info' : j.state === 'failed' ? 'err' : 'warn'}">${esc(j.state)}</span></td>
       <td class="num mono">${j.retry_count ?? 0}</td>
-      <td class="mono small">${j.next_attempt_at ? esc(fmtTime(j.next_attempt_at)) : '—'}</td>
-      <td class="mono small">${j.worker_id ? esc(j.worker_id) : '<span class="muted">—</span>'}</td>
-      <td class="small ${j.last_error ? 'muted' : 'muted'}">${esc(j.last_error || '—')}</td>
-    </tr>`).join('');
+      <td class="mono small">${next ? esc(fmtTime(next)) : '—'}</td>
+      <td class="mono small">${lease ? esc(lease) : '<span class="muted">—</span>'}</td>
+      <td class="small muted">${esc(j.last_error || '—')}</td>
+    </tr>`;
+    }).join('');
   } catch (e) {
     if (tb) tb.innerHTML = '';
     const je = $('jobs-error');
@@ -1370,7 +1433,7 @@ async function loadMultipartUploads() {
       <td>${esc(u.bucket)}</td>
       <td class="mono">${esc(u.key)}</td>
       <td>${esc(u.content_type || '—')}</td>
-      <td class="mono small">${esc(fmtTime(u.initiated_at))}</td>
+      <td class="mono small">${esc(fmtTime(u.created_at ?? u.initiated_at))}</td>
       <td><button class="btn sm danger btn-abort-mp" data-id="${esc(u.upload_id)}">Hủy upload</button></td>
     </tr>`).join('');
 

@@ -36,6 +36,18 @@ pub fn router(
     let config_lock = Arc::new(std::sync::RwLock::new(config.clone()));
     let admin_state: telecrate::admin::AdminState = (config_lock, session_store, db);
 
+    // Sampler metrics nền cho biểu đồ Tổng quan (10s/điểm, ring 1000).
+    // Trước đây hàm `metrics_sampler` tồn tại nhưng không nơi nào spawn nên
+    // `/admin/api/metrics-history` luôn chỉ có 1 điểm dự phòng → biểu đồ
+    // hiện 1 chấm đơn + trục Y vô nghĩa. Spawn tại đây (router dựng trong
+    // async runtime của daemon và của tests — tác vụ nền vô hại cho tests).
+    {
+        let (sampler_cfg, sampler_store, sampler_db) = admin_state.clone();
+        tokio::spawn(async move {
+            telecrate::admin::metrics_sampler(sampler_cfg, sampler_store, sampler_db).await;
+        });
+    }
+
     Router::new()
         .route("/health", get(health))
         .route(
@@ -268,6 +280,31 @@ async fn find_secret_key(state: &AppState, key_id: &str) -> Option<String> {
     None
 }
 
+/// Cập nhật `last_used_at` của key sau auth thành công (fire-and-forget để
+/// không làm chậm đường dữ liệu S3; lỗi bỏ qua). Trước đây hàm
+/// `touch_access_key_last_used` tồn tại nhưng không nơi nào gọi nên dashboard
+/// luôn hiện "chưa dùng".
+fn touch_key_last_used(state: &AppState, key_id: &str) {
+    let db = state.db.clone();
+    let kid = key_id.to_string();
+    tokio::spawn(async move {
+        let _ = telecrate::db::touch_access_key_last_used(&db, &kid).await;
+    });
+}
+
+/// Ghi audit cho thao tác S3 control-plane phá hủy (best-effort, không chặn
+/// request khi store bận). Put/Get high-volume KHÔNG audit để khỏi flood
+/// ring-buffer 5000 bản ghi.
+fn audit_s3(
+    state: &AppState,
+    level: telecrate::admin::AuditLevel,
+    actor: &str,
+    action: &str,
+    detail: String,
+) {
+    state.session_store.audit(level, actor, action, detail);
+}
+
 /// Xác thực SigV4 header hoặc presigned query. Trả access key id hoặc S3Error.
 async fn authenticate(
     state: &AppState,
@@ -320,6 +357,7 @@ async fn authenticate(
             log_auth_err(&e);
             sig_error_to_s3(e, resource, request_id)
         })?;
+        touch_key_last_used(state, &v.access_key_id);
         return Ok(v.access_key_id);
     }
 
@@ -343,6 +381,7 @@ async fn authenticate(
             log_auth_err(&e);
             sig_error_to_s3(e, resource, request_id)
         })?;
+        touch_key_last_used(state, &v.access_key_id);
         return Ok(v.access_key_id);
     }
 
@@ -1267,7 +1306,7 @@ async fn bucket_post(
             .await;
     }
 
-    if let Err(e) = authenticate(
+    let actor = match authenticate(
         &state,
         &AuthInput {
             method: "POST",
@@ -1281,8 +1320,9 @@ async fn bucket_post(
     )
     .await
     {
-        return e.into_response();
-    }
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
     if !query_map(raw_query).contains_key("delete") {
         return S3Error::new(
             "InvalidRequest",
@@ -1356,6 +1396,19 @@ async fn bucket_post(
         }
     }
     best_effort_remote_deletes(state.transport.clone(), pending_deletes).await;
+    if !deleted.is_empty() {
+        audit_s3(
+            &state,
+            telecrate::admin::AuditLevel::Warn,
+            &actor,
+            "s3.objects.delete_multi",
+            format!(
+                "bucket='{bucket}' count={} keys='{}'",
+                deleted.len(),
+                deleted.join(",")
+            ),
+        );
+    }
     xml_response(
         StatusCode::OK,
         telecrate::s3::delete_result_xml(&deleted, quiet),
@@ -1439,7 +1492,7 @@ async fn create_bucket(
         "s3:CreateBucket"
     };
 
-    if let Err(e) = check_auth_with_policy(
+    let actor = match check_auth_with_policy(
         &state,
         action,
         Some(&bucket),
@@ -1456,8 +1509,9 @@ async fn create_bucket(
     )
     .await
     {
-        return e.into_response();
-    }
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
 
     let resp = if qmap.contains_key("cors") {
         put_bucket_cors_handler(&state, &bucket, &body, &resource, &request_id).await
@@ -1487,6 +1541,13 @@ async fn create_bucket(
         };
         match telecrate::db::create_bucket(&state.db, &bucket, &bucket_region).await {
             Ok(telecrate::db::CreateBucketOutcome::Created) => {
+                audit_s3(
+                    &state,
+                    telecrate::admin::AuditLevel::Info,
+                    &actor,
+                    "s3.bucket.create",
+                    format!("bucket='{bucket}' region='{bucket_region}'"),
+                );
                 xml_response(StatusCode::OK, String::new(), &request_id)
             }
             Ok(telecrate::db::CreateBucketOutcome::AlreadyOwned) => {
@@ -1538,7 +1599,7 @@ async fn delete_bucket(
         "s3:DeleteBucket"
     };
 
-    if let Err(e) = check_auth_with_policy(
+    let actor = match check_auth_with_policy(
         &state,
         action,
         Some(&bucket),
@@ -1555,8 +1616,9 @@ async fn delete_bucket(
     )
     .await
     {
-        return e.into_response();
-    }
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
 
     let resp = if qmap.contains_key("cors") {
         delete_bucket_cors_handler(&state, &bucket, &resource, &request_id).await
@@ -1567,6 +1629,13 @@ async fn delete_bucket(
     } else {
         match telecrate::db::delete_bucket(&state.db, &bucket).await {
             Ok(telecrate::db::DeleteBucketOutcome::Deleted) => {
+                audit_s3(
+                    &state,
+                    telecrate::admin::AuditLevel::Warn,
+                    &actor,
+                    "s3.bucket.delete",
+                    format!("bucket='{bucket}'"),
+                );
                 xml_response(StatusCode::NO_CONTENT, String::new(), &request_id)
             }
             Ok(telecrate::db::DeleteBucketOutcome::NoSuchBucket) => telecrate::s3::S3Error::new(
@@ -2827,7 +2896,7 @@ async fn delete_object(
     let raw_path = uri.path().to_string();
     let resource = format!("/{bucket}/{key}");
     let raw_query = uri.query().unwrap_or("");
-    if let Err(e) = check_auth_with_policy(
+    let actor = match check_auth_with_policy(
         &state,
         "s3:DeleteObject",
         Some(&bucket),
@@ -2844,8 +2913,9 @@ async fn delete_object(
     )
     .await
     {
-        return e.into_response();
-    }
+        Ok(a) => a,
+        Err(e) => return e.into_response(),
+    };
     let qmap = query_map(raw_query);
     if let Some(upload_id) = qmap.get("uploadId") {
         return abort_multipart_upload_handler(
@@ -2988,6 +3058,15 @@ async fn delete_object(
         let _ = std::fs::remove_file(p);
     }
     best_effort_remote_deletes(state.transport.clone(), deleted.remote_locators).await;
+    if deleted.existed {
+        audit_s3(
+            &state,
+            telecrate::admin::AuditLevel::Warn,
+            &actor,
+            "s3.object.delete",
+            format!("bucket='{bucket}' key='{key}'"),
+        );
+    }
     xml_response(StatusCode::NO_CONTENT, String::new(), &request_id)
 }
 

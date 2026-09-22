@@ -1,3 +1,51 @@
+# TeleCrate v0.3.3-beta.6 — Release Notes (pre-release)
+
+Phiên bản **beta** sửa loạt lỗi dashboard quản trị: bucket size luôn 0 B, biểu đồ
+Tổng quan vẽ sai, access key ID trùng nhau, nhãn postgres "partial" đã lỗi thời,
+nhật ký thiếu thao tác S3, và DB size sai khi dùng Postgres.
+
+---
+
+## 🌟 Điểm nổi bật trong phiên bản v0.3.3-beta.6
+
+### 1. Bucket size + DB size hiển thị đúng
+* Bảng Buckets đọc đúng field `total_size_bytes` (trước đây đọc nhầm `total_bytes`
+  nên luôn hiện 0 B).
+* Thẻ DB size: SQLite đo file `index.db` như cũ; Postgres hỏi trực tiếp
+  `pg_database_size(current_database())`. Nhãn thẻ tự hiện backend đang dùng
+  (`DB size (sqlite)` / `DB size (postgres)`).
+
+### 2. Biểu đồ Tổng quan vẽ đúng
+* Task `metrics_sampler` (10s/điểm, giữ ~2.7 giờ) trước đây tồn tại nhưng không nơi
+  nào spawn nên history luôn chỉ có 1 điểm → biểu đồ hiện 1 chấm đơn. Đã spawn
+  trong `router()`.
+* Sửa nhãn trục Y bị cắt (`0.666… B` hiện thành `66666 B`), 1 điểm vẽ đường ngang
+  + chấm ở mép phải, thêm nhãn giờ trục X.
+
+### 3. Access keys: ID duy nhất + lưu đầy đủ
+* `crypto_random_bytes` không còn lặng lẽ trả buffer toàn 0 khi OS RNG lỗi
+  (nguyên nhân gây trùng ID + ghi đè lẫn nhau qua `ON CONFLICT`); sinh ID có kiểm
+  tra duy nhất trong DB.
+* Lúc tạo key giờ persist thật `allowed_buckets`/`policy` (trước đây lặng lẽ bỏ).
+* Sửa badge/nút Tạm dừng-Kích hoạt luôn sai do so sánh `status` phân biệt hoa thường
+  (`Active` vs `active`); cột "last used" giờ cập nhật sau mỗi lần auth S3 thành công.
+
+### 4. Nhật ký + nhãn postgres
+* Audit thêm thao tác S3 phá hủy: tạo/xóa bucket, xóa 1 object, xóa nhiều objects
+  (Put/Get không audit để khỏi flood ring-buffer).
+* Dropdown DB backend: `postgres (runnable)` thay cho nhãn `partial` cũ.
+
+### Nâng cấp từ beta.5
+Thay binary, giữ DB/spool (không migration mới):
+```bash
+sudo systemctl stop telecrate
+curl -fsSL https://github.com/ZkIsHere/TeleCrate/releases/download/v0.3.3-beta.6/telecrate-linux-amd64.tar.gz | sudo tar -xz -C /usr/local/bin/
+sudo systemctl start telecrate
+```
+Sau restart đợi vài phút để sampler đủ điểm vẽ biểu đồ đường.
+
+---
+
 # TeleCrate v0.3.3-beta.5 — Release Notes (pre-release)
 
 Phiên bản **beta** sửa bước `s3 check`/tạo datastore của PBS: với endpoint path-style,
