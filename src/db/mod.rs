@@ -12,7 +12,8 @@
 use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
-    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
+    ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, JoinType, PaginatorTrait,
+    QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set, Statement, TransactionTrait, Value,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -796,17 +797,16 @@ pub async fn create_multipart_upload(
     if !head_bucket(db, bucket).await? {
         return Err("NoSuchBucket".to_string());
     }
-    exec(
-        db,
-        "INSERT INTO multipart_uploads(upload_id, bucket, key, content_type, metadata_json) VALUES (?, ?, ?, ?, ?)",
-        &[
-            Val::text(upload_id),
-            Val::text(bucket),
-            Val::text(key),
-            Val::text(content_type),
-            Val::opt_text(metadata_json),
-        ],
-    )
+    let conn = db.sea_conn();
+    entities::multipart_uploads::ActiveModel {
+        upload_id: Set(upload_id.to_string()),
+        bucket: Set(bucket.to_string()),
+        key: Set(key.to_string()),
+        content_type: Set(content_type.to_string()),
+        metadata_json: Set(metadata_json.map(|s| s.to_string())),
+        ..Default::default()
+    }
+    .insert(&conn)
     .await
     .map_err(|e| format!("insert multipart_upload: {e}"))?;
     Ok(())
@@ -817,36 +817,21 @@ pub async fn get_multipart_upload(
     db: &Db,
     upload_id: &str,
 ) -> Result<Option<MultipartUpload>, String> {
-    let row = fetch_opt(
-        db,
-        "SELECT upload_id, bucket, key, content_type, metadata_json, created_at FROM multipart_uploads WHERE upload_id = ?",
-        &[Val::text(upload_id)],
-    )
-    .await
-    .map_err(|e| format!("query get multipart_upload: {e}"))?;
-    match row {
-        Some(r) => Ok(Some(MultipartUpload {
-            upload_id: r
-                .get_string(0)
-                .map_err(|e| format!("row multipart_upload: {e}"))?,
-            bucket: r
-                .get_string(1)
-                .map_err(|e| format!("row multipart_upload: {e}"))?,
-            key: r
-                .get_string(2)
-                .map_err(|e| format!("row multipart_upload: {e}"))?,
-            content_type: r
-                .get_string(3)
-                .map_err(|e| format!("row multipart_upload: {e}"))?,
-            metadata_json: r
-                .get_opt_string(4)
-                .map_err(|e| format!("row multipart_upload: {e}"))?,
-            created_at: r
-                .get_string(5)
-                .map_err(|e| format!("row multipart_upload: {e}"))?,
-        })),
-        None => Ok(None),
-    }
+    let conn = db.sea_conn();
+    entities::multipart_uploads::Entity::find_by_id(upload_id)
+        .one(&conn)
+        .await
+        .map_err(|e| format!("query get multipart_upload: {e}"))
+        .map(|m| {
+            m.map(|m| MultipartUpload {
+                upload_id: m.upload_id,
+                bucket: m.bucket,
+                key: m.key,
+                content_type: m.content_type,
+                metadata_json: m.metadata_json,
+                created_at: m.created_at,
+            })
+        })
 }
 
 /// Lưu hoặc cập nhật một Part của Multipart Upload.
@@ -861,23 +846,34 @@ pub async fn save_multipart_part(
     ciphertext_sha256: &str,
     spool_path: Option<&str>,
 ) -> Result<(), String> {
-    exec(
-        db,
-        "INSERT INTO multipart_parts(upload_id, part_number, size, etag, plaintext_sha256, ciphertext_sha256, spool_path)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(upload_id, part_number) DO UPDATE SET
-            size=excluded.size, etag=excluded.etag, plaintext_sha256=excluded.plaintext_sha256,
-            ciphertext_sha256=excluded.ciphertext_sha256, spool_path=excluded.spool_path, state='pending'",
-        &[
-            Val::text(upload_id),
-            Val::int(part_number as i64),
-            Val::int(size),
-            Val::text(etag),
-            Val::text(plaintext_sha256),
-            Val::text(ciphertext_sha256),
-            Val::opt_text(spool_path),
-        ],
+    let conn = db.sea_conn();
+    entities::multipart_parts::Entity::insert(entities::multipart_parts::ActiveModel {
+        upload_id: Set(upload_id.to_string()),
+        part_number: Set(part_number as i64),
+        size: Set(size),
+        etag: Set(etag.to_string()),
+        plaintext_sha256: Set(plaintext_sha256.to_string()),
+        ciphertext_sha256: Set(ciphertext_sha256.to_string()),
+        spool_path: Set(spool_path.map(|s| s.to_string())),
+        state: Set("pending".to_string()),
+        ..Default::default()
+    })
+    .on_conflict(
+        OnConflict::columns([
+            entities::multipart_parts::Column::UploadId,
+            entities::multipart_parts::Column::PartNumber,
+        ])
+        .update_columns([
+            entities::multipart_parts::Column::Size,
+            entities::multipart_parts::Column::Etag,
+            entities::multipart_parts::Column::PlaintextSha256,
+            entities::multipart_parts::Column::CiphertextSha256,
+            entities::multipart_parts::Column::SpoolPath,
+            entities::multipart_parts::Column::State,
+        ])
+        .to_owned(),
     )
+    .exec(&conn)
     .await
     .map_err(|e| format!("insert/update multipart_part: {e}"))?;
     Ok(())
@@ -885,47 +881,29 @@ pub async fn save_multipart_part(
 
 /// Liệt kê các Part đã upload theo thứ tự part_number tăng dần.
 pub async fn list_multipart_parts(db: &Db, upload_id: &str) -> Result<Vec<MultipartPart>, String> {
-    let rows = fetch_all(
-        db,
-        "SELECT upload_id, part_number, size, etag, plaintext_sha256, ciphertext_sha256, spool_path, remote_locator_json, state, created_at
-                  FROM multipart_parts WHERE upload_id = ? ORDER BY part_number ASC",
-        &[Val::text(upload_id)],
-    )
-    .await
-    .map_err(|e| format!("query list multipart_parts: {e}"))?;
+    use entities::multipart_parts::Column as P;
+    let conn = db.sea_conn();
+    let rows = entities::multipart_parts::Entity::find()
+        .filter(P::UploadId.eq(upload_id))
+        .order_by_asc(P::PartNumber)
+        .all(&conn)
+        .await
+        .map_err(|e| format!("query list multipart_parts: {e}"))?;
     let mut parts = Vec::new();
-    for r in rows {
+    for m in rows {
         parts.push(MultipartPart {
-            upload_id: r
-                .get_string(0)
-                .map_err(|e| format!("row multipart_part: {e}"))?,
-            part_number: r
-                .get_i32(1)
-                .map_err(|e| format!("row multipart_part: {e}"))?,
-            size: r
-                .get_i64(2)
-                .map_err(|e| format!("row multipart_part: {e}"))?,
-            etag: r
-                .get_string(3)
-                .map_err(|e| format!("row multipart_part: {e}"))?,
-            plaintext_sha256: r
-                .get_string(4)
-                .map_err(|e| format!("row multipart_part: {e}"))?,
-            ciphertext_sha256: r
-                .get_string(5)
-                .map_err(|e| format!("row multipart_part: {e}"))?,
-            spool_path: r
-                .get_opt_string(6)
-                .map_err(|e| format!("row multipart_part: {e}"))?,
-            remote_locator_json: r
-                .get_opt_string(7)
-                .map_err(|e| format!("row multipart_part: {e}"))?,
-            state: r
-                .get_string(8)
-                .map_err(|e| format!("row multipart_part: {e}"))?,
-            created_at: r
-                .get_string(9)
-                .map_err(|e| format!("row multipart_part: {e}"))?,
+            upload_id: m.upload_id,
+            // Cột BIGINT nhưng struct giữ i32 như cũ.
+            part_number: i32::try_from(m.part_number)
+                .map_err(|_| "row multipart_part: part_number out of i32 range".to_string())?,
+            size: m.size,
+            etag: m.etag,
+            plaintext_sha256: m.plaintext_sha256,
+            ciphertext_sha256: m.ciphertext_sha256,
+            spool_path: m.spool_path,
+            remote_locator_json: m.remote_locator_json,
+            state: m.state,
+            created_at: m.created_at,
         });
     }
     Ok(parts)
@@ -936,80 +914,66 @@ pub async fn abort_multipart_upload(db: &Db, upload_id: &str) -> Result<Vec<Stri
     let parts = list_multipart_parts(db, upload_id).await?;
     let spool_paths: Vec<String> = parts.into_iter().filter_map(|p| p.spool_path).collect();
 
-    let mut tx = db.begin().await?;
-    tx.exec(
-        "DELETE FROM multipart_parts WHERE upload_id = ?",
-        &[Val::text(upload_id)],
-    )
-    .await
-    .map_err(|e| format!("delete parts: {e}"))?;
-    tx.exec(
-        "DELETE FROM multipart_uploads WHERE upload_id = ?",
-        &[Val::text(upload_id)],
-    )
-    .await
-    .map_err(|e| format!("delete upload: {e}"))?;
-    tx.commit().await?;
+    let sea = db.sea_conn();
+    let txn = sea.begin().await.map_err(|e| format!("begin txn: {e}"))?;
+    entities::multipart_parts::Entity::delete_many()
+        .filter(entities::multipart_parts::Column::UploadId.eq(upload_id))
+        .exec(&txn)
+        .await
+        .map_err(|e| format!("delete parts: {e}"))?;
+    entities::multipart_uploads::Entity::delete_by_id(upload_id)
+        .exec(&txn)
+        .await
+        .map_err(|e| format!("delete upload: {e}"))?;
+    txn.commit().await.map_err(|e| format!("commit txn: {e}"))?;
 
     Ok(spool_paths)
 }
 
 /// Liệt kê tất cả Multipart Uploads chưa hoàn thành của một bucket.
 pub async fn list_multipart_uploads(db: &Db, bucket: &str) -> Result<Vec<MultipartUpload>, String> {
-    let rows = fetch_all(
-        db,
-        "SELECT upload_id, bucket, key, content_type, metadata_json, created_at FROM multipart_uploads WHERE bucket = ? ORDER BY created_at ASC",
-        &[Val::text(bucket)],
-    )
-    .await
-    .map_err(|e| format!("query list multipart_uploads: {e}"))?;
-    let mut uploads = Vec::new();
-    for r in rows {
-        uploads.push(MultipartUpload {
-            upload_id: r
-                .get_string(0)
-                .map_err(|e| format!("row list multipart_uploads: {e}"))?,
-            bucket: r
-                .get_string(1)
-                .map_err(|e| format!("row list multipart_uploads: {e}"))?,
-            key: r
-                .get_string(2)
-                .map_err(|e| format!("row list multipart_uploads: {e}"))?,
-            content_type: r
-                .get_string(3)
-                .map_err(|e| format!("row list multipart_uploads: {e}"))?,
-            metadata_json: r
-                .get_opt_string(4)
-                .map_err(|e| format!("row list multipart_uploads: {e}"))?,
-            created_at: r
-                .get_string(5)
-                .map_err(|e| format!("row list multipart_uploads: {e}"))?,
-        });
-    }
-    Ok(uploads)
+    use entities::multipart_uploads::Column as U;
+    let conn = db.sea_conn();
+    let rows = entities::multipart_uploads::Entity::find()
+        .filter(U::Bucket.eq(bucket))
+        .order_by_asc(U::CreatedAt)
+        .all(&conn)
+        .await
+        .map_err(|e| format!("query list multipart_uploads: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|m| MultipartUpload {
+            upload_id: m.upload_id,
+            bucket: m.bucket,
+            key: m.key,
+            content_type: m.content_type,
+            metadata_json: m.metadata_json,
+            created_at: m.created_at,
+        })
+        .collect())
 }
 
-async fn get_bucket_versioning_tx(tx: &mut Tx<'_>, bucket: &str) -> Result<String, String> {
-    let row = tx
-        .fetch_opt(
-            "SELECT versioning_status FROM buckets WHERE name = ?",
-            &[Val::text(bucket)],
-        )
-        .await
-        .map_err(|e| format!("query: {e}"))?;
-    match row {
-        Some(r) => r.get_string(0).map_err(|e| format!("row: {e}")),
-        None => Ok("Disabled".to_string()),
+/// Backend SeaORM tương ứng (cho `Statement::from_sql_and_values`).
+pub(crate) fn sea_backend(db: &Db) -> sea_orm::DbBackend {
+    match db.backend() {
+        DbBackend::Sqlite => sea_orm::DbBackend::Sqlite,
+        DbBackend::Postgres => sea_orm::DbBackend::Postgres,
     }
 }
 
 async fn prepare_versioning_write_tx(
-    tx: &mut Tx<'_>,
+    txn: &sea_orm::DatabaseTransaction,
     bucket: &str,
     key: &str,
     requested_version_id: &str,
 ) -> Result<(String, Vec<String>), String> {
-    let v_status = get_bucket_versioning_tx(tx, bucket).await?;
+    use entities::objects::Column as O;
+    let v_status = entities::buckets::Entity::find_by_id(bucket)
+        .one(txn)
+        .await
+        .map_err(|e| format!("query: {e}"))?
+        .map(|m| m.versioning_status)
+        .unwrap_or_else(|| "Disabled".to_string());
     let final_version_id = if v_status == "Suspended" {
         "null".to_string()
     } else if v_status == "Enabled" {
@@ -1025,44 +989,47 @@ async fn prepare_versioning_write_tx(
     let mut old_spools = Vec::new();
     if v_status == "Enabled" {
         // Preserves existing versions
-    } else if v_status == "Suspended" {
-        // Overwrite existing "null" version
-        let rows = tx
-            .fetch_all("SELECT spool_path FROM chunks WHERE version_id = 'null' AND version_id IN (SELECT version_id FROM objects WHERE bucket = ? AND key = ?)", &[Val::text(bucket), Val::text(key)])
-            .await
-            .map_err(|e| format!("query: {e}"))?;
-        let null_spools: Vec<String> = rows
-            .into_iter()
-            .filter_map(|r| r.get_opt_string(0).unwrap_or(None))
-            .collect();
-        old_spools.extend(null_spools);
-        tx.exec("DELETE FROM upload_jobs WHERE version_id = 'null' AND version_id IN (SELECT version_id FROM objects WHERE bucket = ? AND key = ?)", &[Val::text(bucket), Val::text(key)]).await.ok();
-        tx.exec("DELETE FROM chunks WHERE version_id = 'null' AND version_id IN (SELECT version_id FROM objects WHERE bucket = ? AND key = ?)", &[Val::text(bucket), Val::text(key)]).await.ok();
-        tx.exec(
-            "DELETE FROM objects WHERE bucket = ? AND key = ? AND version_id = 'null'",
-            &[Val::text(bucket), Val::text(key)],
-        )
-        .await
-        .ok();
     } else {
-        // Disabled: delete all previous versions
-        let rows = tx
-            .fetch_all("SELECT spool_path FROM chunks WHERE version_id IN (SELECT version_id FROM objects WHERE bucket = ? AND key = ?)", &[Val::text(bucket), Val::text(key)])
+        // Suspended: chỉ ghi đè version "null". Disabled: xóa mọi version cũ.
+        let null_only = v_status == "Suspended";
+        let mut q = entities::objects::Entity::find()
+            .filter(O::Bucket.eq(bucket))
+            .filter(O::Key.eq(key));
+        if null_only {
+            q = q.filter(O::VersionId.eq("null"));
+        }
+        let versions: Vec<String> = q
+            .all(txn)
             .await
-            .map_err(|e| format!("query: {e}"))?;
-        let spools: Vec<String> = rows
+            .map_err(|e| format!("query: {e}"))?
             .into_iter()
-            .filter_map(|r| r.get_opt_string(0).unwrap_or(None))
+            .map(|m| m.version_id)
             .collect();
-        old_spools.extend(spools);
-        tx.exec("DELETE FROM upload_jobs WHERE version_id IN (SELECT version_id FROM objects WHERE bucket = ? AND key = ?)", &[Val::text(bucket), Val::text(key)]).await.ok();
-        tx.exec("DELETE FROM chunks WHERE version_id IN (SELECT version_id FROM objects WHERE bucket = ? AND key = ?)", &[Val::text(bucket), Val::text(key)]).await.ok();
-        tx.exec(
-            "DELETE FROM objects WHERE bucket = ? AND key = ?",
-            &[Val::text(bucket), Val::text(key)],
-        )
-        .await
-        .ok();
+        if !versions.is_empty() {
+            use entities::chunks::Column as C;
+            use entities::upload_jobs::Column as J;
+            let spools: Vec<(Option<String>,)> = entities::chunks::Entity::find()
+                .select_only()
+                .column(C::SpoolPath)
+                .filter(C::VersionId.is_in(versions.clone()))
+                .into_tuple()
+                .all(txn)
+                .await
+                .map_err(|e| format!("query: {e}"))?;
+            old_spools.extend(spools.into_iter().filter_map(|(s,)| s));
+            let _ = entities::upload_jobs::Entity::delete_many()
+                .filter(J::VersionId.is_in(versions.clone()))
+                .exec(txn)
+                .await;
+            let _ = entities::chunks::Entity::delete_many()
+                .filter(C::VersionId.is_in(versions.clone()))
+                .exec(txn)
+                .await;
+            let _ = entities::objects::Entity::delete_many()
+                .filter(O::VersionId.is_in(versions))
+                .exec(txn)
+                .await;
+        }
     }
     Ok((final_version_id, old_spools))
 }
@@ -1117,67 +1084,70 @@ pub async fn complete_multipart_upload_txn(
     let bucket = upload.bucket.clone();
     let key = upload.key.clone();
 
-    let mut tx = db.begin().await?;
+    let sea = db.sea_conn();
+    let txn = sea.begin().await.map_err(|e| format!("begin txn: {e}"))?;
 
     let (final_version_id, old_spools) =
-        prepare_versioning_write_tx(&mut tx, &bucket, &key, version_id).await?;
+        prepare_versioning_write_tx(&txn, &bucket, &key, version_id).await?;
 
-    tx.exec(
-        "INSERT INTO objects(bucket, key, version_id, is_delete_marker, storage_state, size, etag, content_type, user_metadata_json) VALUES (?, ?, ?, 0, 'accepted-local', ?, ?, ?, ?)",
-        &[
-            Val::text(&bucket),
-            Val::text(&key),
-            Val::text(&final_version_id),
-            Val::int(total_size),
-            Val::text(&multipart_etag),
-            Val::text(&upload.content_type),
-            Val::opt_text(upload.metadata_json.as_deref()),
-        ],
-    )
+    entities::objects::ActiveModel {
+        bucket: Set(bucket.clone()),
+        key: Set(key.clone()),
+        version_id: Set(final_version_id.clone()),
+        is_delete_marker: Set(0),
+        storage_state: Set("accepted-local".to_string()),
+        size: Set(total_size),
+        etag: Set(multipart_etag),
+        content_type: Set(upload.content_type.clone()),
+        user_metadata_json: Set(upload.metadata_json.clone()),
+        ..Default::default()
+    }
+    .insert(&txn)
     .await
     .map_err(|e| format!("insert object: {e}"))?;
 
     let mut current_offset: i64 = 0;
     for (idx, part) in parts.iter().enumerate() {
         let spool_path = part.spool_path.as_deref().unwrap_or("");
-        tx.exec(
-            "INSERT INTO chunks(version_id, idx, \"offset\", length, plaintext_sha256, ciphertext_sha256, encryption_mode, spool_path, state) VALUES (?, ?, ?, ?, ?, ?, 'none', ?, 'pending')",
-            &[
-                Val::text(&final_version_id),
-                Val::int(idx as i64),
-                Val::int(current_offset),
-                Val::int(part.size),
-                Val::text(&part.plaintext_sha256),
-                Val::text(&part.ciphertext_sha256),
-                Val::text(spool_path),
-            ],
-        )
+        entities::chunks::ActiveModel {
+            version_id: Set(final_version_id.clone()),
+            idx: Set(idx as i64),
+            offset: Set(current_offset),
+            length: Set(part.size),
+            plaintext_sha256: Set(part.plaintext_sha256.clone()),
+            ciphertext_sha256: Set(part.ciphertext_sha256.clone()),
+            encryption_mode: Set("none".to_string()),
+            spool_path: Set(Some(spool_path.to_string())),
+            state: Set("pending".to_string()),
+            ..Default::default()
+        }
+        .insert(&txn)
         .await
         .map_err(|e| format!("insert chunk: {e}"))?;
         current_offset += part.size;
     }
 
-    tx.exec(
-        "INSERT INTO upload_jobs(job_id, version_id, state) VALUES (?, ?, 'pending')",
-        &[Val::text(job_id), Val::text(&final_version_id)],
-    )
+    entities::upload_jobs::ActiveModel {
+        job_id: Set(job_id.to_string()),
+        version_id: Set(final_version_id.clone()),
+        state: Set("pending".to_string()),
+        ..Default::default()
+    }
+    .insert(&txn)
     .await
     .map_err(|e| format!("insert job: {e}"))?;
 
-    tx.exec(
-        "DELETE FROM multipart_parts WHERE upload_id = ?",
-        &[Val::text(upload_id)],
-    )
-    .await
-    .map_err(|e| format!("delete parts: {e}"))?;
-    tx.exec(
-        "DELETE FROM multipart_uploads WHERE upload_id = ?",
-        &[Val::text(upload_id)],
-    )
-    .await
-    .map_err(|e| format!("delete upload: {e}"))?;
+    entities::multipart_parts::Entity::delete_many()
+        .filter(entities::multipart_parts::Column::UploadId.eq(upload_id))
+        .exec(&txn)
+        .await
+        .map_err(|e| format!("delete parts: {e}"))?;
+    entities::multipart_uploads::Entity::delete_by_id(upload_id)
+        .exec(&txn)
+        .await
+        .map_err(|e| format!("delete upload: {e}"))?;
 
-    tx.commit().await?;
+    txn.commit().await.map_err(|e| format!("commit txn: {e}"))?;
 
     let version = latest_version(db, &bucket, &key)
         .await?
@@ -1400,51 +1370,56 @@ pub async fn put_object(
     chunks: &[NewChunk],
     job_id: &str,
 ) -> Result<(Vec<String>, String), String> {
-    let mut tx = conn.begin().await?;
+    let sea = conn.sea_conn();
+    let txn = sea.begin().await.map_err(|e| format!("begin txn: {e}"))?;
 
     let (final_version_id, old_spools) =
-        prepare_versioning_write_tx(&mut tx, bucket, key, version_id).await?;
+        prepare_versioning_write_tx(&txn, bucket, key, version_id).await?;
 
-    tx.exec(
-        "INSERT INTO objects(bucket, key, version_id, is_delete_marker, storage_state, size, etag, content_type, user_metadata_json, system_metadata_json) VALUES (?, ?, ?, 0, 'accepted-local', ?, ?, ?, ?, ?)",
-        &[
-            Val::text(bucket),
-            Val::text(key),
-            Val::text(&final_version_id),
-            Val::int(size),
-            Val::text(etag),
-            Val::text(content_type),
-            Val::opt_text(user_metadata_json),
-            Val::opt_text(system_metadata_json),
-        ],
-    )
+    entities::objects::ActiveModel {
+        bucket: Set(bucket.to_string()),
+        key: Set(key.to_string()),
+        version_id: Set(final_version_id.clone()),
+        is_delete_marker: Set(0),
+        storage_state: Set("accepted-local".to_string()),
+        size: Set(size),
+        etag: Set(etag.to_string()),
+        content_type: Set(content_type.to_string()),
+        user_metadata_json: Set(user_metadata_json.map(|s| s.to_string())),
+        system_metadata_json: Set(system_metadata_json.map(|s| s.to_string())),
+        ..Default::default()
+    }
+    .insert(&txn)
     .await
     .map_err(|e| format!("insert object: {e}"))?;
     for (idx, c) in chunks.iter().enumerate() {
-        tx.exec(
-            "INSERT INTO chunks(version_id, idx, \"offset\", length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref, spool_path, state) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending')",
-            &[
-                Val::text(&final_version_id),
-                Val::int(idx as i64),
-                Val::int(c.offset),
-                Val::int(c.length),
-                Val::text(&c.plaintext_sha256),
-                Val::text(&c.ciphertext_sha256),
-                Val::text(&c.mode),
-                Val::opt_text(c.key_ref.as_deref()),
-                Val::text(&c.spool_path),
-            ],
-        )
+        entities::chunks::ActiveModel {
+            version_id: Set(final_version_id.clone()),
+            idx: Set(idx as i64),
+            offset: Set(c.offset),
+            length: Set(c.length),
+            plaintext_sha256: Set(c.plaintext_sha256.clone()),
+            ciphertext_sha256: Set(c.ciphertext_sha256.clone()),
+            encryption_mode: Set(c.mode.clone()),
+            key_ref: Set(c.key_ref.clone()),
+            spool_path: Set(Some(c.spool_path.clone())),
+            state: Set("pending".to_string()),
+            ..Default::default()
+        }
+        .insert(&txn)
         .await
         .map_err(|e| format!("insert chunk: {e}"))?;
     }
-    tx.exec(
-        "INSERT INTO upload_jobs(job_id, version_id, state) VALUES (?, ?, 'pending')",
-        &[Val::text(job_id), Val::text(&final_version_id)],
-    )
+    entities::upload_jobs::ActiveModel {
+        job_id: Set(job_id.to_string()),
+        version_id: Set(final_version_id.clone()),
+        state: Set("pending".to_string()),
+        ..Default::default()
+    }
+    .insert(&txn)
     .await
     .map_err(|e| format!("insert job: {e}"))?;
-    tx.commit().await?;
+    txn.commit().await.map_err(|e| format!("commit txn: {e}"))?;
     Ok((old_spools, final_version_id))
 }
 
@@ -1472,8 +1447,6 @@ pub async fn copy_object_txn(
         .await?
         .ok_or_else(|| "NoSuchKey".to_string())?;
 
-    let src_chunks = chunks_of(conn, &src_version.version_id).await?;
-
     let (final_content_type, final_user_meta, final_sys_meta) =
         if metadata_directive.eq_ignore_ascii_case("REPLACE") {
             (
@@ -1491,53 +1464,76 @@ pub async fn copy_object_txn(
             )
         };
 
-    let mut tx = conn.begin().await?;
+    let sea = conn.sea_conn();
+    let txn = sea.begin().await.map_err(|e| format!("begin txn: {e}"))?;
 
     let (final_version_id, old_spools) =
-        prepare_versioning_write_tx(&mut tx, dest_bucket, dest_key, new_version_id).await?;
+        prepare_versioning_write_tx(&txn, dest_bucket, dest_key, new_version_id).await?;
 
-    tx.exec(
-        "INSERT INTO objects(bucket, key, version_id, is_delete_marker, storage_state, size, etag, content_type, user_metadata_json, system_metadata_json) VALUES (?, ?, ?, 0, 'accepted-local', ?, ?, ?, ?, ?)",
-        &[
-            Val::text(dest_bucket),
-            Val::text(dest_key),
-            Val::text(&final_version_id),
-            Val::int(src_version.size),
-            Val::text(&src_version.etag),
-            Val::text(&final_content_type),
-            Val::opt_text(final_user_meta.as_deref()),
-            Val::opt_text(final_sys_meta.as_deref()),
-        ],
-    )
+    entities::objects::ActiveModel {
+        bucket: Set(dest_bucket.to_string()),
+        key: Set(dest_key.to_string()),
+        version_id: Set(final_version_id.clone()),
+        is_delete_marker: Set(0),
+        storage_state: Set("accepted-local".to_string()),
+        size: Set(src_version.size),
+        etag: Set(src_version.etag.clone()),
+        content_type: Set(final_content_type),
+        user_metadata_json: Set(final_user_meta),
+        system_metadata_json: Set(final_sys_meta),
+        ..Default::default()
+    }
+    .insert(&txn)
     .await
     .map_err(|e| format!("insert object: {e}"))?;
 
-    let mut need_upload = false;
-    for c in &src_chunks {
-        tx.exec(
-            "INSERT INTO chunks(version_id, idx, \"offset\", length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref, spool_path, remote_locator_json, state)
-             SELECT ?, idx, \"offset\", length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref, spool_path, remote_locator_json, state
-             FROM chunks WHERE version_id = ? AND idx = ?",
-            &[Val::text(&final_version_id), Val::text(&src_version.version_id), Val::int(c.idx)],
-        )
+    // Zero-copy spool reference: đọc chunk nguồn trong txn rồi chèn lại dưới
+    // version mới (thay INSERT..SELECT raw như trước).
+    let src_rows = entities::chunks::Entity::find()
+        .filter(entities::chunks::Column::VersionId.eq(&src_version.version_id))
+        .order_by_asc(entities::chunks::Column::Idx)
+        .all(&txn)
         .await
         .map_err(|e| format!("copy chunk: {e}"))?;
 
-        if c.state == "pending" {
+    let mut need_upload = false;
+    for s in &src_rows {
+        entities::chunks::ActiveModel {
+            version_id: Set(final_version_id.clone()),
+            idx: Set(s.idx),
+            offset: Set(s.offset),
+            length: Set(s.length),
+            plaintext_sha256: Set(s.plaintext_sha256.clone()),
+            ciphertext_sha256: Set(s.ciphertext_sha256.clone()),
+            encryption_mode: Set(s.encryption_mode.clone()),
+            key_ref: Set(s.key_ref.clone()),
+            spool_path: Set(s.spool_path.clone()),
+            remote_locator_json: Set(s.remote_locator_json.clone()),
+            state: Set(s.state.clone()),
+            ..Default::default()
+        }
+        .insert(&txn)
+        .await
+        .map_err(|e| format!("copy chunk: {e}"))?;
+
+        if s.state == "pending" {
             need_upload = true;
         }
     }
 
     if need_upload {
-        tx.exec(
-            "INSERT INTO upload_jobs(job_id, version_id, state) VALUES (?, ?, 'pending')",
-            &[Val::text(new_job_id), Val::text(&final_version_id)],
-        )
+        entities::upload_jobs::ActiveModel {
+            job_id: Set(new_job_id.to_string()),
+            version_id: Set(final_version_id.clone()),
+            state: Set("pending".to_string()),
+            ..Default::default()
+        }
+        .insert(&txn)
         .await
         .map_err(|e| format!("insert job: {e}"))?;
     }
 
-    tx.commit().await?;
+    txn.commit().await.map_err(|e| format!("commit txn: {e}"))?;
 
     let version = latest_version(conn, dest_bucket, dest_key)
         .await?
@@ -1546,12 +1542,18 @@ pub async fn copy_object_txn(
     Ok((old_spools, version))
 }
 
-/// Cột tiebreaker "bản ghi chèn sau" khi created_at trùng nhau:
-/// `rowid` (SQLite) / `ctid` (Postgres). Không dùng version_id vì uuid ngẫu nhiên.
-fn tiebreak_col(backend: DbBackend) -> &'static str {
-    match backend {
-        DbBackend::Sqlite => "rowid",
-        DbBackend::Postgres => "ctid",
+fn object_version(m: entities::objects::Model) -> ObjectVersion {
+    ObjectVersion {
+        version_id: m.version_id,
+        key: m.key,
+        is_delete_marker: m.is_delete_marker != 0,
+        size: m.size,
+        etag: m.etag,
+        content_type: m.content_type,
+        storage_state: m.storage_state,
+        created_at: m.created_at,
+        user_metadata_json: m.user_metadata_json,
+        system_metadata_json: m.system_metadata_json,
     }
 }
 
@@ -1560,26 +1562,23 @@ pub async fn latest_version(
     bucket: &str,
     key: &str,
 ) -> Result<Option<ObjectVersion>, String> {
-    let tb = tiebreak_col(db.backend());
-    let sql = format!("SELECT version_id, key, is_delete_marker, size, etag, content_type, storage_state, created_at, user_metadata_json, system_metadata_json FROM objects WHERE bucket = ? AND key = ? ORDER BY created_at DESC, {tb} DESC LIMIT 1");
-    let row = fetch_opt(db, &sql, &[Val::text(bucket), Val::text(key)])
+    use entities::objects::Column as O;
+    let conn = db.sea_conn();
+    // Tiebreaker "bản ghi chèn sau" khi created_at trùng: rowid/ctid là
+    // intrinsic của backend (không phải schema) nên dùng Expr tường minh.
+    let tb = match db.backend() {
+        DbBackend::Sqlite => "rowid",
+        DbBackend::Postgres => "ctid",
+    };
+    let row = entities::objects::Entity::find()
+        .filter(O::Bucket.eq(bucket))
+        .filter(O::Key.eq(key))
+        .order_by_desc(O::CreatedAt)
+        .order_by_desc(Expr::cust(tb))
+        .one(&conn)
         .await
         .map_err(|e| format!("query: {e}"))?;
-    match row {
-        Some(r) => Ok(Some(ObjectVersion {
-            version_id: r.get_string(0).map_err(|e| format!("row: {e}"))?,
-            key: r.get_string(1).map_err(|e| format!("row: {e}"))?,
-            is_delete_marker: r.get_bool(2).map_err(|e| format!("row: {e}"))?,
-            size: r.get_i64(3).map_err(|e| format!("row: {e}"))?,
-            etag: r.get_string(4).map_err(|e| format!("row: {e}"))?,
-            content_type: r.get_string(5).map_err(|e| format!("row: {e}"))?,
-            storage_state: r.get_string(6).map_err(|e| format!("row: {e}"))?,
-            created_at: r.get_string(7).map_err(|e| format!("row: {e}"))?,
-            user_metadata_json: r.get_opt_string(8).map_err(|e| format!("row: {e}"))?,
-            system_metadata_json: r.get_opt_string(9).map_err(|e| format!("row: {e}"))?,
-        })),
-        None => Ok(None),
-    }
+    Ok(row.map(object_version))
 }
 
 pub async fn get_version_by_id(
@@ -1588,50 +1587,38 @@ pub async fn get_version_by_id(
     key: &str,
     version_id: &str,
 ) -> Result<Option<ObjectVersion>, String> {
-    let row = fetch_opt(
-        db,
-        "SELECT version_id, key, is_delete_marker, size, etag, content_type, storage_state, created_at, user_metadata_json, system_metadata_json FROM objects WHERE bucket = ? AND key = ? AND version_id = ?",
-        &[Val::text(bucket), Val::text(key), Val::text(version_id)],
-    )
-    .await
-    .map_err(|e| format!("query: {e}"))?;
-    match row {
-        Some(r) => Ok(Some(ObjectVersion {
-            version_id: r.get_string(0).map_err(|e| format!("row: {e}"))?,
-            key: r.get_string(1).map_err(|e| format!("row: {e}"))?,
-            is_delete_marker: r.get_bool(2).map_err(|e| format!("row: {e}"))?,
-            size: r.get_i64(3).map_err(|e| format!("row: {e}"))?,
-            etag: r.get_string(4).map_err(|e| format!("row: {e}"))?,
-            content_type: r.get_string(5).map_err(|e| format!("row: {e}"))?,
-            storage_state: r.get_string(6).map_err(|e| format!("row: {e}"))?,
-            created_at: r.get_string(7).map_err(|e| format!("row: {e}"))?,
-            user_metadata_json: r.get_opt_string(8).map_err(|e| format!("row: {e}"))?,
-            system_metadata_json: r.get_opt_string(9).map_err(|e| format!("row: {e}"))?,
-        })),
-        None => Ok(None),
-    }
+    use entities::objects::Column as O;
+    let conn = db.sea_conn();
+    let row = entities::objects::Entity::find()
+        .filter(O::Bucket.eq(bucket))
+        .filter(O::Key.eq(key))
+        .filter(O::VersionId.eq(version_id))
+        .one(&conn)
+        .await
+        .map_err(|e| format!("query: {e}"))?;
+    Ok(row.map(object_version))
 }
 
 pub async fn chunks_of(db: &Db, version_id: &str) -> Result<Vec<ChunkRow>, String> {
-    let rows = fetch_all(
-        db,
-        "SELECT idx, length, spool_path, state, encryption_mode, key_ref FROM chunks WHERE version_id = ? ORDER BY idx",
-        &[Val::text(version_id)],
-    )
-    .await
-    .map_err(|e| format!("query: {e}"))?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(ChunkRow {
-            idx: r.get_i64(0).map_err(|e| format!("rows: {e}"))?,
-            length: r.get_i64(1).map_err(|e| format!("rows: {e}"))?,
-            spool_path: r.get_opt_string(2).map_err(|e| format!("rows: {e}"))?,
-            state: r.get_string(3).map_err(|e| format!("rows: {e}"))?,
-            encryption_mode: r.get_string(4).map_err(|e| format!("rows: {e}"))?,
-            key_ref: r.get_opt_string(5).map_err(|e| format!("rows: {e}"))?,
-        });
-    }
-    Ok(out)
+    use entities::chunks::Column as C;
+    let conn = db.sea_conn();
+    let rows = entities::chunks::Entity::find()
+        .filter(C::VersionId.eq(version_id))
+        .order_by_asc(C::Idx)
+        .all(&conn)
+        .await
+        .map_err(|e| format!("query: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|m| ChunkRow {
+            idx: m.idx,
+            length: m.length,
+            spool_path: m.spool_path,
+            state: m.state,
+            encryption_mode: m.encryption_mode,
+            key_ref: m.key_ref,
+        })
+        .collect())
 }
 
 /// Xóa object: trả spool paths để caller dọn + locators đã remote (caller best-effort xóa remote).
@@ -1644,13 +1631,24 @@ pub struct DeleteObjectResult {
 }
 
 pub async fn create_delete_marker(db: &Db, bucket: &str, key: &str) -> Result<String, String> {
-    let mut tx = db.begin().await?;
-    let (version_id, _) = prepare_versioning_write_tx(&mut tx, bucket, key, "null").await?;
-    tx.exec(
-        "INSERT INTO objects(bucket, key, version_id, is_delete_marker, storage_state, size, etag, content_type) VALUES (?, ?, ?, 1, 'accepted-local', 0, '', '')",
-        &[Val::text(bucket), Val::text(key), Val::text(&version_id)],
-    ).await.map_err(|e| format!("insert delete marker: {e}"))?;
-    tx.commit().await?;
+    let sea = db.sea_conn();
+    let txn = sea.begin().await.map_err(|e| format!("begin txn: {e}"))?;
+    let (version_id, _) = prepare_versioning_write_tx(&txn, bucket, key, "null").await?;
+    entities::objects::ActiveModel {
+        bucket: Set(bucket.to_string()),
+        key: Set(key.to_string()),
+        version_id: Set(version_id.clone()),
+        is_delete_marker: Set(1),
+        storage_state: Set("accepted-local".to_string()),
+        size: Set(0),
+        etag: Set(String::new()),
+        content_type: Set(String::new()),
+        ..Default::default()
+    }
+    .insert(&txn)
+    .await
+    .map_err(|e| format!("insert delete marker: {e}"))?;
+    txn.commit().await.map_err(|e| format!("commit txn: {e}"))?;
     Ok(version_id)
 }
 
@@ -1660,17 +1658,21 @@ pub async fn delete_object_version(
     key: &str,
     version_id: &str,
 ) -> Result<DeleteObjectResult, String> {
-    let mut tx = db.begin().await?;
+    use entities::chunks::Column as C;
+    use entities::objects::Column as O;
+    use entities::upload_jobs::Column as J;
+    let sea = db.sea_conn();
+    let txn = sea.begin().await.map_err(|e| format!("begin txn: {e}"))?;
 
-    let is_dm = match tx
-        .fetch_opt(
-            "SELECT is_delete_marker FROM objects WHERE bucket = ? AND key = ? AND version_id = ?",
-            &[Val::text(bucket), Val::text(key), Val::text(version_id)],
-        )
+    let is_dm = match entities::objects::Entity::find()
+        .filter(O::Bucket.eq(bucket))
+        .filter(O::Key.eq(key))
+        .filter(O::VersionId.eq(version_id))
+        .one(&txn)
         .await
         .map_err(|e| format!("query: {e}"))?
     {
-        Some(r) => r.get_bool(0).map_err(|e| format!("row: {e}"))?,
+        Some(m) => m.is_delete_marker != 0,
         None => {
             return Ok(DeleteObjectResult {
                 existed: false,
@@ -1682,38 +1684,35 @@ pub async fn delete_object_version(
         }
     };
 
-    let rows = tx
-        .fetch_all(
-            "SELECT spool_path FROM chunks WHERE version_id = ?",
-            &[Val::text(version_id)],
-        )
+    let spool_paths: Vec<String> = entities::chunks::Entity::find()
+        .select_only()
+        .column(C::SpoolPath)
+        .filter(C::VersionId.eq(version_id))
+        .into_tuple::<(Option<String>,)>()
+        .all(&txn)
         .await
-        .map_err(|e| format!("query: {e}"))?;
-    let spool_paths: Vec<String> = rows
+        .map_err(|e| format!("query: {e}"))?
         .into_iter()
-        .filter_map(|r| r.get_opt_string(0).unwrap_or(None))
+        .filter_map(|(s,)| s)
         .collect();
 
-    tx.exec(
-        "DELETE FROM upload_jobs WHERE version_id = ?",
-        &[Val::text(version_id)],
-    )
-    .await
-    .ok();
-    tx.exec(
-        "DELETE FROM chunks WHERE version_id = ?",
-        &[Val::text(version_id)],
-    )
-    .await
-    .ok();
-    tx.exec(
-        "DELETE FROM objects WHERE bucket = ? AND key = ? AND version_id = ?",
-        &[Val::text(bucket), Val::text(key), Val::text(version_id)],
-    )
-    .await
-    .map_err(|e| format!("delete version: {e}"))?;
+    let _ = entities::upload_jobs::Entity::delete_many()
+        .filter(J::VersionId.eq(version_id))
+        .exec(&txn)
+        .await;
+    let _ = entities::chunks::Entity::delete_many()
+        .filter(C::VersionId.eq(version_id))
+        .exec(&txn)
+        .await;
+    entities::objects::Entity::delete_many()
+        .filter(O::Bucket.eq(bucket))
+        .filter(O::Key.eq(key))
+        .filter(O::VersionId.eq(version_id))
+        .exec(&txn)
+        .await
+        .map_err(|e| format!("delete version: {e}"))?;
 
-    tx.commit().await?;
+    txn.commit().await.map_err(|e| format!("commit txn: {e}"))?;
 
     Ok(DeleteObjectResult {
         existed: true,
@@ -1725,17 +1724,22 @@ pub async fn delete_object_version(
 }
 
 pub async fn delete_object(db: &Db, bucket: &str, key: &str) -> Result<DeleteObjectResult, String> {
-    let mut tx = db.begin().await?;
-    let rows = tx
-        .fetch_all(
-            "SELECT version_id FROM objects WHERE bucket = ? AND key = ?",
-            &[Val::text(bucket), Val::text(key)],
-        )
+    use entities::chunks::Column as C;
+    use entities::objects::Column as O;
+    use entities::upload_jobs::Column as J;
+    let sea = db.sea_conn();
+    let txn = sea.begin().await.map_err(|e| format!("begin txn: {e}"))?;
+    let versions: Vec<String> = entities::objects::Entity::find()
+        .select_only()
+        .column(O::VersionId)
+        .filter(O::Bucket.eq(bucket))
+        .filter(O::Key.eq(key))
+        .into_tuple::<(String,)>()
+        .all(&txn)
         .await
-        .map_err(|e| format!("query: {e}"))?;
-    let versions: Vec<String> = rows
+        .map_err(|e| format!("query: {e}"))?
         .into_iter()
-        .filter_map(|r| r.get_string(0).ok())
+        .map(|(v,)| v)
         .collect();
     if versions.is_empty() {
         return Ok(DeleteObjectResult {
@@ -1749,45 +1753,41 @@ pub async fn delete_object(db: &Db, bucket: &str, key: &str) -> Result<DeleteObj
     let mut spool_paths = Vec::new();
     let mut remote_locators = Vec::new();
     for v in &versions {
-        let rows = tx
-            .fetch_all(
-                "SELECT spool_path, state, remote_locator_json FROM chunks WHERE version_id = ?",
-                &[Val::text(v)],
-            )
+        let rows = entities::chunks::Entity::find()
+            .filter(C::VersionId.eq(v.as_str()))
+            .all(&txn)
             .await
             .map_err(|e| format!("query: {e}"))?;
-        for r in rows {
-            let spool = r.get_opt_string(0).map_err(|e| format!("rows: {e}"))?;
-            let state = r.get_string(1).map_err(|e| format!("rows: {e}"))?;
-            let locator = r.get_opt_string(2).map_err(|e| format!("rows: {e}"))?;
-            if let Some(p) = spool {
+        for m in rows {
+            if let Some(p) = m.spool_path {
                 spool_paths.push(p);
             }
-            if state == "remote" {
-                if let Some(loc) = locator {
+            if m.state == "remote" {
+                if let Some(loc) = m.remote_locator_json {
                     if let Ok(parsed) = serde_json::from_str(&loc) {
                         remote_locators.push(parsed);
                     }
                 }
             }
         }
-        tx.exec(
-            "DELETE FROM upload_jobs WHERE version_id = ?",
-            &[Val::text(v)],
-        )
-        .await
-        .map_err(|e| format!("delete jobs: {e}"))?;
-        tx.exec("DELETE FROM chunks WHERE version_id = ?", &[Val::text(v)])
+        entities::upload_jobs::Entity::delete_many()
+            .filter(J::VersionId.eq(v.as_str()))
+            .exec(&txn)
+            .await
+            .map_err(|e| format!("delete jobs: {e}"))?;
+        entities::chunks::Entity::delete_many()
+            .filter(C::VersionId.eq(v.as_str()))
+            .exec(&txn)
             .await
             .map_err(|e| format!("delete chunks: {e}"))?;
     }
-    tx.exec(
-        "DELETE FROM objects WHERE bucket = ? AND key = ?",
-        &[Val::text(bucket), Val::text(key)],
-    )
-    .await
-    .map_err(|e| format!("delete objects: {e}"))?;
-    tx.commit().await?;
+    entities::objects::Entity::delete_many()
+        .filter(O::Bucket.eq(bucket))
+        .filter(O::Key.eq(key))
+        .exec(&txn)
+        .await
+        .map_err(|e| format!("delete objects: {e}"))?;
+    txn.commit().await.map_err(|e| format!("commit txn: {e}"))?;
     Ok(DeleteObjectResult {
         existed: true,
         spool_paths,
@@ -1809,33 +1809,48 @@ pub async fn list_object_versions(
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_");
-    let tb = tiebreak_col(db.backend());
+    // rowid/ctid là intrinsic của backend (không phải schema) + LIKE..ESCAPE +
+    // so sánh tuple — giữ nguyên SQL text, chỉ chuyển sang chạy trên sea_conn.
+    let tb = match db.backend() {
+        DbBackend::Sqlite => "rowid",
+        DbBackend::Postgres => "ctid",
+    };
     let sql = format!("SELECT key, version_id, is_delete_marker, size, etag, created_at FROM objects WHERE bucket = ? AND key LIKE ? || '%' ESCAPE '\\' AND (key > ? OR (key = ? AND version_id > ?)) ORDER BY key ASC, created_at DESC, {tb} DESC LIMIT ?");
-    let rows = fetch_all(
-        db,
-        &sql,
-        &[
-            Val::text(bucket),
-            Val::text(&esc),
-            Val::text(key_marker),
-            Val::text(key_marker),
-            Val::text(version_id_marker),
-            Val::int(limit),
+    let stmt = Statement::from_sql_and_values(
+        sea_backend(db),
+        sql,
+        [
+            Value::from(bucket.to_string()),
+            Value::from(esc),
+            Value::from(key_marker.to_string()),
+            Value::from(key_marker.to_string()),
+            Value::from(version_id_marker.to_string()),
+            Value::from(limit),
         ],
-    )
-    .await
-    .map_err(|e| format!("query: {e}"))?;
+    );
+    let rows = db
+        .sea_conn()
+        .query_all(stmt)
+        .await
+        .map_err(|e| format!("query: {e}"))?;
 
     let mut result = Vec::new();
     let mut last_key: Option<String> = None;
 
     for r in rows {
-        let key = r.get_string(0).map_err(|e| format!("row: {e}"))?;
-        let version_id = r.get_string(1).map_err(|e| format!("row: {e}"))?;
-        let is_delete_marker = r.get_bool(2).map_err(|e| format!("row: {e}"))?;
-        let size = r.get_i64(3).map_err(|e| format!("row: {e}"))?;
-        let etag = r.get_string(4).map_err(|e| format!("row: {e}"))?;
-        let created_at = r.get_string(5).map_err(|e| format!("row: {e}"))?;
+        let key: String = r.try_get("", "key").map_err(|e| format!("row: {e}"))?;
+        let version_id: String = r
+            .try_get("", "version_id")
+            .map_err(|e| format!("row: {e}"))?;
+        let is_delete_marker: bool = r
+            .try_get::<i64>("", "is_delete_marker")
+            .map(|v| v != 0)
+            .map_err(|e| format!("row: {e}"))?;
+        let size: i64 = r.try_get("", "size").map_err(|e| format!("row: {e}"))?;
+        let etag: String = r.try_get("", "etag").map_err(|e| format!("row: {e}"))?;
+        let created_at: String = r
+            .try_get("", "created_at")
+            .map_err(|e| format!("row: {e}"))?;
         let is_latest = !matches!(&last_key, Some(k) if k == &key);
         last_key = Some(key.clone());
         result.push(VersionListItem {
@@ -1864,37 +1879,59 @@ pub async fn list_keys(
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_");
-    let tb = tiebreak_col(db.backend());
+    // Subquery tương quan MAX(rowid/ctid) — intrinsic backend, giữ nguyên SQL text.
+    let tb = match db.backend() {
+        DbBackend::Sqlite => "rowid",
+        DbBackend::Postgres => "ctid",
+    };
     let sql = format!("SELECT key, version_id, is_delete_marker, size, etag, content_type, storage_state, created_at, user_metadata_json, system_metadata_json FROM objects o1 WHERE bucket = ? AND key LIKE ? || '%' ESCAPE '\\' AND key > ? AND {tb} = (SELECT MAX({tb}) FROM objects o2 WHERE o2.bucket = o1.bucket AND o2.key = o1.key) AND is_delete_marker = 0 ORDER BY key LIMIT ?");
 
-    let rows = fetch_all(
-        db,
-        &sql,
-        &[
-            Val::text(bucket),
-            Val::text(&esc),
-            Val::text(start_after),
-            Val::int(limit_plus_one),
+    let stmt = Statement::from_sql_and_values(
+        sea_backend(db),
+        sql,
+        [
+            Value::from(bucket.to_string()),
+            Value::from(esc),
+            Value::from(start_after.to_string()),
+            Value::from(limit_plus_one),
         ],
-    )
-    .await
-    .map_err(|e| format!("query: {e}"))?;
+    );
+    let rows = db
+        .sea_conn()
+        .query_all(stmt)
+        .await
+        .map_err(|e| format!("query: {e}"))?;
     let mut out = Vec::new();
     for r in rows {
-        let key = r.get_string(0).map_err(|e| format!("rows: {e}"))?;
+        let key: String = r.try_get("", "key").map_err(|e| format!("rows: {e}"))?;
         out.push((
             key.clone(),
             ObjectVersion {
-                version_id: r.get_string(1).map_err(|e| format!("rows: {e}"))?,
+                version_id: r
+                    .try_get("", "version_id")
+                    .map_err(|e| format!("rows: {e}"))?,
                 key,
-                is_delete_marker: r.get_bool(2).map_err(|e| format!("rows: {e}"))?,
-                size: r.get_i64(3).map_err(|e| format!("rows: {e}"))?,
-                etag: r.get_string(4).map_err(|e| format!("rows: {e}"))?,
-                content_type: r.get_string(5).map_err(|e| format!("rows: {e}"))?,
-                storage_state: r.get_string(6).map_err(|e| format!("rows: {e}"))?,
-                created_at: r.get_string(7).map_err(|e| format!("rows: {e}"))?,
-                user_metadata_json: r.get_opt_string(8).map_err(|e| format!("rows: {e}"))?,
-                system_metadata_json: r.get_opt_string(9).map_err(|e| format!("rows: {e}"))?,
+                is_delete_marker: r
+                    .try_get::<i64>("", "is_delete_marker")
+                    .map(|v| v != 0)
+                    .map_err(|e| format!("rows: {e}"))?,
+                size: r.try_get("", "size").map_err(|e| format!("rows: {e}"))?,
+                etag: r.try_get("", "etag").map_err(|e| format!("rows: {e}"))?,
+                content_type: r
+                    .try_get("", "content_type")
+                    .map_err(|e| format!("rows: {e}"))?,
+                storage_state: r
+                    .try_get("", "storage_state")
+                    .map_err(|e| format!("rows: {e}"))?,
+                created_at: r
+                    .try_get("", "created_at")
+                    .map_err(|e| format!("rows: {e}"))?,
+                user_metadata_json: r
+                    .try_get("", "user_metadata_json")
+                    .map_err(|e| format!("rows: {e}"))?,
+                system_metadata_json: r
+                    .try_get("", "system_metadata_json")
+                    .map_err(|e| format!("rows: {e}"))?,
             },
         ));
     }
@@ -1905,19 +1942,34 @@ pub async fn list_keys(
 pub async fn active_spool_paths(
     db: &Db,
 ) -> Result<std::collections::HashSet<std::path::PathBuf>, String> {
-    let sql = if schema_version(db).await.unwrap_or(0) >= 2 {
-        "SELECT spool_path FROM chunks WHERE spool_path IS NOT NULL UNION SELECT spool_path FROM multipart_parts WHERE spool_path IS NOT NULL"
-    } else {
-        "SELECT spool_path FROM chunks WHERE spool_path IS NOT NULL"
-    };
-    let rows = fetch_all(db, sql, &[])
+    use entities::chunks::Column as C;
+    use entities::multipart_parts::Column as P;
+    let conn = db.sea_conn();
+    let mut paths: Vec<Option<String>> = entities::chunks::Entity::find()
+        .select_only()
+        .column(C::SpoolPath)
+        .filter(C::SpoolPath.is_not_null())
+        .into_tuple::<(Option<String>,)>()
+        .all(&conn)
         .await
-        .map_err(|e| format!("query active spool: {e}"))?;
-    let mut set = std::collections::HashSet::new();
-    for r in rows {
-        let p = r
-            .get_string(0)
+        .map_err(|e| format!("query active spool: {e}"))?
+        .into_iter()
+        .map(|(s,)| s)
+        .collect();
+    // UNION với parts: chỉ khi schema đã có bảng multipart_parts (migration >= 2).
+    if schema_version(db).await.unwrap_or(0) >= 2 {
+        let more: Vec<(Option<String>,)> = entities::multipart_parts::Entity::find()
+            .select_only()
+            .column(P::SpoolPath)
+            .filter(P::SpoolPath.is_not_null())
+            .into_tuple()
+            .all(&conn)
+            .await
             .map_err(|e| format!("query active spool: {e}"))?;
+        paths.extend(more.into_iter().map(|(s,)| s));
+    }
+    let mut set = std::collections::HashSet::new();
+    for p in paths.into_iter().flatten() {
         let pb = std::path::PathBuf::from(p);
         set.insert(pb.clone());
         if let Ok(canon) = std::fs::canonicalize(&pb) {
@@ -2096,30 +2148,35 @@ pub struct BucketStats {
 
 pub async fn bucket_stats(db: &Db) -> Result<Vec<BucketStats>, String> {
     // Postgres: SUM(bigint) trả về NUMERIC nên phải cast về BIGINT để decode i64.
+    // Aggregate tương quan giữ nguyên SQL text, chạy trên sea_conn (có alias ổn
+    // định cho QueryResult).
     let sql = match db.backend() {
-        DbBackend::Sqlite => "SELECT b.name, \
-             COALESCE((SELECT COUNT(*) FROM objects o WHERE o.bucket = b.name AND o.is_delete_marker = 0), 0), \
-             COALESCE((SELECT SUM(o.size) FROM objects o WHERE o.bucket = b.name AND o.is_delete_marker = 0), 0) \
+        DbBackend::Sqlite => "SELECT b.name AS name, \
+             COALESCE((SELECT COUNT(*) FROM objects o WHERE o.bucket = b.name AND o.is_delete_marker = 0), 0) AS object_count, \
+             COALESCE((SELECT SUM(o.size) FROM objects o WHERE o.bucket = b.name AND o.is_delete_marker = 0), 0) AS total_size \
              FROM buckets b ORDER BY b.name",
-        DbBackend::Postgres => "SELECT b.name, \
-             COALESCE((SELECT COUNT(*) FROM objects o WHERE o.bucket = b.name AND o.is_delete_marker = 0), 0), \
-             COALESCE((SELECT SUM(o.size) FROM objects o WHERE o.bucket = b.name AND o.is_delete_marker = 0)::BIGINT, 0) \
+        DbBackend::Postgres => "SELECT b.name AS name, \
+             COALESCE((SELECT COUNT(*) FROM objects o WHERE o.bucket = b.name AND o.is_delete_marker = 0), 0) AS object_count, \
+             COALESCE((SELECT SUM(o.size) FROM objects o WHERE o.bucket = b.name AND o.is_delete_marker = 0)::BIGINT, 0) AS total_size \
              FROM buckets b ORDER BY b.name",
     };
-    let rows = fetch_all(db, sql, &[])
+    let stmt = Statement::from_sql_and_values(sea_backend(db), sql, []);
+    let rows = db
+        .sea_conn()
+        .query_all(stmt)
         .await
         .map_err(|e| format!("query bucket_stats: {e}"))?;
     let mut out = Vec::new();
     for r in rows {
         out.push(BucketStats {
             name: r
-                .get_string(0)
+                .try_get("", "name")
                 .map_err(|e| format!("rows bucket_stats: {e}"))?,
             object_count: r
-                .get_i64(1)
+                .try_get("", "object_count")
                 .map_err(|e| format!("rows bucket_stats: {e}"))?,
             total_size_bytes: r
-                .get_i64(2)
+                .try_get("", "total_size")
                 .map_err(|e| format!("rows bucket_stats: {e}"))?,
         });
     }
@@ -2152,76 +2209,94 @@ pub struct JobSummary {
 }
 
 pub async fn list_jobs(db: &Db) -> Result<(Vec<JobRecord>, JobSummary), String> {
-    let rows = fetch_all(
-        db,
-        "SELECT j.job_id, j.version_id, o.bucket, o.key, j.state, j.retry_count, \
-             j.next_attempt, j.lease_owner, j.lease_expires, j.last_error, j.generation \
-             FROM upload_jobs j LEFT JOIN objects o ON j.version_id = o.version_id \
-             ORDER BY j.next_attempt DESC LIMIT 200",
-        &[],
-    )
-    .await
-    .map_err(|e| format!("query list_jobs: {e}"))?;
-    let mut jobs = Vec::new();
-    for r in rows {
-        jobs.push(JobRecord {
-            job_id: r
-                .get_string(0)
-                .map_err(|e| format!("rows list_jobs: {e}"))?,
-            version_id: r
-                .get_string(1)
-                .map_err(|e| format!("rows list_jobs: {e}"))?,
-            bucket: r
-                .get_opt_string(2)
-                .map_err(|e| format!("rows list_jobs: {e}"))?
-                .unwrap_or_default(),
-            key: r
-                .get_opt_string(3)
-                .map_err(|e| format!("rows list_jobs: {e}"))?
-                .unwrap_or_default(),
-            state: r
-                .get_string(4)
-                .map_err(|e| format!("rows list_jobs: {e}"))?,
-            retry_count: r.get_i64(5).map_err(|e| format!("rows list_jobs: {e}"))?,
-            next_attempt: r
-                .get_string(6)
-                .map_err(|e| format!("rows list_jobs: {e}"))?,
-            lease_owner: r
-                .get_opt_string(7)
-                .map_err(|e| format!("rows list_jobs: {e}"))?,
-            lease_expires: r
-                .get_opt_string(8)
-                .map_err(|e| format!("rows list_jobs: {e}"))?,
-            last_error: r
-                .get_opt_string(9)
-                .map_err(|e| format!("rows list_jobs: {e}"))?,
-            generation: r.get_i64(10).map_err(|e| format!("rows list_jobs: {e}"))?,
-        });
-    }
+    use entities::upload_jobs::Column as J;
+    let conn = db.sea_conn();
+    let rows = entities::upload_jobs::Entity::find()
+        .select_only()
+        .column(J::JobId)
+        .column(J::VersionId)
+        .column_as(entities::objects::Column::Bucket, "bucket")
+        .column_as(entities::objects::Column::Key, "key")
+        .column(J::State)
+        .column(J::RetryCount)
+        .column(J::NextAttempt)
+        .column(J::LeaseOwner)
+        .column(J::LeaseExpires)
+        .column(J::LastError)
+        .column(J::Generation)
+        .join(
+            JoinType::LeftJoin,
+            entities::upload_jobs::Relation::Objects.def(),
+        )
+        .order_by_desc(J::NextAttempt)
+        .limit(200)
+        .into_tuple::<(
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+            String,
+            i64,
+            String,
+            Option<String>,
+            Option<String>,
+            Option<String>,
+            i64,
+        )>()
+        .all(&conn)
+        .await
+        .map_err(|e| format!("query list_jobs: {e}"))?;
+    let jobs = rows
+        .into_iter()
+        .map(
+            |(
+                job_id,
+                version_id,
+                bucket,
+                key,
+                state,
+                retry_count,
+                next_attempt,
+                lease_owner,
+                lease_expires,
+                last_error,
+                generation,
+            )| JobRecord {
+                job_id,
+                version_id,
+                bucket: bucket.unwrap_or_default(),
+                key: key.unwrap_or_default(),
+                state,
+                retry_count,
+                next_attempt,
+                lease_owner,
+                lease_expires,
+                last_error,
+                generation,
+            },
+        )
+        .collect();
 
     let summary = job_summary(db).await?;
     Ok((jobs, summary))
 }
 
 pub async fn job_summary(db: &Db) -> Result<JobSummary, String> {
-    async fn count(db: &Db, state: &str) -> Result<i64, String> {
-        match fetch_opt(
-            db,
-            "SELECT COUNT(*) FROM upload_jobs WHERE state = ?",
-            &[Val::text(state)],
-        )
-        .await
-        {
-            Ok(Some(r)) => r.get_i64(0),
-            Ok(None) => Ok(0),
-            Err(e) => Err(format!("count jobs {state}: {e}")),
-        }
+    let conn = db.sea_conn();
+    async fn count(conn: &sea_orm::DatabaseConnection, state: &str) -> Result<i64, String> {
+        use entities::upload_jobs::Column as J;
+        entities::upload_jobs::Entity::find()
+            .filter(J::State.eq(state))
+            .count(conn)
+            .await
+            .map(|n| n as i64)
+            .map_err(|e| format!("count jobs {state}: {e}"))
     }
     Ok(JobSummary {
-        pending: count(db, "pending").await?,
-        uploading: count(db, "uploading").await?,
-        completed: count(db, "completed").await.unwrap_or(0),
-        failed: count(db, "failed").await.unwrap_or(0),
+        pending: count(&conn, "pending").await?,
+        uploading: count(&conn, "uploading").await?,
+        completed: count(&conn, "completed").await.unwrap_or(0),
+        failed: count(&conn, "failed").await.unwrap_or(0),
     })
 }
 

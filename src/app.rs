@@ -1806,25 +1806,23 @@ async fn collect_version_parts(
                 request_id,
             ));
         }
-        let loc_row = telecrate::db::fetch_opt(
-            db,
-            "SELECT remote_locator_json FROM chunks WHERE version_id = ? AND idx = ?",
-            &[
-                telecrate::db::Val::text(&version.version_id),
-                telecrate::db::Val::int(c.idx),
-            ],
-        )
-        .await
-        .map_err(|e| {
-            S3Error::new(
-                "InternalError",
-                format!("locator: {e}"),
-                StatusCode::INTERNAL_SERVER_ERROR,
-                resource,
-                request_id,
-            )
-        })?;
-        let loc_json = loc_row.and_then(|r| r.get_opt_string(0).unwrap_or(None));
+        use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+        use telecrate::db::entities::chunks;
+        let loc_json = chunks::Entity::find()
+            .filter(chunks::Column::VersionId.eq(&version.version_id))
+            .filter(chunks::Column::Idx.eq(c.idx))
+            .one(&db.sea_conn())
+            .await
+            .map_err(|e| {
+                S3Error::new(
+                    "InternalError",
+                    format!("locator: {e}"),
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    resource,
+                    request_id,
+                )
+            })?
+            .and_then(|m| m.remote_locator_json);
         let locator: telecrate::telegram::RemoteLocator =
             serde_json::from_str(&loc_json.unwrap_or_default()).map_err(|_| {
                 S3Error::new(

@@ -492,6 +492,60 @@ fn dir_size(path: &FilePath) -> u64 {
     total
 }
 
+/// Tổng số objects/chunks/bytes đã index (non-delete-markers) qua entities.
+/// SUM(size) trên Postgres phải `::BIGINT` (SUM bigint trả về NUMERIC, decode
+/// i64 trực tiếp sẽ lỗi → 0 sai như code cũ).
+struct StorageTotals {
+    objects: i64,
+    chunks: i64,
+}
+
+async fn storage_totals(db: &telecrate::db::Db) -> StorageTotals {
+    use sea_orm::{EntityTrait, PaginatorTrait};
+    use telecrate::db::entities::{chunks, objects};
+    let conn = db.sea_conn();
+    let o = objects::Entity::find().count(&conn).await.unwrap_or(0) as i64;
+    let c = chunks::Entity::find().count(&conn).await.unwrap_or(0) as i64;
+    StorageTotals {
+        objects: o,
+        chunks: c,
+    }
+}
+
+/// Tổng objects live (bỏ delete markers) + bytes — dùng cho metrics sampler và
+/// điểm dự phòng khi history rỗng. Giữ semantics `is_delete_marker = 0` như cũ.
+async fn live_storage_totals(db: &telecrate::db::Db) -> (i64, i64) {
+    use sea_orm::{
+        ColumnTrait, ConnectionTrait, EntityTrait, PaginatorTrait, QueryFilter, Statement,
+    };
+    use telecrate::db::entities::objects;
+    let conn = db.sea_conn();
+    let o = objects::Entity::find()
+        .filter(objects::Column::IsDeleteMarker.eq(0))
+        .count(&conn)
+        .await
+        .unwrap_or(0) as i64;
+    let sum_sql = match db.backend() {
+        telecrate::db::DbBackend::Sqlite => {
+            "SELECT COALESCE(SUM(size), 0) AS total FROM objects WHERE is_delete_marker = 0"
+        }
+        telecrate::db::DbBackend::Postgres => {
+            "SELECT COALESCE(SUM(size)::BIGINT, 0) AS total FROM objects WHERE is_delete_marker = 0"
+        }
+    };
+    let b = conn
+        .query_one(Statement::from_string(
+            telecrate::db::sea_backend(db),
+            sum_sql.to_string(),
+        ))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|r| r.try_get::<i64>("", "total").ok())
+        .unwrap_or(0);
+    (o, b)
+}
+
 /// `GET /admin/api/status`
 pub async fn api_get_status(
     State((config_lock, store, db)): State<AdminState>,
@@ -514,11 +568,16 @@ pub async fn api_get_status(
             .map(|m| m.len())
             .unwrap_or(0),
         telecrate::db::DbBackend::Postgres => {
-            crate::db::fetch_opt(&db, "SELECT pg_database_size(current_database())", &[])
+            use sea_orm::{ConnectionTrait, Statement};
+            db.sea_conn()
+                .query_one(Statement::from_string(
+                    telecrate::db::sea_backend(&db),
+                    "SELECT pg_database_size(current_database()) AS size".to_string(),
+                ))
                 .await
                 .ok()
                 .flatten()
-                .and_then(|r| r.get_i64(0).ok())
+                .and_then(|r| r.try_get::<i64>("", "size").ok())
                 .map(|n| n.max(0) as u64)
                 .unwrap_or(0)
         }
@@ -533,26 +592,13 @@ pub async fn api_get_status(
     if let Ok(keys) = telecrate::db::list_access_keys(&db).await {
         total_access_keys = keys.len();
     }
-    let total_objects = crate::db::count(&db, "SELECT COUNT(*) FROM objects", &[])
+    let totals = storage_totals(&db).await;
+    let total_objects = totals.objects;
+    let total_chunks = totals.chunks;
+    let (pending_jobs, uploading_jobs) = telecrate::db::job_summary(&db)
         .await
-        .unwrap_or(0);
-    let total_chunks = crate::db::count(&db, "SELECT COUNT(*) FROM chunks", &[])
-        .await
-        .unwrap_or(0);
-    let pending_jobs = crate::db::count(
-        &db,
-        "SELECT COUNT(*) FROM upload_jobs WHERE state = 'pending'",
-        &[],
-    )
-    .await
-    .unwrap_or(0);
-    let uploading_jobs = crate::db::count(
-        &db,
-        "SELECT COUNT(*) FROM upload_jobs WHERE state = 'uploading'",
-        &[],
-    )
-    .await
-    .unwrap_or(0);
+        .map(|s| (s.pending, s.uploading))
+        .unwrap_or((0, 0));
 
     Json(json!({
         "version": telecrate::VERSION,
@@ -581,42 +627,6 @@ pub async fn api_get_status(
         }
     }))
     .into_response()
-}
-
-/// `GET /admin/api/buckets`
-pub async fn api_list_buckets(
-    State((_config_lock, store, db)): State<AdminState>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
-        return err_resp.into_response();
-    }
-
-    let buckets = match telecrate::db::list_buckets(&db).await {
-        Ok(b) => b,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("List error: {e}") })),
-            )
-                .into_response()
-        }
-    };
-
-    let mut list = Vec::new();
-    for b in buckets {
-        let versioning = telecrate::db::get_bucket_versioning(&db, &b.name)
-            .await
-            .unwrap_or_else(|_| "Disabled".to_string());
-        list.push(json!({
-            "name": b.name,
-            "region": b.region,
-            "created_at": b.created_at,
-            "versioning": versioning,
-        }));
-    }
-
-    Json(list).into_response()
 }
 
 #[derive(Deserialize)]
@@ -693,105 +703,6 @@ pub async fn api_delete_bucket(
         )
             .into_response(),
     }
-}
-
-/// `GET /admin/api/buckets/:name/objects`
-pub async fn api_list_bucket_objects(
-    State((_config_lock, store, db)): State<AdminState>,
-    Path(name): Path<String>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
-        return err_resp.into_response();
-    }
-
-    let rows = match telecrate::db::fetch_all(
-        &db,
-        "SELECT key, version_id, is_delete_marker, storage_state, size, etag, content_type, created_at FROM objects WHERE bucket = ? ORDER BY key ASC, created_at DESC",
-        &[telecrate::db::Val::text(&name)],
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("Query prepare error: {e}") })),
-            )
-                .into_response();
-        }
-    };
-
-    let mut list = Vec::new();
-    for r in rows {
-        if let (
-            Ok(key),
-            Ok(version_id),
-            Ok(is_del),
-            Ok(storage_state),
-            Ok(size),
-            Ok(etag),
-            Ok(content_type),
-            Ok(created_at),
-        ) = (
-            r.get_string(0),
-            r.get_string(1),
-            r.get_i64(2),
-            r.get_string(3),
-            r.get_i64(4),
-            r.get_string(5),
-            r.get_string(6),
-            r.get_string(7),
-        ) {
-            list.push(json!({
-                "key": key,
-                "version_id": version_id,
-                "is_delete_marker": is_del != 0,
-                "storage_state": storage_state,
-                "size": size,
-                "etag": etag,
-                "content_type": content_type,
-                "created_at": created_at,
-            }));
-        }
-    }
-
-    Json(list).into_response()
-}
-
-/// `GET /admin/api/access-keys`
-pub async fn api_list_access_keys(
-    State((_config_lock, store, db)): State<AdminState>,
-    headers: HeaderMap,
-) -> Response {
-    if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
-        return err_resp.into_response();
-    }
-
-    let keys = match telecrate::db::list_access_keys(&db).await {
-        Ok(k) => k,
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("List error: {e}") })),
-            )
-                .into_response()
-        }
-    };
-
-    let list: Vec<serde_json::Value> = keys
-        .into_iter()
-        .map(|k| {
-            json!({
-                "access_key_id": k.access_key_id,
-                "user_id": k.description.unwrap_or_else(|| "admin".to_string()),
-                "status": k.status,
-                "created_at": k.created_at,
-            })
-        })
-        .collect();
-
-    Json(list).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1453,22 +1364,7 @@ pub async fn metrics_sampler(
         interval.tick().await;
         let config = read_config(&config_lock);
         let spool_used = dir_size(FilePath::new(&config.spool_dir));
-        let total_objects = crate::db::count(
-            &db,
-            "SELECT COUNT(*) FROM objects WHERE is_delete_marker = 0",
-            &[],
-        )
-        .await
-        .unwrap_or(0);
-        let size_row = crate::db::fetch_opt(
-            &db,
-            "SELECT COALESCE(SUM(size), 0) FROM objects WHERE is_delete_marker = 0",
-            &[],
-        )
-        .await
-        .ok()
-        .flatten();
-        let total_size = size_row.and_then(|r| r.get_i64(0).ok()).unwrap_or(0);
+        let (total_objects, total_size) = live_storage_totals(&db).await;
         let (mut pending, mut uploading) = (0, 0);
         if let Ok(s) = telecrate::db::job_summary(&db).await {
             pending = s.pending;
@@ -1497,22 +1393,7 @@ pub async fn api_get_metrics_history(
     if points.is_empty() {
         let config = read_config(&config_lock);
         let spool_used = dir_size(FilePath::new(&config.spool_dir));
-        let total_objects = crate::db::count(
-            &db,
-            "SELECT COUNT(*) FROM objects WHERE is_delete_marker = 0",
-            &[],
-        )
-        .await
-        .unwrap_or(0);
-        let size_row = crate::db::fetch_opt(
-            &db,
-            "SELECT COALESCE(SUM(size), 0) FROM objects WHERE is_delete_marker = 0",
-            &[],
-        )
-        .await
-        .ok()
-        .flatten();
-        let total_size = size_row.and_then(|r| r.get_i64(0).ok()).unwrap_or(0);
+        let (total_objects, total_size) = live_storage_totals(&db).await;
         let (mut pending, mut uploading) = (0, 0);
         if let Ok(s) = telecrate::db::job_summary(&db).await {
             pending = s.pending;
@@ -1857,34 +1738,28 @@ pub async fn api_list_access_keys_v2(
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
         return err_resp.into_response();
     }
-    // Query with new columns (migration 0004 adds them; graceful if missing)
-    let rows = match telecrate::db::fetch_all(
-        &db,
-        "SELECT access_key_id, status, description, created_at, last_used_at, allowed_buckets FROM access_keys ORDER BY created_at ASC",
-        &[],
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(_) => telecrate::db::fetch_all(
-            &db,
-            "SELECT access_key_id, status, description, created_at, NULL, NULL FROM access_keys ORDER BY created_at ASC",
-            &[],
-        )
+    // Migration 0004 là bắt buộc (apply_all_migrations) nên đọc trực tiếp qua
+    // entity, không cần nhánh fallback cột thiếu như trước.
+    use sea_orm::{EntityTrait, QueryOrder};
+    use telecrate::db::entities::access_keys;
+    let rows = access_keys::Entity::find()
+        .order_by_asc(access_keys::Column::CreatedAt)
+        .all(&db.sea_conn())
         .await
-        .unwrap_or_default(),
-    };
-    let mut list = Vec::new();
-    for r in rows {
-        list.push(json!({
-            "access_key_id": r.get_string(0).unwrap_or_default(),
-            "status": r.get_string(1).unwrap_or_default(),
-            "user_id": r.get_opt_string(2).unwrap_or(None).unwrap_or_else(|| "admin".to_string()),
-            "created_at": r.get_string(3).unwrap_or_default(),
-            "last_used_at": r.get_opt_string(4),
-            "allowed_buckets": r.get_opt_string(5),
-        }));
-    }
+        .unwrap_or_default();
+    let list: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|m| {
+            json!({
+                "access_key_id": m.access_key_id,
+                "status": m.status,
+                "user_id": m.description.unwrap_or_else(|| "admin".to_string()),
+                "created_at": m.created_at,
+                "last_used_at": m.last_used_at,
+                "allowed_buckets": m.allowed_buckets,
+            })
+        })
+        .collect();
     Json(list).into_response()
 }
 
@@ -2042,38 +1917,34 @@ pub async fn api_list_multipart_uploads(
     if let Err(err_resp) = authenticate_admin_request(&headers, &store, false) {
         return err_resp.into_response();
     }
-    // Direct query — list_multipart_uploads in db.rs takes bucket param,
-    // but for dashboard we want all uploads across all buckets.
-    let rows = match telecrate::db::fetch_all(
-        &db,
-        "SELECT upload_id, bucket, key, content_type, created_at FROM multipart_uploads ORDER BY created_at DESC LIMIT 100",
-        &[],
-    )
-    .await
-    {
+    // Dashboard cần mọi upload trên mọi bucket (db fn lọc theo bucket) —
+    // query entity trực tiếp, giữ nguyên shape/order/limit.
+    use sea_orm::{EntityTrait, QueryOrder, QuerySelect};
+    use telecrate::db::entities::multipart_uploads;
+    let rows = multipart_uploads::Entity::find()
+        .order_by_desc(multipart_uploads::Column::CreatedAt)
+        .limit(100)
+        .all(&db.sea_conn())
+        .await;
+    let rows = match rows {
         Ok(r) => r,
         Err(e) => {
-            return Json(json!({ "uploads": [], "total": 0, "error": e })).into_response();
+            return Json(json!({ "uploads": [], "total": 0, "error": e.to_string() }))
+                .into_response();
         }
     };
-    let mut list = Vec::new();
-    for r in rows {
-        if let (Ok(upload_id), Ok(bucket), Ok(key), Ok(content_type), Ok(created_at)) = (
-            r.get_string(0),
-            r.get_string(1),
-            r.get_string(2),
-            r.get_string(3),
-            r.get_string(4),
-        ) {
-            list.push(json!({
-                "upload_id": upload_id,
-                "bucket": bucket,
-                "key": key,
-                "content_type": content_type,
-                "created_at": created_at,
-            }));
-        }
-    }
+    let list: Vec<serde_json::Value> = rows
+        .into_iter()
+        .map(|m| {
+            json!({
+                "upload_id": m.upload_id,
+                "bucket": m.bucket,
+                "key": m.key,
+                "content_type": m.content_type,
+                "created_at": m.created_at,
+            })
+        })
+        .collect();
     let total = list.len();
     Json(json!({ "uploads": list, "total": total })).into_response()
 }
