@@ -13,8 +13,6 @@ pub struct Model {
     pub plaintext_sha256: String,
     pub ciphertext_sha256: String,
     pub spool_path: Option<String>,
-    pub remote_locator_json: Option<String>,
-    pub state: String,
     pub created_at: String,
 }
 

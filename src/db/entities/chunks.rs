@@ -8,13 +8,11 @@ pub struct Model {
     pub version_id: String,
     #[sea_orm(primary_key, auto_increment = false)]
     pub idx: i64,
-    pub offset: i64,
     pub length: i64,
     pub plaintext_sha256: String,
     pub ciphertext_sha256: String,
     pub encryption_mode: String,
     pub key_ref: Option<String>,
-    pub nonce: Option<String>,
     pub spool_path: Option<String>,
     pub remote_locator_json: Option<String>,
     pub state: String,

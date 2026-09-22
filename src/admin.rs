@@ -1787,7 +1787,6 @@ pub async fn api_list_jobs(
                         "lease_owner": j.lease_owner,
                         "lease_expires": j.lease_expires,
                         "last_error": j.last_error,
-                        "generation": j.generation,
                     })
                 })
                 .collect();

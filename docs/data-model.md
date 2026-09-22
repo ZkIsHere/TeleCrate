@@ -1,29 +1,37 @@
-# Data model TeleCrate (SQLite WAL)
+# Data model TeleCrate (SQLite WAL + Postgres)
 
-> Forward-only migrations tại `migrations/NNNN_*.sql`. Không sửa migration đã release.
-> Backend Postgres (`db_backend="postgres"`): schema tương đương tại
-> `migrations/postgres/0001_0004_schema.sql` (partial — runtime blocked, xem ADR 0005).
+> Forward-only migrations tại `migrations/NNNN_*.sql` (+ song sinh Postgres tại
+> `migrations/postgres/`). Không sửa migration đã release.
+> Entities SeaORM tại `src/db/entities/` mirror DDL; `tests/entity_schema_parity.rs`
+> đối chiếu tự động (cập nhật 2026-09-22).
 
-## Bảng chính (đối chiếu `migrations/0001_init.sql` — cập nhật 2026-09-15)
+## Bảng chính (sau migration 0005 — cập nhật 2026-09-22)
 
-Đã có ở migration 0001 (`implemented-and-tested` - M0):
-- `schema_version(version INTEGER PRIMARY KEY, applied_at)`
-- `buckets(name PK, region, versioning_status, encryption_override NULL, created_at)`
-- `objects(bucket, key, version_id PK, is_delete_marker, storage_state, size, etag, content_type, created_at)` + index `(bucket, key, created_at DESC)`
-- `chunks(version_id FK, idx, offset, length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref NULL, nonce NULL, spool_path NULL, remote_locator_json NULL, state)`
-- `upload_jobs(job_id PK, version_id FK, state, lease_owner NULL, lease_expires NULL, retry_count, next_attempt, generation, last_error NULL)`
-- `recovery_checkpoints(seq PK, manifest_json, sha256, created_at)`
-- `kv(key PK, value)`
+- `schema_version(version PK, applied_at)`
+- `buckets(name PK, region, versioning_status, created_at)`
+- `objects(bucket, key, version_id PK, is_delete_marker, storage_state, size, etag, content_type, created_at, user_metadata_json NULL, system_metadata_json NULL)` + index `(bucket, key, created_at DESC)`
+- `chunks(version_id FK, idx, length, plaintext_sha256, ciphertext_sha256, encryption_mode, key_ref NULL, spool_path NULL, remote_locator_json NULL, state)` — PK `(version_id, idx)`
+- `upload_jobs(job_id PK, version_id FK, state, lease_owner NULL, lease_expires NULL, retry_count, next_attempt, last_error NULL)` + index `(state, next_attempt)` cho worker claim poll
+- `multipart_uploads(upload_id PK, bucket, key, content_type, metadata_json NULL, created_at)` + index `(bucket, key, created_at DESC)`
+- `multipart_parts(upload_id FK, part_number, size, etag, plaintext_sha256, ciphertext_sha256, spool_path NULL, created_at, PRIMARY KEY (upload_id, part_number))`
+- `access_keys(access_key_id PK, secret_key, status, description NULL, created_at, last_used_at NULL, allowed_buckets NULL)` (M4 — secret lưu để kiểm HMAC dưới bảo vệ thích hợp, file quyền 0600, không log)
+- `bucket_policies(bucket PK, policy_json, updated_at)` + `bucket_cors`, `bucket_bpa`, `bucket_lock_configs`, `object_locks(bucket, key, version_id PK, retain_until_date NULL, mode NULL, legal_hold, updated_at)` (M4)
 
-Đã bổ sung ở migration 0002 (`implemented-and-tested` - M3):
-- `multipart_uploads(upload_id PK, bucket, key, content_type, metadata_json NULL, created_at)`
-- `multipart_parts(upload_id FK, part_number, size, etag, plaintext_sha256, ciphertext_sha256, spool_path NULL, remote_locator_json NULL, state, created_at, PRIMARY KEY (upload_id, part_number))`
-- `objects` (cột `system_metadata_json NULL` và `user_metadata_json NULL`)
+Đã xóa ở migration 0005 (audit schema 2026-09-22 — bảng/cột chết, không code path nào dùng):
+- Bảng `kv`, `recovery_checkpoints`; cột `chunks.nonce` (nonce nằm trong file spool),
+  `chunks.offset` (đọc lắp theo `idx`), `buckets.encryption_override`,
+  `upload_jobs.generation` (luôn 1), `multipart_parts.remote_locator_json`/`state`.
+- Giữ `multipart_parts.created_at` (S3 ListParts `LastModified`).
 
 Planned (thêm ở migration mới khi tới milestone):
 - `remote_blobs` + `chunk_blobs` (nếu packing — quyết sau khi đo random read/GC, hiện chưa packing)
-- `access_keys` (M4 — secret lưu để kiểm HMAC dưới bảo vệ thích hợp, file quyền 0600, không log)
-- `policies` + `retention` (M4)
+
+## Trạng thái chuẩn
+
+- `chunks.state`: `pending` → `remote` (worker upload xong). GC dọn spool của chunk
+  `remote` còn `spool_path` (crash giữa commit và cleanup).
+- `upload_jobs.state`: `pending` → `uploading` (lease) → `done` / `failed`.
+  Dashboard "Hoàn tất" đếm `done`.
 
 ## Quy tắc
 

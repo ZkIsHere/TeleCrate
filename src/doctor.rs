@@ -199,7 +199,7 @@ mod tests {
         let doc_rep = run_doctor(&conn).await.unwrap();
         assert!(doc_rep.db_integrity_ok);
         assert!(doc_rep.foreign_keys_ok);
-        assert_eq!(doc_rep.schema_version, 4);
+        assert_eq!(doc_rep.schema_version, 5);
         assert_eq!(doc_rep.issues.len(), 0);
 
         // 2. Put object with 1 valid spool chunk and 1 missing spool chunk

@@ -174,10 +174,79 @@ fn parse_pg_ddl(text: &str) -> HashMap<String, ColSet> {
             if let Some((t, cols)) = parse_create_table(&clean) {
                 tables.entry(t).or_default().extend(cols);
             }
+        } else if clean.to_ascii_lowercase().contains("drop table") {
+            // DROP TABLE [IF EXISTS] <t> (migration dọn bảng chết).
+            let toks: Vec<&str> = clean.split_whitespace().collect();
+            if toks.len() >= 3
+                && toks[0].eq_ignore_ascii_case("drop")
+                && toks[1].eq_ignore_ascii_case("table")
+            {
+                // Bỏ qua IF [NOT] EXISTS (2-3 tokens) để tới tên bảng.
+                let mut idx = 2;
+                if toks
+                    .get(idx)
+                    .map(|t| t.eq_ignore_ascii_case("if"))
+                    .unwrap_or(false)
+                {
+                    idx += 1;
+                    if toks
+                        .get(idx)
+                        .map(|t| t.eq_ignore_ascii_case("not"))
+                        .unwrap_or(false)
+                    {
+                        idx += 1;
+                    }
+                    if toks
+                        .get(idx)
+                        .map(|t| t.eq_ignore_ascii_case("exists"))
+                        .unwrap_or(false)
+                    {
+                        idx += 1;
+                    }
+                }
+                if let Some(t) = toks.get(idx) {
+                    tables.remove(&norm_name(t.trim_end_matches(';')));
+                }
+            }
         } else if clean.to_ascii_lowercase().contains("alter table") {
             // ALTER TABLE <t> ADD COLUMN [IF NOT EXISTS] <col> <type...>
+            //           <t> DROP COLUMN [IF EXISTS] <col>
             let toks: Vec<&str> = clean.split_whitespace().collect();
             if toks.len() >= 6
+                && toks[0].eq_ignore_ascii_case("alter")
+                && toks[1].eq_ignore_ascii_case("table")
+                && toks[3].eq_ignore_ascii_case("drop")
+            {
+                let mut idx = 5; // sau DROP COLUMN (toks[4] == COLUMN)
+                                 // Bỏ qua IF [NOT] EXISTS (PG: IF EXISTS; SQLite DROP COLUMN
+                                 // không có mệnh đề này).
+                if toks
+                    .get(idx)
+                    .map(|t| t.eq_ignore_ascii_case("if"))
+                    .unwrap_or(false)
+                {
+                    idx += 1;
+                    if toks
+                        .get(idx)
+                        .map(|t| t.eq_ignore_ascii_case("not"))
+                        .unwrap_or(false)
+                    {
+                        idx += 1;
+                    }
+                    if toks
+                        .get(idx)
+                        .map(|t| t.eq_ignore_ascii_case("exists"))
+                        .unwrap_or(false)
+                    {
+                        idx += 1;
+                    }
+                }
+                if let Some(col) = toks.get(idx) {
+                    if let Some(cols) = tables.get_mut(&norm_name(toks[2])) {
+                        cols.remove(&norm_name(col.trim_matches('"').trim_end_matches(';')));
+                    }
+                }
+            } else if toks.len() >= 6
                 && toks[0].eq_ignore_ascii_case("alter")
                 && toks[1].eq_ignore_ascii_case("table")
                 && toks[3].eq_ignore_ascii_case("add")
@@ -321,8 +390,6 @@ async fn test_entity_parity_sqlite_applied_schema() {
         objects::Entity,
         chunks::Entity,
         upload_jobs::Entity,
-        recovery_checkpoints::Entity,
-        kv::Entity,
         multipart_uploads::Entity,
         multipart_parts::Entity,
         access_keys::Entity,
@@ -351,8 +418,6 @@ fn test_entity_parity_postgres_ddl_text() {
         objects::Entity,
         chunks::Entity,
         upload_jobs::Entity,
-        recovery_checkpoints::Entity,
-        kv::Entity,
         multipart_uploads::Entity,
         multipart_parts::Entity,
         access_keys::Entity,

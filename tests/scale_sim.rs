@@ -37,8 +37,8 @@ async fn test_high_density_scale_simulation_25k_objects() {
             ).unwrap();
 
             let mut stmt_chunk = tx.prepare(
-                "INSERT INTO chunks(version_id, idx, offset, length, plaintext_sha256, ciphertext_sha256, state)
-                 VALUES (?, 0, 0, ?, 'sha256-sim', 'sha256-sim', 'telegram-committed')"
+                "INSERT INTO chunks(version_id, idx, length, plaintext_sha256, ciphertext_sha256, state)
+                 VALUES (?, 0, ?, 'sha256-sim', 'sha256-sim', 'remote')"
             ).unwrap();
 
             for i in 0..25_000 {

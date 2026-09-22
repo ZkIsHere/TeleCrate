@@ -22,8 +22,9 @@ pub async fn run_gc(
 ) -> Result<GcStats, String> {
     let mut stats = GcStats::default();
 
-    // 1. Spool GC: Dọn dẹp spool file của các chunk đã telegram-committed
-    if let Ok(spool_rows) = crate::db::committed_spool_chunks(db).await {
+    // 1. Spool GC: Dọn dẹp spool file của các chunk đã remote nhưng còn spool
+    // (worker crash giữa remote-commit và spool-cleanup).
+    if let Ok(spool_rows) = crate::db::remote_spool_chunks(db).await {
         for (chunk_version_id, idx, spool_path) in spool_rows {
             let path = Path::new(&spool_path);
             if path.exists() {
@@ -136,8 +137,8 @@ mod tests {
         .await
         .unwrap();
 
-        // Mark chunk state as telegram-committed
-        crate::db::set_chunk_state(&conn, "v1", "telegram-committed")
+        // Mark chunk uploaded (spool chưa dọn — GC phải xử lý).
+        crate::db::set_chunk_state(&conn, "v1", "remote")
             .await
             .unwrap();
 

@@ -13,7 +13,6 @@ pub struct BucketRecord {
     pub name: String,
     pub region: String,
     pub versioning_status: String,
-    pub encryption_override: Option<String>,
     pub created_at: String,
 }
 
@@ -34,13 +33,11 @@ pub struct ObjectRecord {
 pub struct ChunkRecord {
     pub version_id: String,
     pub idx: i32,
-    pub offset: i64,
     pub length: i64,
     pub plaintext_sha256: String,
     pub ciphertext_sha256: String,
     pub encryption_mode: String,
     pub key_ref: Option<String>,
-    pub nonce: Option<String>,
     pub spool_path: Option<String>,
     pub remote_locator_json: Option<String>,
     pub state: String,
@@ -84,7 +81,6 @@ pub async fn export_recovery_bundle(db: &Db) -> Result<RecoveryBundle, String> {
             name: m.name,
             region: m.region,
             versioning_status: m.versioning_status,
-            encryption_override: m.encryption_override,
             created_at: m.created_at,
         })
         .collect();
@@ -119,13 +115,11 @@ pub async fn export_recovery_bundle(db: &Db) -> Result<RecoveryBundle, String> {
                 version_id: m.version_id,
                 idx: i32::try_from(m.idx)
                     .map_err(|_| "row chunks export: idx out of i32 range".to_string())?,
-                offset: m.offset,
                 length: m.length,
                 plaintext_sha256: m.plaintext_sha256,
                 ciphertext_sha256: m.ciphertext_sha256,
                 encryption_mode: m.encryption_mode,
                 key_ref: m.key_ref,
-                nonce: m.nonce,
                 spool_path: m.spool_path,
                 remote_locator_json: m.remote_locator_json,
                 state: m.state,
@@ -262,7 +256,6 @@ pub async fn import_recovery_bundle_file(
             name: Set(b.name.clone()),
             region: Set(b.region.clone()),
             versioning_status: Set(b.versioning_status.clone()),
-            encryption_override: Set(b.encryption_override.clone()),
             created_at: Set(b.created_at.clone()),
         })
         .on_conflict(
@@ -309,13 +302,11 @@ pub async fn import_recovery_bundle_file(
         let am = crate::db::entities::chunks::ActiveModel {
             version_id: Set(c.version_id.clone()),
             idx: Set(c.idx as i64),
-            offset: Set(c.offset),
             length: Set(c.length),
             plaintext_sha256: Set(c.plaintext_sha256.clone()),
             ciphertext_sha256: Set(c.ciphertext_sha256.clone()),
             encryption_mode: Set(c.encryption_mode.clone()),
             key_ref: Set(c.key_ref.clone()),
-            nonce: Set(c.nonce.clone()),
             spool_path: Set(c.spool_path.clone()),
             remote_locator_json: Set(c.remote_locator_json.clone()),
             state: Set(c.state.clone()),

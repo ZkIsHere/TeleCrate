@@ -8,7 +8,6 @@ pub struct Model {
     pub name: String,
     pub region: String,
     pub versioning_status: String,
-    pub encryption_override: Option<String>,
     pub created_at: String,
 }
 

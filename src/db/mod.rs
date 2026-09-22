@@ -166,6 +166,7 @@ pub const MIGRATION_001: &str = include_str!("../../migrations/0001_init.sql");
 pub const MIGRATION_002: &str = include_str!("../../migrations/0002_m3_multipart_versioning.sql");
 pub const MIGRATION_003: &str = include_str!("../../migrations/0003_m4_auth_policy_cors_lock.sql");
 pub const MIGRATION_004: &str = include_str!("../../migrations/0004_dashboard_enhancements.sql");
+pub const MIGRATION_005: &str = include_str!("../../migrations/0005_gc_cleanup.sql");
 
 /// DDL Postgres versioned, song song migrations SQLite 0001→0004
 /// (cùng quy ước file SQL forward-only). Runtime apply theo version.
@@ -176,6 +177,7 @@ pub const PG_MIGRATION_003: &str =
     include_str!("../../migrations/postgres/0003_m4_auth_policy_cors_lock.sql");
 pub const PG_MIGRATION_004: &str =
     include_str!("../../migrations/postgres/0004_dashboard_enhancements.sql");
+pub const PG_MIGRATION_005: &str = include_str!("../../migrations/postgres/0005_gc_cleanup.sql");
 
 /// DDL Postgres đầy đủ cho DBA tạo schema trước (`telecrate db pg-schema`).
 pub const POSTGRES_SCHEMA: &str = concat!(
@@ -183,6 +185,7 @@ pub const POSTGRES_SCHEMA: &str = concat!(
     include_str!("../../migrations/postgres/0002_m3_multipart_versioning.sql"),
     include_str!("../../migrations/postgres/0003_m4_auth_policy_cors_lock.sql"),
     include_str!("../../migrations/postgres/0004_dashboard_enhancements.sql"),
+    include_str!("../../migrations/postgres/0005_gc_cleanup.sql"),
 );
 
 /// Lấy version migration hiện tại (0 nếu chưa có bảng).
@@ -259,12 +262,14 @@ pub async fn apply_all_migrations(db: &Db) -> Result<i64, String> {
             (2, MIGRATION_002),
             (3, MIGRATION_003),
             (4, MIGRATION_004),
+            (5, MIGRATION_005),
         ],
         DbBackend::Postgres => &[
             (1, PG_MIGRATION_001),
             (2, PG_MIGRATION_002),
             (3, PG_MIGRATION_003),
             (4, PG_MIGRATION_004),
+            (5, PG_MIGRATION_005),
         ],
     };
     for (v, sql) in steps {
@@ -462,8 +467,6 @@ pub struct MultipartPart {
     pub plaintext_sha256: String,
     pub ciphertext_sha256: String,
     pub spool_path: Option<String>,
-    pub remote_locator_json: Option<String>,
-    pub state: String,
     pub created_at: String,
 }
 
@@ -537,7 +540,6 @@ pub async fn save_multipart_part(
         plaintext_sha256: Set(plaintext_sha256.to_string()),
         ciphertext_sha256: Set(ciphertext_sha256.to_string()),
         spool_path: Set(spool_path.map(|s| s.to_string())),
-        state: Set("pending".to_string()),
         ..Default::default()
     })
     .on_conflict(
@@ -551,7 +553,6 @@ pub async fn save_multipart_part(
             entities::multipart_parts::Column::PlaintextSha256,
             entities::multipart_parts::Column::CiphertextSha256,
             entities::multipart_parts::Column::SpoolPath,
-            entities::multipart_parts::Column::State,
         ])
         .to_owned(),
     )
@@ -583,8 +584,6 @@ pub async fn list_multipart_parts(db: &Db, upload_id: &str) -> Result<Vec<Multip
             plaintext_sha256: m.plaintext_sha256,
             ciphertext_sha256: m.ciphertext_sha256,
             spool_path: m.spool_path,
-            remote_locator_json: m.remote_locator_json,
-            state: m.state,
             created_at: m.created_at,
         });
     }
@@ -788,13 +787,11 @@ pub async fn complete_multipart_upload_txn(
     .await
     .map_err(|e| format!("insert object: {e}"))?;
 
-    let mut current_offset: i64 = 0;
     for (idx, part) in parts.iter().enumerate() {
         let spool_path = part.spool_path.as_deref().unwrap_or("");
         entities::chunks::ActiveModel {
             version_id: Set(final_version_id.clone()),
             idx: Set(idx as i64),
-            offset: Set(current_offset),
             length: Set(part.size),
             plaintext_sha256: Set(part.plaintext_sha256.clone()),
             ciphertext_sha256: Set(part.ciphertext_sha256.clone()),
@@ -806,7 +803,6 @@ pub async fn complete_multipart_upload_txn(
         .insert(&txn)
         .await
         .map_err(|e| format!("insert chunk: {e}"))?;
-        current_offset += part.size;
     }
 
     entities::upload_jobs::ActiveModel {
@@ -950,6 +946,14 @@ pub async fn delete_bucket(db: &Db, name: &str) -> Result<DeleteBucketOutcome, S
     if n > 0 {
         return Ok(DeleteBucketOutcome::NotEmpty);
     }
+    // Multipart upload đang dở cũng tính là "có nội dung" (S3 trả 409 thay vì
+    // để FK NỔ 500 khi xóa bucket còn upload dở dang).
+    let uploads = list_multipart_uploads(db, name)
+        .await
+        .map_err(|e| format!("count uploads: {e}"))?;
+    if !uploads.is_empty() {
+        return Ok(DeleteBucketOutcome::NotEmpty);
+    }
     entities::buckets::Entity::delete_by_id(name)
         .exec(&conn)
         .await
@@ -1029,6 +1033,9 @@ pub struct ChunkRow {
 /// checksum / ETag S3 (ETag nằm ở object, = MD5 plaintext).
 #[derive(Debug, Clone)]
 pub struct NewChunk {
+    /// Offset dự kiến trong object. KHÔNG persist (cột `chunks.offset` đã xóa ở
+    /// migration 0005) — đọc lắp chunk theo `idx` liên tục. Giữ field để ổn định
+    /// API cho callers hiện tại.
     pub offset: i64,
     pub length: i64,
     pub plaintext_sha256: String,
@@ -1081,7 +1088,6 @@ pub async fn put_object(
         entities::chunks::ActiveModel {
             version_id: Set(final_version_id.clone()),
             idx: Set(idx as i64),
-            offset: Set(c.offset),
             length: Set(c.length),
             plaintext_sha256: Set(c.plaintext_sha256.clone()),
             ciphertext_sha256: Set(c.ciphertext_sha256.clone()),
@@ -1183,10 +1189,11 @@ pub async fn copy_object_txn(
 
     let mut need_upload = false;
     for s in &src_rows {
-        entities::chunks::ActiveModel {
+        // Mọi cột đều Set tường minh; `..Default` chỉ để đủ field.
+        #[allow(clippy::needless_update)]
+        let am = entities::chunks::ActiveModel {
             version_id: Set(final_version_id.clone()),
             idx: Set(s.idx),
-            offset: Set(s.offset),
             length: Set(s.length),
             plaintext_sha256: Set(s.plaintext_sha256.clone()),
             ciphertext_sha256: Set(s.ciphertext_sha256.clone()),
@@ -1196,10 +1203,11 @@ pub async fn copy_object_txn(
             remote_locator_json: Set(s.remote_locator_json.clone()),
             state: Set(s.state.clone()),
             ..Default::default()
-        }
-        .insert(&txn)
-        .await
-        .map_err(|e| format!("copy chunk: {e}"))?;
+        };
+        entities::chunks::Entity::insert(am)
+            .exec(&txn)
+            .await
+            .map_err(|e| format!("copy chunk: {e}"))?;
 
         if s.state == "pending" {
             need_upload = true;
@@ -1884,7 +1892,6 @@ pub struct JobRecord {
     pub lease_owner: Option<String>,
     pub lease_expires: Option<String>,
     pub last_error: Option<String>,
-    pub generation: i64,
 }
 
 /// Job summary counts.
@@ -1911,7 +1918,6 @@ pub async fn list_jobs(db: &Db) -> Result<(Vec<JobRecord>, JobSummary), String> 
         .column(J::LeaseOwner)
         .column(J::LeaseExpires)
         .column(J::LastError)
-        .column(J::Generation)
         .join(
             JoinType::LeftJoin,
             entities::upload_jobs::Relation::Objects.def(),
@@ -1929,7 +1935,6 @@ pub async fn list_jobs(db: &Db) -> Result<(Vec<JobRecord>, JobSummary), String> 
             Option<String>,
             Option<String>,
             Option<String>,
-            i64,
         )>()
         .all(&conn)
         .await
@@ -1948,7 +1953,6 @@ pub async fn list_jobs(db: &Db) -> Result<(Vec<JobRecord>, JobSummary), String> 
                 lease_owner,
                 lease_expires,
                 last_error,
-                generation,
             )| JobRecord {
                 job_id,
                 version_id,
@@ -1960,7 +1964,6 @@ pub async fn list_jobs(db: &Db) -> Result<(Vec<JobRecord>, JobSummary), String> 
                 lease_owner,
                 lease_expires,
                 last_error,
-                generation,
             },
         )
         .collect();
@@ -1980,10 +1983,12 @@ pub async fn job_summary(db: &Db) -> Result<JobSummary, String> {
             .map(|n| n as i64)
             .map_err(|e| format!("count jobs {state}: {e}"))
     }
+    // Job xong ghi state 'done' (finish_upload_job) — 'completed' không bao giờ
+    // được set nên đếm 'done' vào đây để dashboard "Hoàn tất" trung thực.
     Ok(JobSummary {
         pending: count(&conn, "pending").await?,
         uploading: count(&conn, "uploading").await?,
-        completed: count(&conn, "completed").await.unwrap_or(0),
+        completed: count(&conn, "done").await.unwrap_or(0),
         failed: count(&conn, "failed").await.unwrap_or(0),
     })
 }
@@ -2348,8 +2353,12 @@ pub async fn flag_object_delete_marker(
     Ok(())
 }
 
-/// Các chunk đã `telegram-committed` nhưng vẫn còn `spool_path`.
-pub async fn committed_spool_chunks(db: &Db) -> Result<Vec<(String, i64, String)>, String> {
+/// Các chunk đã upload remote xong (`state = 'remote'`) nhưng vẫn còn
+/// `spool_path` (worker crash giữa remote-commit và spool-cleanup, hoặc GC chưa
+/// chạy). Xóa file các chunk này an toàn vì blob remote đã tồn tại.
+/// (Trước đây lọc state `telegram-committed` — giá trị không bao giờ được set ở
+/// production nên GC bỏ sót, spool rò rỉ.)
+pub async fn remote_spool_chunks(db: &Db) -> Result<Vec<(String, i64, String)>, String> {
     use entities::chunks::Column as C;
     let conn = db.sea_conn();
     let out: Vec<(String, i64, String)> = entities::chunks::Entity::find()
@@ -2357,7 +2366,7 @@ pub async fn committed_spool_chunks(db: &Db) -> Result<Vec<(String, i64, String)
         .column(C::VersionId)
         .column(C::Idx)
         .column(C::SpoolPath)
-        .filter(C::State.eq("telegram-committed"))
+        .filter(C::State.eq("remote"))
         .filter(C::SpoolPath.is_not_null())
         .into_tuple::<(String, i64, Option<String>)>()
         .all(&conn)
@@ -2975,6 +2984,8 @@ mod tests {
         assert_eq!(schema_version(&db).await.unwrap(), 3);
         apply_migration(&db, 4, MIGRATION_004).await.unwrap();
         assert_eq!(schema_version(&db).await.unwrap(), 4);
+        apply_migration(&db, 5, MIGRATION_005).await.unwrap();
+        assert_eq!(schema_version(&db).await.unwrap(), 5);
     }
 
     #[test]
@@ -2996,8 +3007,6 @@ mod tests {
             "objects",
             "chunks",
             "upload_jobs",
-            "recovery_checkpoints",
-            "kv",
             "multipart_uploads",
             "multipart_parts",
             "access_keys",
@@ -3010,6 +3019,27 @@ mod tests {
             assert!(
                 ddl.contains(&format!("CREATE TABLE IF NOT EXISTS {table}(")),
                 "missing table {table}"
+            );
+        }
+        // Bảng/cột chết phải được DROP ở migration 0005 (CREATE ở 0001 vẫn còn
+        // trong text nối — kiểm tra statement DROP thay vì vắng mặt CREATE).
+        for gone_table in ["recovery_checkpoints", "kv"] {
+            assert!(
+                PG_MIGRATION_005.contains(&format!("DROP TABLE IF EXISTS {gone_table}")),
+                "0005 must drop dead table {gone_table}"
+            );
+        }
+        for gone_col in [
+            "DROP COLUMN IF EXISTS nonce",
+            "DROP COLUMN IF EXISTS \"offset\"",
+            "DROP COLUMN IF EXISTS encryption_override",
+            "DROP COLUMN IF EXISTS generation",
+            "DROP COLUMN IF EXISTS remote_locator_json",
+            "DROP COLUMN IF EXISTS state",
+        ] {
+            assert!(
+                PG_MIGRATION_005.contains(gone_col),
+                "0005 must contain {gone_col}"
             );
         }
         // Không lẫn dialect SQLite.

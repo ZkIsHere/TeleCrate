@@ -51,7 +51,7 @@ async fn test_integration_gc_spool_remote_and_multipart() {
     .await
     .unwrap();
 
-    telecrate::db::set_chunk_state(&conn, "v1", "telegram-committed")
+    telecrate::db::set_chunk_state(&conn, "v1", "remote")
         .await
         .unwrap();
 
@@ -96,8 +96,8 @@ async fn test_integration_gc_spool_remote_and_multipart() {
         let raw = rusqlite::Connection::open(&db_path).unwrap();
         raw.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
         raw.execute(
-            "INSERT INTO multipart_parts (upload_id, part_number, size, etag, plaintext_sha256, ciphertext_sha256, spool_path, state)
-             VALUES ('dead-upload', 1, 9, 'e', 'p', 'c', ?1, 'pending')",
+            "INSERT INTO multipart_parts (upload_id, part_number, size, etag, plaintext_sha256, ciphertext_sha256, spool_path)
+             VALUES ('dead-upload', 1, 9, 'e', 'p', 'c', ?1)",
             [orphan_part_spool.to_str().unwrap()],
         )
         .unwrap();

@@ -12,7 +12,6 @@ pub struct Model {
     pub lease_expires: Option<String>,
     pub retry_count: i64,
     pub next_attempt: String,
-    pub generation: i64,
     pub last_error: Option<String>,
 }
 
