@@ -1,13 +1,13 @@
-//! DB layer — dual backend SQLite/Postgres trên sqlx, migrations forward-only.
+//! DB layer — dual backend SQLite/Postgres trên SeaORM + SeaQuery, migrations
+//! forward-only (ADR 0006).
 //!
-//! Mọi query viết placeholder `?` + bind một lần; nhánh Postgres viết lại `$N`
-//! qua `rebind_pg` (sqlx không tự rebind với `sqlx::query(&str)`).
+//! Mọi query nghiệp vụ qua entities (`src/db/entities/` — single source of truth
+//! cho cấu trúc bảng, test parity với DDL cả hai backend). Chỉ còn SQL text cho:
+//! intrinsic backend (`rowid`/`ctid`, PRAGMA, `VACUUM INTO`, `datetime('now')`),
+//! aggregate tương quan (bucket_stats, SUM) và DDL migrator.
 //! Datetime lưu TEXT `YYYY-MM-DD HH:MM:SS` UTC trên cả hai backend nên so sánh
 //! chuỗi tương đương so sánh thời gian. Số nguyên đọc i64 trên cả hai
 //! (DDL Postgres dùng BIGINT toàn bộ). Không giữ txn mở suốt network upload.
-//!
-//! ADR 0006: `entities` là single source of truth cho cấu trúc bảng (SeaORM +
-//! SeaQuery), mirror migrations SQL — xem `entities/mod.rs`.
 
 use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
 use sea_orm::sea_query::{Expr, OnConflict};
@@ -72,9 +72,8 @@ impl Db {
         Ok(Db::Postgres(pool))
     }
 
-    /// Kết nối SeaORM bọc cùng pool (ADR 0006 Phase 2).
-    /// Rẻ (clone Arc + wrap), dùng cho các hàm đã migrate sang entities;
-    /// code raw-sqlx còn lại tiếp tục dùng pool trực tiếp.
+    /// Kết nối SeaORM bọc cùng pool (ADR 0006). Rẻ (clone Arc + wrap) — mọi
+    /// query DAL chạy qua kết nối này; pool sqlx gốc chỉ còn mở lúc khởi tạo.
     pub fn sea_conn(&self) -> sea_orm::DatabaseConnection {
         match self {
             Db::Sqlite(p) => sea_orm::SqlxSqliteConnector::from_sqlx_sqlite_pool(p.clone()),
@@ -128,7 +127,7 @@ fn civil_from_days(z: i64) -> (i32, u8, u8) {
 }
 
 /// Backend metadata DB (ADR 0005). Cả hai backend đều runnable.
-/// Query DAL hợp nhất qua sqlx (`?` placeholder, tự rebind `$N` cho Postgres).
+/// Query DAL hợp nhất qua SeaORM entities + SeaQuery (ADR 0006).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DbBackend {
     Sqlite,

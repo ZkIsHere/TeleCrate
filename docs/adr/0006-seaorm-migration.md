@@ -33,8 +33,9 @@ hiện khi chạy test Postgres (hiếm khi chạy local).
 - Kiểu ánh xạ tối giản, zero behavior change: mọi cột số nguyên → `i64`
   (kể cả flag 0/1, khớp `get_i64` hiện tại), mọi cột datetime TEXT → `String`
   (giữ format `YYYY-MM-DD HH:MM:SS` UTC, không thêm chrono).
-- `rusqlite` được giữ lại **chỉ** cho SQLite online backup API (SeaORM không có),
-  mở cùng file DB — không dùng trong đường dữ liệu runtime.
+- `rusqlite` được giữ lại **chỉ** cho tests mở trực tiếp file DB (setup FK OFF,
+  bulk insert scale_sim) — đường dữ liệu runtime và backup (`VACUUM INTO` qua sea)
+  không dùng tới.
 
 ## 3. Lộ trình
 

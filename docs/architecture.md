@@ -35,9 +35,9 @@ GET/HEAD/LIST sau ghi thành công phải thấy ngay version vừa ghi, kể c�
 - **CLI vs daemon**: mục tiêu CLI gọi admin API khi daemon chạy. HIỆN TẠI `init/doctor/migrations`
   mở DB trực tiếp và chưa có pid lock — `partial`, khóa single-daemon + pid lock làm ở M2 cùng worker.
 - **Database DAL (SQLite WAL & PostgreSQL)**: index bucket/object/version/chunk/jobs/multipart/policies/retention/migrations/checkpoints. Xem `data-model.md`.
-  Dual-backend async qua `telecrate::db::Db` (`sqlx`). Hỗ trợ chọn `db_backend = "sqlite"` (mặc định)
-  hoặc `db_backend = "postgres"` với `database_url`. Cả 2 backend chạy chung logic DAL, transaction `Tx`,
-  schema parity 15 bảng (migrations SQLite 0001→0004 và Postgres DDL). Daemon và worker hoàn toàn async,
+  Dual-backend async qua `telecrate::db::Db` (SeaORM + SeaQuery, ADR 0006). Hỗ trợ chọn `db_backend = "sqlite"` (mặc định)
+  hoặc `db_backend = "postgres"` với `database_url`. Cả 2 backend chạy chung logic DAL qua entities
+  (`src/db/entities/`, test parity schema tự động), schema parity 15 bảng (migrations SQLite 0001→0004 và Postgres DDL). Daemon và worker hoàn toàn async,
   không block thread pool. Backup/restore và disaster recovery hỗ trợ mã hóa AEAD.
 - **spool filesystem**: thư mục data riêng, file chunk đặt tên theo content-hash/job-id, KHÔNG dùng object key trực tiếp làm path (chặn path traversal). Quota + high/low watermark + reserved free space. Không LRU cho pending data.
 - **read cache (OPTIONAL, mặc định tắt/quota 0)**: chỉ chứa bản tái tải được, eviction riêng, không chiếm quota spool.
