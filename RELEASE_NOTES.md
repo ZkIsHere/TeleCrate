@@ -1,3 +1,19 @@
+# TeleCrate v0.3.3-beta.9 — Release Notes (pre-release)
+
+Phiên bản **beta** sửa cú pháp backup trong tài liệu nâng cấp beta.8
+(`telecrate db backup` nhận `--output`, không phải positional) và help text
+`telecrate db pg-schema` đã lỗi thời. Không migration mới (schema vẫn version 5),
+không đổi hành vi — nâng cấp thay binary trực tiếp, không cần backup bắt buộc
+(vẫn khuyến nghị backup định kỳ).
+
+```bash
+sudo systemctl stop telecrate
+curl -fsSL https://github.com/ZkIsHere/TeleCrate/releases/download/v0.3.3-beta.9/telecrate-linux-amd64.tar.gz | sudo tar -xz -C /usr/local/bin/
+sudo systemctl start telecrate
+```
+
+---
+
 # TeleCrate v0.3.3-beta.8 — Release Notes (pre-release)
 
 Phiên bản **beta** dọn schema DB (migration 0005) + 3 bug fix GC/jobs/delete.
