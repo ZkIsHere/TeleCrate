@@ -2464,7 +2464,7 @@ dependencies = [
 
 [[package]]
 name = "telecrate"
-version = "0.3.3-beta.6"
+version = "0.3.3-beta.7"
 dependencies = [
  "axum",
  "axum-server",

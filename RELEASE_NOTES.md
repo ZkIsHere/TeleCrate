@@ -1,3 +1,39 @@
+# TeleCrate v0.3.3-beta.7 — Release Notes (pre-release)
+
+Phiên bản **beta** migrate toàn bộ DB layer sang SeaORM + SeaQuery (ADR 0006):
+entities là single source of truth cho cấu trúc 15 bảng, test parity schema tự
+động đối chiếu với DDL thật cả hai backend. API S3/dashboard/worker giữ nguyên.
+
+---
+
+## 🌟 Điểm nổi bật trong phiên bản v0.3.3-beta.7
+
+### 1. SeaORM entities + test parity (Phase 1)
+* `src/db/entities/` cho 15 bảng (viết tay, build offline), số nguyên → `i64`,
+  datetime TEXT → `String` (zero behavior change).
+* `tests/entity_schema_parity.rs`: sinh `CREATE TABLE` từ entities rồi đối chiếu
+  tập cột + nhóm kiểu với SQLite sau migrate và text DDL Postgres — lệch là fail CI.
+* `rusqlite 0.31 → 0.32` (chung native lib với sqlx 0.8).
+
+### 2. Migrate CRUD → đường nóng → worker → gc/doctor/recovery (Phase 2–4)
+* Buckets/keys/policy/cors/bpa/lock, objects/chunks (put/copy/delete + txn
+  SeaORM), multipart, jobs, worker lease (claim nguyên tử giữ nguyên), GC guard
+  WORM, doctor/scrub, recovery export/import.
+* Chỉ còn SQL text cho intrinsic backend (`rowid`/`ctid`, PRAGMA,
+  `VACUUM INTO`, `datetime`/`to_char`) và aggregate tương quan.
+* Xóa toàn bộ shim cũ (`Val`/`Row`/`Tx`/`fetch`/`exec`/`rebind`) và 3 handlers
+  admin v1 chết. Sửa ké: metrics `SUM(size)` trên Postgres (trước đây luôn 0).
+
+### Nâng cấp từ beta.6
+Thay binary, giữ DB/spool (không migration mới):
+```bash
+sudo systemctl stop telecrate
+curl -fsSL https://github.com/ZkIsHere/TeleCrate/releases/download/v0.3.3-beta.7/telecrate-linux-amd64.tar.gz | sudo tar -xz -C /usr/local/bin/
+sudo systemctl start telecrate
+```
+
+---
+
 # TeleCrate v0.3.3-beta.6 — Release Notes (pre-release)
 
 Phiên bản **beta** sửa loạt lỗi dashboard quản trị: bucket size luôn 0 B, biểu đồ
