@@ -10,6 +10,10 @@
 //! SeaQuery), mirror migrations SQL — xem `entities/mod.rs`.
 
 use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
+use sea_orm::sea_query::{Expr, OnConflict};
+use sea_orm::{
+    ActiveModelTrait, ColumnTrait, EntityTrait, PaginatorTrait, QueryFilter, QueryOrder, Set,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::{PgPoolOptions, PgRow};
@@ -68,6 +72,16 @@ impl Db {
             .await
             .map_err(|e| format!("open postgres: {e}"))?;
         Ok(Db::Postgres(pool))
+    }
+
+    /// Kết nối SeaORM bọc cùng pool (ADR 0006 Phase 2).
+    /// Rẻ (clone Arc + wrap), dùng cho các hàm đã migrate sang entities;
+    /// code raw-sqlx còn lại tiếp tục dùng pool trực tiếp.
+    pub fn sea_conn(&self) -> sea_orm::DatabaseConnection {
+        match self {
+            Db::Sqlite(p) => sea_orm::SqlxSqliteConnector::from_sqlx_sqlite_pool(p.clone()),
+            Db::Postgres(p) => sea_orm::SqlxPostgresConnector::from_sqlx_postgres_pool(p.clone()),
+        }
     }
 
     /// Mở transaction backend-tương ứng (không giữ xuyên network upload).
@@ -1182,28 +1196,29 @@ pub struct Bucket {
 }
 
 pub async fn get_bucket_versioning(db: &Db, bucket: &str) -> Result<String, String> {
-    let row = fetch_opt(
-        db,
-        "SELECT versioning_status FROM buckets WHERE name = ?",
-        &[Val::text(bucket)],
-    )
-    .await
-    .map_err(|e| format!("query: {e}"))?;
+    let conn = db.sea_conn();
+    let row = entities::buckets::Entity::find_by_id(bucket)
+        .one(&conn)
+        .await
+        .map_err(|e| format!("query: {e}"))?;
     match row {
-        Some(r) => r.get_string(0).map_err(|e| format!("row: {e}")),
+        Some(m) => Ok(m.versioning_status),
         None => Ok("Disabled".to_string()),
     }
 }
 
 pub async fn set_bucket_versioning(db: &Db, bucket: &str, status: &str) -> Result<(), String> {
-    let affected = exec(
-        db,
-        "UPDATE buckets SET versioning_status = ? WHERE name = ?",
-        &[Val::text(status), Val::text(bucket)],
-    )
-    .await
-    .map_err(|e| format!("execute update bucket versioning: {e}"))?;
-    if affected == 0 {
+    let conn = db.sea_conn();
+    let res = entities::buckets::Entity::update_many()
+        .col_expr(
+            entities::buckets::Column::VersioningStatus,
+            Expr::value(status.to_string()),
+        )
+        .filter(entities::buckets::Column::Name.eq(bucket))
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("execute update bucket versioning: {e}"))?;
+    if res.rows_affected == 0 {
         return Err("NoSuchBucket".to_string());
     }
     Ok(())
@@ -1240,45 +1255,33 @@ pub async fn create_bucket(
     if !valid_bucket_name(name) {
         return Err("InvalidBucketName".to_string());
     }
-    let row = fetch_opt(
-        db,
-        "SELECT COUNT(*) FROM buckets WHERE name = ?",
-        &[Val::text(name)],
-    )
-    .await
-    .map_err(|e| format!("lookup bucket: {e}"))?;
-    let n = row
-        .map(|r| r.get_i64(0))
-        .transpose()
+    let conn = db.sea_conn();
+    let exists = entities::buckets::Entity::find_by_id(name)
+        .one(&conn)
+        .await
         .map_err(|e| format!("lookup bucket: {e}"))?
-        .unwrap_or(0);
-    if n > 0 {
+        .is_some();
+    if exists {
         return Ok(CreateBucketOutcome::AlreadyOwned);
     }
-    exec(
-        db,
-        "INSERT INTO buckets(name, region) VALUES (?, ?)",
-        &[Val::text(name), Val::text(region)],
-    )
+    entities::buckets::ActiveModel {
+        name: Set(name.to_string()),
+        region: Set(region.to_string()),
+        ..Default::default()
+    }
+    .insert(&conn)
     .await
     .map_err(|e| format!("insert bucket: {e}"))?;
     Ok(CreateBucketOutcome::Created)
 }
 
 pub async fn head_bucket(db: &Db, name: &str) -> Result<bool, String> {
-    let row = fetch_opt(
-        db,
-        "SELECT COUNT(*) FROM buckets WHERE name = ?",
-        &[Val::text(name)],
-    )
-    .await
-    .map_err(|e| format!("lookup bucket: {e}"))?;
-    let n = row
-        .map(|r| r.get_i64(0))
-        .transpose()
-        .map_err(|e| format!("lookup bucket: {e}"))?
-        .unwrap_or(0);
-    Ok(n > 0)
+    let conn = db.sea_conn();
+    entities::buckets::Entity::find_by_id(name)
+        .one(&conn)
+        .await
+        .map_err(|e| format!("lookup bucket: {e}"))
+        .map(|m| m.is_some())
 }
 
 /// Xóa bucket — từ chối khi còn object/version (S3: 409 BucketNotEmpty).
@@ -1286,22 +1289,17 @@ pub async fn delete_bucket(db: &Db, name: &str) -> Result<DeleteBucketOutcome, S
     if !head_bucket(db, name).await? {
         return Ok(DeleteBucketOutcome::NoSuchBucket);
     }
-    let row = fetch_opt(
-        db,
-        "SELECT COUNT(*) FROM objects WHERE bucket = ?",
-        &[Val::text(name)],
-    )
-    .await
-    .map_err(|e| format!("count objects: {e}"))?;
-    let n = row
-        .map(|r| r.get_i64(0))
-        .transpose()
-        .map_err(|e| format!("count objects: {e}"))?
-        .unwrap_or(0);
+    let conn = db.sea_conn();
+    let n = entities::objects::Entity::find()
+        .filter(entities::objects::Column::Bucket.eq(name))
+        .count(&conn)
+        .await
+        .map_err(|e| format!("count objects: {e}"))?;
     if n > 0 {
         return Ok(DeleteBucketOutcome::NotEmpty);
     }
-    exec(db, "DELETE FROM buckets WHERE name = ?", &[Val::text(name)])
+    entities::buckets::Entity::delete_by_id(name)
+        .exec(&conn)
         .await
         .map_err(|e| format!("delete bucket: {e}"))?;
     Ok(DeleteBucketOutcome::Deleted)
@@ -1315,23 +1313,21 @@ pub enum DeleteBucketOutcome {
 }
 
 pub async fn list_buckets(db: &Db) -> Result<Vec<Bucket>, String> {
-    let rows = fetch_all(
-        db,
-        "SELECT name, region, versioning_status, created_at FROM buckets ORDER BY name",
-        &[],
-    )
-    .await
-    .map_err(|e| format!("query: {e}"))?;
-    let mut out = Vec::new();
-    for r in rows {
-        out.push(Bucket {
-            name: r.get_string(0).map_err(|e| format!("rows: {e}"))?,
-            region: r.get_string(1).map_err(|e| format!("rows: {e}"))?,
-            versioning_status: r.get_string(2).map_err(|e| format!("rows: {e}"))?,
-            created_at: r.get_string(3).map_err(|e| format!("rows: {e}"))?,
-        });
-    }
-    Ok(out)
+    let conn = db.sea_conn();
+    let rows = entities::buckets::Entity::find()
+        .order_by_asc(entities::buckets::Column::Name)
+        .all(&conn)
+        .await
+        .map_err(|e| format!("query: {e}"))?;
+    Ok(rows
+        .into_iter()
+        .map(|m| Bucket {
+            name: m.name,
+            region: m.region,
+            versioning_status: m.versioning_status,
+            created_at: m.created_at,
+        })
+        .collect())
 }
 
 // --- Objects M2.2 & M3.5 Versioning ---
@@ -1950,90 +1946,68 @@ pub async fn create_access_key(
     secret_key: &str,
     description: Option<&str>,
 ) -> Result<(), String> {
-    exec(
-        db,
-        "INSERT INTO access_keys(access_key_id, secret_key, status, description) VALUES (?, ?, 'Active', ?)
-         ON CONFLICT(access_key_id) DO UPDATE SET secret_key=excluded.secret_key, status='Active', description=excluded.description",
-        &[Val::text(access_key_id), Val::text(secret_key), Val::opt_text(description)],
+    let conn = db.sea_conn();
+    entities::access_keys::Entity::insert(entities::access_keys::ActiveModel {
+        access_key_id: Set(access_key_id.to_string()),
+        secret_key: Set(secret_key.to_string()),
+        status: Set("Active".to_string()),
+        description: Set(description.map(|s| s.to_string())),
+        ..Default::default()
+    })
+    .on_conflict(
+        OnConflict::columns([entities::access_keys::Column::AccessKeyId])
+            .update_columns([
+                entities::access_keys::Column::SecretKey,
+                entities::access_keys::Column::Status,
+                entities::access_keys::Column::Description,
+            ])
+            .to_owned(),
     )
+    .exec(&conn)
     .await
     .map_err(|e| format!("insert access_key: {e}"))?;
     Ok(())
+}
+
+fn access_key_record(m: entities::access_keys::Model) -> AccessKeyRecord {
+    AccessKeyRecord {
+        access_key_id: m.access_key_id,
+        secret_key: m.secret_key,
+        status: m.status,
+        description: m.description,
+        created_at: m.created_at,
+    }
 }
 
 pub async fn get_access_key(
     db: &Db,
     access_key_id: &str,
 ) -> Result<Option<AccessKeyRecord>, String> {
-    let row = fetch_opt(
-        db,
-        "SELECT access_key_id, secret_key, status, description, created_at FROM access_keys WHERE access_key_id = ?",
-        &[Val::text(access_key_id)],
-    )
-    .await
-    .map_err(|e| format!("query get access_key: {e}"))?;
-    match row {
-        Some(r) => Ok(Some(AccessKeyRecord {
-            access_key_id: r
-                .get_string(0)
-                .map_err(|e| format!("row access_key: {e}"))?,
-            secret_key: r
-                .get_string(1)
-                .map_err(|e| format!("row access_key: {e}"))?,
-            status: r
-                .get_string(2)
-                .map_err(|e| format!("row access_key: {e}"))?,
-            description: r
-                .get_opt_string(3)
-                .map_err(|e| format!("row access_key: {e}"))?,
-            created_at: r
-                .get_string(4)
-                .map_err(|e| format!("row access_key: {e}"))?,
-        })),
-        None => Ok(None),
-    }
+    let conn = db.sea_conn();
+    entities::access_keys::Entity::find_by_id(access_key_id)
+        .one(&conn)
+        .await
+        .map_err(|e| format!("query get access_key: {e}"))
+        .map(|m| m.map(access_key_record))
 }
 
 pub async fn list_access_keys(db: &Db) -> Result<Vec<AccessKeyRecord>, String> {
-    let rows = fetch_all(
-        db,
-        "SELECT access_key_id, secret_key, status, description, created_at FROM access_keys ORDER BY created_at ASC",
-        &[],
-    )
-    .await
-    .map_err(|e| format!("query list access_keys: {e}"))?;
-    let mut list = Vec::new();
-    for r in rows {
-        list.push(AccessKeyRecord {
-            access_key_id: r
-                .get_string(0)
-                .map_err(|e| format!("row access_key: {e}"))?,
-            secret_key: r
-                .get_string(1)
-                .map_err(|e| format!("row access_key: {e}"))?,
-            status: r
-                .get_string(2)
-                .map_err(|e| format!("row access_key: {e}"))?,
-            description: r
-                .get_opt_string(3)
-                .map_err(|e| format!("row access_key: {e}"))?,
-            created_at: r
-                .get_string(4)
-                .map_err(|e| format!("row access_key: {e}"))?,
-        });
-    }
-    Ok(list)
+    let conn = db.sea_conn();
+    let rows = entities::access_keys::Entity::find()
+        .order_by_asc(entities::access_keys::Column::CreatedAt)
+        .all(&conn)
+        .await
+        .map_err(|e| format!("query list access_keys: {e}"))?;
+    Ok(rows.into_iter().map(access_key_record).collect())
 }
 
 pub async fn delete_access_key(db: &Db, access_key_id: &str) -> Result<bool, String> {
-    let affected = exec(
-        db,
-        "DELETE FROM access_keys WHERE access_key_id = ?",
-        &[Val::text(access_key_id)],
-    )
-    .await
-    .map_err(|e| format!("delete access_key: {e}"))?;
-    Ok(affected > 0)
+    let conn = db.sea_conn();
+    let res = entities::access_keys::Entity::delete_by_id(access_key_id)
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("delete access_key: {e}"))?;
+    Ok(res.rows_affected > 0)
 }
 
 pub async fn update_access_key_status(
@@ -2048,14 +2022,17 @@ pub async fn update_access_key_status(
     } else {
         return Err("status must be Active or Inactive".to_string());
     };
-    let affected = exec(
-        db,
-        "UPDATE access_keys SET status = ? WHERE access_key_id = ?",
-        &[Val::text(canonical_status), Val::text(access_key_id)],
-    )
-    .await
-    .map_err(|e| format!("update access_key status: {e}"))?;
-    Ok(affected > 0)
+    let conn = db.sea_conn();
+    let res = entities::access_keys::Entity::update_many()
+        .col_expr(
+            entities::access_keys::Column::Status,
+            Expr::value(canonical_status.to_string()),
+        )
+        .filter(entities::access_keys::Column::AccessKeyId.eq(access_key_id))
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("update access_key status: {e}"))?;
+    Ok(res.rows_affected > 0)
 }
 
 pub async fn update_access_key_description(
@@ -2063,14 +2040,17 @@ pub async fn update_access_key_description(
     access_key_id: &str,
     description: &str,
 ) -> Result<bool, String> {
-    let affected = exec(
-        db,
-        "UPDATE access_keys SET description = ? WHERE access_key_id = ?",
-        &[Val::text(description), Val::text(access_key_id)],
-    )
-    .await
-    .map_err(|e| format!("update access_key description: {e}"))?;
-    Ok(affected > 0)
+    let conn = db.sea_conn();
+    let res = entities::access_keys::Entity::update_many()
+        .col_expr(
+            entities::access_keys::Column::Description,
+            Expr::value(Some(description.to_string())),
+        )
+        .filter(entities::access_keys::Column::AccessKeyId.eq(access_key_id))
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("update access_key description: {e}"))?;
+    Ok(res.rows_affected > 0)
 }
 
 pub async fn update_access_key_allowed_buckets(
@@ -2078,25 +2058,31 @@ pub async fn update_access_key_allowed_buckets(
     access_key_id: &str,
     allowed_buckets: Option<&str>,
 ) -> Result<bool, String> {
-    let affected = exec(
-        db,
-        "UPDATE access_keys SET allowed_buckets = ? WHERE access_key_id = ?",
-        &[Val::opt_text(allowed_buckets), Val::text(access_key_id)],
-    )
-    .await
-    .map_err(|e| format!("update access_key allowed_buckets: {e}"))?;
-    Ok(affected > 0)
+    let conn = db.sea_conn();
+    let res = entities::access_keys::Entity::update_many()
+        .col_expr(
+            entities::access_keys::Column::AllowedBuckets,
+            Expr::value(allowed_buckets.map(|s| s.to_string())),
+        )
+        .filter(entities::access_keys::Column::AccessKeyId.eq(access_key_id))
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("update access_key allowed_buckets: {e}"))?;
+    Ok(res.rows_affected > 0)
 }
 
 pub async fn touch_access_key_last_used(db: &Db, access_key_id: &str) -> Result<(), String> {
     let now = now_str();
-    exec(
-        db,
-        "UPDATE access_keys SET last_used_at = ? WHERE access_key_id = ?",
-        &[Val::text(&now), Val::text(access_key_id)],
-    )
-    .await
-    .map_err(|e| format!("touch access_key last_used: {e}"))?;
+    let conn = db.sea_conn();
+    entities::access_keys::Entity::update_many()
+        .col_expr(
+            entities::access_keys::Column::LastUsedAt,
+            Expr::value(Some(now)),
+        )
+        .filter(entities::access_keys::Column::AccessKeyId.eq(access_key_id))
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("touch access_key last_used: {e}"))?;
     Ok(())
 }
 
@@ -2245,12 +2231,21 @@ pub async fn set_bucket_policy(db: &Db, bucket: &str, policy_json: &str) -> Resu
         return Err("NoSuchBucket".to_string());
     }
     let now = now_str();
-    exec(
-        db,
-        "INSERT INTO bucket_policies(bucket, policy_json) VALUES (?, ?)
-         ON CONFLICT(bucket) DO UPDATE SET policy_json=excluded.policy_json, updated_at=?",
-        &[Val::text(bucket), Val::text(policy_json), Val::text(&now)],
+    let conn = db.sea_conn();
+    entities::bucket_policies::Entity::insert(entities::bucket_policies::ActiveModel {
+        bucket: Set(bucket.to_string()),
+        policy_json: Set(policy_json.to_string()),
+        updated_at: Set(now),
+    })
+    .on_conflict(
+        OnConflict::columns([entities::bucket_policies::Column::Bucket])
+            .update_columns([
+                entities::bucket_policies::Column::PolicyJson,
+                entities::bucket_policies::Column::UpdatedAt,
+            ])
+            .to_owned(),
     )
+    .exec(&conn)
     .await
     .map_err(|e| format!("set bucket policy: {e}"))?;
     Ok(())
@@ -2260,34 +2255,24 @@ pub async fn get_bucket_policy(db: &Db, bucket: &str) -> Result<Option<String>, 
     if !head_bucket(db, bucket).await? {
         return Err("NoSuchBucket".to_string());
     }
-    let row = fetch_opt(
-        db,
-        "SELECT policy_json FROM bucket_policies WHERE bucket = ?",
-        &[Val::text(bucket)],
-    )
-    .await
-    .map_err(|e| format!("query get bucket policy: {e}"))?;
-    match row {
-        Some(r) => Ok(Some(
-            r.get_string(0)
-                .map_err(|e| format!("row bucket policy: {e}"))?,
-        )),
-        None => Ok(None),
-    }
+    let conn = db.sea_conn();
+    entities::bucket_policies::Entity::find_by_id(bucket)
+        .one(&conn)
+        .await
+        .map_err(|e| format!("query get bucket policy: {e}"))
+        .map(|m| m.map(|m| m.policy_json))
 }
 
 pub async fn delete_bucket_policy(db: &Db, bucket: &str) -> Result<bool, String> {
     if !head_bucket(db, bucket).await? {
         return Err("NoSuchBucket".to_string());
     }
-    let affected = exec(
-        db,
-        "DELETE FROM bucket_policies WHERE bucket = ?",
-        &[Val::text(bucket)],
-    )
-    .await
-    .map_err(|e| format!("delete bucket policy: {e}"))?;
-    Ok(affected > 0)
+    let conn = db.sea_conn();
+    let res = entities::bucket_policies::Entity::delete_by_id(bucket)
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("delete bucket policy: {e}"))?;
+    Ok(res.rows_affected > 0)
 }
 
 // Bucket CORS
@@ -2296,12 +2281,21 @@ pub async fn set_bucket_cors(db: &Db, bucket: &str, cors_json: &str) -> Result<(
         return Err("NoSuchBucket".to_string());
     }
     let now = now_str();
-    exec(
-        db,
-        "INSERT INTO bucket_cors(bucket, cors_json) VALUES (?, ?)
-         ON CONFLICT(bucket) DO UPDATE SET cors_json=excluded.cors_json, updated_at=?",
-        &[Val::text(bucket), Val::text(cors_json), Val::text(&now)],
+    let conn = db.sea_conn();
+    entities::bucket_cors::Entity::insert(entities::bucket_cors::ActiveModel {
+        bucket: Set(bucket.to_string()),
+        cors_json: Set(cors_json.to_string()),
+        updated_at: Set(now),
+    })
+    .on_conflict(
+        OnConflict::columns([entities::bucket_cors::Column::Bucket])
+            .update_columns([
+                entities::bucket_cors::Column::CorsJson,
+                entities::bucket_cors::Column::UpdatedAt,
+            ])
+            .to_owned(),
     )
+    .exec(&conn)
     .await
     .map_err(|e| format!("set bucket cors: {e}"))?;
     Ok(())
@@ -2311,34 +2305,24 @@ pub async fn get_bucket_cors(db: &Db, bucket: &str) -> Result<Option<String>, St
     if !head_bucket(db, bucket).await? {
         return Err("NoSuchBucket".to_string());
     }
-    let row = fetch_opt(
-        db,
-        "SELECT cors_json FROM bucket_cors WHERE bucket = ?",
-        &[Val::text(bucket)],
-    )
-    .await
-    .map_err(|e| format!("query get bucket cors: {e}"))?;
-    match row {
-        Some(r) => Ok(Some(
-            r.get_string(0)
-                .map_err(|e| format!("row bucket cors: {e}"))?,
-        )),
-        None => Ok(None),
-    }
+    let conn = db.sea_conn();
+    entities::bucket_cors::Entity::find_by_id(bucket)
+        .one(&conn)
+        .await
+        .map_err(|e| format!("query get bucket cors: {e}"))
+        .map(|m| m.map(|m| m.cors_json))
 }
 
 pub async fn delete_bucket_cors(db: &Db, bucket: &str) -> Result<bool, String> {
     if !head_bucket(db, bucket).await? {
         return Err("NoSuchBucket".to_string());
     }
-    let affected = exec(
-        db,
-        "DELETE FROM bucket_cors WHERE bucket = ?",
-        &[Val::text(bucket)],
-    )
-    .await
-    .map_err(|e| format!("delete bucket cors: {e}"))?;
-    Ok(affected > 0)
+    let conn = db.sea_conn();
+    let res = entities::bucket_cors::Entity::delete_by_id(bucket)
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("delete bucket cors: {e}"))?;
+    Ok(res.rows_affected > 0)
 }
 
 // Block Public Access (BPA)
@@ -2360,25 +2344,27 @@ pub async fn set_bucket_bpa(db: &Db, bucket: &str, bpa: &BucketBpa) -> Result<()
         return Err("NoSuchBucket".to_string());
     }
     let now = now_str();
-    exec(
-        db,
-        "INSERT INTO bucket_bpa(bucket, block_public_acls, ignore_public_acls, block_public_policy, restrict_public_buckets)
-         VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(bucket) DO UPDATE SET
-            block_public_acls=excluded.block_public_acls,
-            ignore_public_acls=excluded.ignore_public_acls,
-            block_public_policy=excluded.block_public_policy,
-            restrict_public_buckets=excluded.restrict_public_buckets,
-            updated_at=?",
-        &[
-            Val::text(bucket),
-            Val::int(bpa.block_public_acls as i64),
-            Val::int(bpa.ignore_public_acls as i64),
-            Val::int(bpa.block_public_policy as i64),
-            Val::int(bpa.restrict_public_buckets as i64),
-            Val::text(&now),
-        ],
+    let conn = db.sea_conn();
+    entities::bucket_bpa::Entity::insert(entities::bucket_bpa::ActiveModel {
+        bucket: Set(bucket.to_string()),
+        block_public_acls: Set(bpa.block_public_acls as i64),
+        ignore_public_acls: Set(bpa.ignore_public_acls as i64),
+        block_public_policy: Set(bpa.block_public_policy as i64),
+        restrict_public_buckets: Set(bpa.restrict_public_buckets as i64),
+        updated_at: Set(now),
+    })
+    .on_conflict(
+        OnConflict::columns([entities::bucket_bpa::Column::Bucket])
+            .update_columns([
+                entities::bucket_bpa::Column::BlockPublicAcls,
+                entities::bucket_bpa::Column::IgnorePublicAcls,
+                entities::bucket_bpa::Column::BlockPublicPolicy,
+                entities::bucket_bpa::Column::RestrictPublicBuckets,
+                entities::bucket_bpa::Column::UpdatedAt,
+            ])
+            .to_owned(),
     )
+    .exec(&conn)
     .await
     .map_err(|e| format!("set bucket bpa: {e}"))?;
     Ok(())
@@ -2388,19 +2374,17 @@ pub async fn get_bucket_bpa(db: &Db, bucket: &str) -> Result<BucketBpa, String> 
     if !head_bucket(db, bucket).await? {
         return Err("NoSuchBucket".to_string());
     }
-    let row = fetch_opt(
-        db,
-        "SELECT block_public_acls, ignore_public_acls, block_public_policy, restrict_public_buckets FROM bucket_bpa WHERE bucket = ?",
-        &[Val::text(bucket)],
-    )
-    .await
-    .map_err(|e| format!("query get bucket bpa: {e}"))?;
+    let conn = db.sea_conn();
+    let row = entities::bucket_bpa::Entity::find_by_id(bucket)
+        .one(&conn)
+        .await
+        .map_err(|e| format!("query get bucket bpa: {e}"))?;
     match row {
-        Some(r) => Ok(BucketBpa {
-            block_public_acls: r.get_bool(0).map_err(|e| format!("row bucket bpa: {e}"))?,
-            ignore_public_acls: r.get_bool(1).map_err(|e| format!("row bucket bpa: {e}"))?,
-            block_public_policy: r.get_bool(2).map_err(|e| format!("row bucket bpa: {e}"))?,
-            restrict_public_buckets: r.get_bool(3).map_err(|e| format!("row bucket bpa: {e}"))?,
+        Some(m) => Ok(BucketBpa {
+            block_public_acls: m.block_public_acls != 0,
+            ignore_public_acls: m.ignore_public_acls != 0,
+            block_public_policy: m.block_public_policy != 0,
+            restrict_public_buckets: m.restrict_public_buckets != 0,
         }),
         None => Ok(BucketBpa::default()),
     }
@@ -2410,14 +2394,12 @@ pub async fn delete_bucket_bpa(db: &Db, bucket: &str) -> Result<bool, String> {
     if !head_bucket(db, bucket).await? {
         return Err("NoSuchBucket".to_string());
     }
-    let affected = exec(
-        db,
-        "DELETE FROM bucket_bpa WHERE bucket = ?",
-        &[Val::text(bucket)],
-    )
-    .await
-    .map_err(|e| format!("delete bucket bpa: {e}"))?;
-    Ok(affected > 0)
+    let conn = db.sea_conn();
+    let res = entities::bucket_bpa::Entity::delete_by_id(bucket)
+        .exec(&conn)
+        .await
+        .map_err(|e| format!("delete bucket bpa: {e}"))?;
+    Ok(res.rows_affected > 0)
 }
 
 // Object Lock Config
@@ -2437,23 +2419,25 @@ pub async fn set_bucket_object_lock_config(
         return Err("NoSuchBucket".to_string());
     }
     let now = now_str();
-    exec(
-        db,
-        "INSERT INTO bucket_lock_configs(bucket, status, default_retention_mode, default_retention_days)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(bucket) DO UPDATE SET
-            status=excluded.status,
-            default_retention_mode=excluded.default_retention_mode,
-            default_retention_days=excluded.default_retention_days,
-            updated_at=?",
-        &[
-            Val::text(bucket),
-            Val::text(&cfg.status),
-            Val::opt_text(cfg.default_retention_mode.as_deref()),
-            cfg.default_retention_days.map(|d| Val::int(d as i64)).unwrap_or(Val::Null),
-            Val::text(&now),
-        ],
+    let conn = db.sea_conn();
+    entities::bucket_lock_configs::Entity::insert(entities::bucket_lock_configs::ActiveModel {
+        bucket: Set(bucket.to_string()),
+        status: Set(cfg.status.clone()),
+        default_retention_mode: Set(cfg.default_retention_mode.clone()),
+        default_retention_days: Set(cfg.default_retention_days.map(|d| d as i64)),
+        updated_at: Set(now),
+    })
+    .on_conflict(
+        OnConflict::columns([entities::bucket_lock_configs::Column::Bucket])
+            .update_columns([
+                entities::bucket_lock_configs::Column::Status,
+                entities::bucket_lock_configs::Column::DefaultRetentionMode,
+                entities::bucket_lock_configs::Column::DefaultRetentionDays,
+                entities::bucket_lock_configs::Column::UpdatedAt,
+            ])
+            .to_owned(),
     )
+    .exec(&conn)
     .await
     .map_err(|e| format!("set bucket object lock config: {e}"))?;
     Ok(())
@@ -2466,25 +2450,25 @@ pub async fn get_bucket_object_lock_config(
     if !head_bucket(db, bucket).await? {
         return Err("NoSuchBucket".to_string());
     }
-    let row = fetch_opt(
-        db,
-        "SELECT status, default_retention_mode, default_retention_days FROM bucket_lock_configs WHERE bucket = ?",
-        &[Val::text(bucket)],
-    )
-    .await
-    .map_err(|e| format!("query get bucket lock config: {e}"))?;
+    let conn = db.sea_conn();
+    let row = entities::bucket_lock_configs::Entity::find_by_id(bucket)
+        .one(&conn)
+        .await
+        .map_err(|e| format!("query get bucket lock config: {e}"))?;
     match row {
-        Some(r) => Ok(Some(ObjectLockConfig {
-            status: r
-                .get_string(0)
-                .map_err(|e| format!("row bucket lock config: {e}"))?,
-            default_retention_mode: r
-                .get_opt_string(1)
-                .map_err(|e| format!("row bucket lock config: {e}"))?,
+        Some(m) => Ok(Some(ObjectLockConfig {
+            status: m.status,
+            default_retention_mode: m.default_retention_mode,
             // Cột BIGINT nhưng struct giữ i32 như cũ.
-            default_retention_days: r
-                .get_opt_i32(2)
-                .map_err(|e| format!("row bucket lock config: {e}"))?,
+            default_retention_days: m
+                .default_retention_days
+                .map(|d| {
+                    i32::try_from(d).map_err(|_| {
+                        "row bucket lock config: default_retention_days out of i32 range"
+                            .to_string()
+                    })
+                })
+                .transpose()?,
         })),
         None => Ok(None),
     }
@@ -2506,23 +2490,30 @@ pub async fn set_object_retention(
     retain_until_date: &str,
 ) -> Result<(), String> {
     let now = now_str();
-    exec(
-        db,
-        "INSERT INTO object_locks(bucket, key, version_id, retain_until_date, mode, legal_hold)
-         VALUES (?, ?, ?, ?, ?, 0)
-         ON CONFLICT(bucket, key, version_id) DO UPDATE SET
-            retain_until_date=excluded.retain_until_date,
-            mode=excluded.mode,
-            updated_at=?",
-        &[
-            Val::text(bucket),
-            Val::text(key),
-            Val::text(version_id),
-            Val::text(retain_until_date),
-            Val::text(mode),
-            Val::text(&now),
-        ],
+    let conn = db.sea_conn();
+    entities::object_locks::Entity::insert(entities::object_locks::ActiveModel {
+        bucket: Set(bucket.to_string()),
+        key: Set(key.to_string()),
+        version_id: Set(version_id.to_string()),
+        retain_until_date: Set(Some(retain_until_date.to_string())),
+        mode: Set(Some(mode.to_string())),
+        legal_hold: Set(0),
+        updated_at: Set(now),
+    })
+    .on_conflict(
+        OnConflict::columns([
+            entities::object_locks::Column::Bucket,
+            entities::object_locks::Column::Key,
+            entities::object_locks::Column::VersionId,
+        ])
+        .update_columns([
+            entities::object_locks::Column::RetainUntilDate,
+            entities::object_locks::Column::Mode,
+            entities::object_locks::Column::UpdatedAt,
+        ])
+        .to_owned(),
     )
+    .exec(&conn)
     .await
     .map_err(|e| format!("set object retention: {e}"))?;
     Ok(())
@@ -2534,29 +2525,23 @@ pub async fn get_object_retention(
     key: &str,
     version_id: &str,
 ) -> Result<Option<ObjectRetention>, String> {
-    let row = fetch_opt(
-        db,
-        "SELECT mode, retain_until_date FROM object_locks WHERE bucket = ? AND key = ? AND version_id = ? AND mode IS NOT NULL",
-        &[Val::text(bucket), Val::text(key), Val::text(version_id)],
-    )
-    .await
-    .map_err(|e| format!("query get object retention: {e}"))?;
+    let conn = db.sea_conn();
+    let row = entities::object_locks::Entity::find()
+        .filter(entities::object_locks::Column::Bucket.eq(bucket))
+        .filter(entities::object_locks::Column::Key.eq(key))
+        .filter(entities::object_locks::Column::VersionId.eq(version_id))
+        .filter(entities::object_locks::Column::Mode.is_not_null())
+        .one(&conn)
+        .await
+        .map_err(|e| format!("query get object retention: {e}"))?;
     match row {
-        Some(r) => {
-            let m = r
-                .get_opt_string(0)
-                .map_err(|e| format!("row retention: {e}"))?;
-            let d = r
-                .get_opt_string(1)
-                .map_err(|e| format!("row retention: {e}"))?;
-            match (m, d) {
-                (Some(mode), Some(retain_until_date)) => Ok(Some(ObjectRetention {
-                    mode,
-                    retain_until_date,
-                })),
-                _ => Ok(None),
-            }
-        }
+        Some(m) => match (m.mode, m.retain_until_date) {
+            (Some(mode), Some(retain_until_date)) => Ok(Some(ObjectRetention {
+                mode,
+                retain_until_date,
+            })),
+            _ => Ok(None),
+        },
         None => Ok(None),
     }
 }
@@ -2569,21 +2554,29 @@ pub async fn set_object_legal_hold(
     on: bool,
 ) -> Result<(), String> {
     let now = now_str();
-    exec(
-        db,
-        "INSERT INTO object_locks(bucket, key, version_id, retain_until_date, mode, legal_hold)
-         VALUES (?, ?, ?, NULL, NULL, ?)
-         ON CONFLICT(bucket, key, version_id) DO UPDATE SET
-            legal_hold=excluded.legal_hold,
-            updated_at=?",
-        &[
-            Val::text(bucket),
-            Val::text(key),
-            Val::text(version_id),
-            Val::int(on as i64),
-            Val::text(&now),
-        ],
+    let conn = db.sea_conn();
+    entities::object_locks::Entity::insert(entities::object_locks::ActiveModel {
+        bucket: Set(bucket.to_string()),
+        key: Set(key.to_string()),
+        version_id: Set(version_id.to_string()),
+        retain_until_date: Set(None),
+        mode: Set(None),
+        legal_hold: Set(on as i64),
+        updated_at: Set(now),
+    })
+    .on_conflict(
+        OnConflict::columns([
+            entities::object_locks::Column::Bucket,
+            entities::object_locks::Column::Key,
+            entities::object_locks::Column::VersionId,
+        ])
+        .update_columns([
+            entities::object_locks::Column::LegalHold,
+            entities::object_locks::Column::UpdatedAt,
+        ])
+        .to_owned(),
     )
+    .exec(&conn)
     .await
     .map_err(|e| format!("set object legal hold: {e}"))?;
     Ok(())
@@ -2595,15 +2588,16 @@ pub async fn get_object_legal_hold(
     key: &str,
     version_id: &str,
 ) -> Result<bool, String> {
-    let row = fetch_opt(
-        db,
-        "SELECT legal_hold FROM object_locks WHERE bucket = ? AND key = ? AND version_id = ?",
-        &[Val::text(bucket), Val::text(key), Val::text(version_id)],
-    )
-    .await
-    .map_err(|e| format!("query get object legal hold: {e}"))?;
+    let conn = db.sea_conn();
+    let row = entities::object_locks::Entity::find()
+        .filter(entities::object_locks::Column::Bucket.eq(bucket))
+        .filter(entities::object_locks::Column::Key.eq(key))
+        .filter(entities::object_locks::Column::VersionId.eq(version_id))
+        .one(&conn)
+        .await
+        .map_err(|e| format!("query get object legal hold: {e}"))?;
     match row {
-        Some(r) => r.get_bool(0).map_err(|e| format!("row legal hold: {e}")),
+        Some(m) => Ok(m.legal_hold != 0),
         None => Ok(false),
     }
 }
