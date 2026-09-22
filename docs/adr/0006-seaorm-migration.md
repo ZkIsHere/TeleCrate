@@ -1,6 +1,8 @@
 # ADR 0006 — Migrate DB layer sang SeaORM + SeaQuery (incremental)
 
-> Ngày: 2026-09-22. Trạng thái: `accepted` (đang triển khai Phase 1).
+> Ngày: 2026-09-22. Trạng thái: `implemented-and-tested` (hoàn thành Phase 1→4b,
+> CI xanh toàn bộ: entities + parity, CRUD buckets/keys/policy, objects/jobs/
+> multipart, worker lease, gc/doctor/recovery, gỡ shim Val/Row/Tx).
 > Liên quan: ADR 0001 (stack SQLite), ADR 0005 (dual-backend sqlx), `docs/data-model.md`,
 > `migrations/NNNN_*.sql`, `migrations/postgres/*.sql`.
 
