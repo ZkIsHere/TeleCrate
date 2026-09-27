@@ -1,3 +1,24 @@
+# TeleCrate v0.3.3-beta.10 — Release Notes (pre-release)
+
+Phiên bản **beta** sửa lỗi `ListObjectsV2` / `?versions` trả `500 InternalError`
+(`syntax error at or near "AND"`) trên backend **Postgres** — nguyên nhân PBS
+Garbage Collection phase2 fail `failed to list chunk in s3 object store`.
+`list_keys`/`list_object_versions` được viết lại bằng SeaORM entities (bỏ raw SQL
+placeholder `?` + `MAX(ctid)`), lọc prefix bằng range; thêm log lỗi list kèm
+`request_id` và regression test pagination kiểu PBS. Không migration mới
+(schema vẫn version 5), không đổi API — nâng cấp thay binary trực tiếp.
+
+```bash
+sudo systemctl stop telecrate
+curl -fsSL https://github.com/ZkIsHere/TeleCrate/releases/download/v0.3.3-beta.10/telecrate-linux-amd64.tar.gz | sudo tar -xz -C /usr/local/bin/
+sudo systemctl start telecrate
+# Kiểm chứng: aws s3api list-objects-v2 --endpoint-url https://<host>:<port> \
+#   --bucket <bucket> --prefix ".chunks/" --max-keys 1000 --no-verify-ssl
+# phải trả 200 (kèm NextContinuationToken), rồi Run now GC trên PBS hết phase3.
+```
+
+---
+
 # TeleCrate v0.3.3-beta.9 — Release Notes (pre-release)
 
 Phiên bản **beta** sửa cú pháp backup trong tài liệu nâng cấp beta.8
