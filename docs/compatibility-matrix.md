@@ -78,7 +78,7 @@
 | SQLite (WAL, SeaORM) | implemented-and-tested | Dual-backend async pool; `db_backend="sqlite"` (mặc định) |
 | Postgres — chọn backend + validate | implemented-and-tested | `db_backend="postgres"` + `database_url` qua TOML/CLI/dashboard, validate fail-closed, secret redaction |
 | Postgres — schema DDL | implemented-and-tested | `migrations/postgres/0001_0004_schema.sql` (tương đương SQLite 0001→0004), `telecrate db pg-schema`, test parity 15 bảng |
-| Postgres — runtime query DAL | implemented-and-tested | DAL async `telecrate::db::Db` (SeaORM entities + SeaQuery), hỗ trợ song song SQLite và Postgres, dynamic pagination, SeaORM transactions, đầy đủ CRUD/Object/Multipart/Lock/Lease, full test suite xanh |
+| Postgres — runtime query DAL | implemented-and-tested | DAL async `telecrate::db::Db` (SeaORM entities + SeaQuery), hỗ trợ song song SQLite và Postgres, dynamic pagination, SeaORM transactions, đầy đủ CRUD/Object/Multipart/Lock/Lease, full test suite xanh. Fix 2026-09-27: `list_keys`/`list_object_versions` viết lại bằng entities (bỏ raw SQL `?` + `MAX(ctid)` gây `500 syntax error at or near "AND"` trên Postgres → PBS GC phase2 `failed to list chunk`); lọc prefix bằng range, có regression test |
 
 ## Transport bảo mật (TLS native)
 

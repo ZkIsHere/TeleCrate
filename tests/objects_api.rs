@@ -443,3 +443,143 @@ fn delete_objects_batch() {
     let r = req(&client, "DELETE", &base, "/multi", b"", &[]);
     assert_eq!(r.status, 204);
 }
+
+#[test]
+fn list_v2_prefix_range_versioned_regression() {
+    // Hồi quy PBS GC fail 2026-09-27: `ListObjectsV2` prefix `.chunks/` trả 500
+    // trên Postgres (raw SQL placeholder `?` + `MAX(ctid)`). DAL mới dùng
+    // SeaORM + lọc prefix bằng range — test phủ trên SQLite:
+    //  (a) prefix chứa ký tự LIKE đặc biệt (`%`, `_`) khớp literal;
+    //  (b) key nhiều versions → chỉ latest; delete-marker → ẩn khỏi List;
+    //  (c) pagination nhiều trang kiểu PBS GC (prefix `.chunks/`).
+    let (_dir, base) = spawn_server();
+    let client = reqwest::blocking::Client::new();
+    mkbucket(&client, &base, "rgx");
+
+    // (a) Keys chứa ký tự đặc biệt (PUT dùng %25 để key thật chứa `%`).
+    for (path, _key) in [
+        ("/rgx/a%251", "a%1"),
+        ("/rgx/a_2", "a_2"),
+        ("/rgx/a/3", "a/3"),
+        ("/rgx/b4", "b4"),
+    ] {
+        let r = req(&client, "PUT", &base, path, b"x", &[]);
+        assert_eq!(r.status, 200, "{path}: {}", text(&r));
+    }
+    // prefix `a%` (query `a%25`) chỉ khớp key `a%1`, không khớp `a_2`.
+    let r = req(
+        &client,
+        "GET",
+        &base,
+        "/rgx?list-type=2&prefix=a%25",
+        b"",
+        &[],
+    );
+    assert_eq!(r.status, 200, "{}", text(&r));
+    let t = text(&r);
+    assert!(t.contains("<Key>a%1</Key>"), "{t}");
+    assert!(!t.contains("a_2"), "{t}");
+    assert!(!t.contains("<Key>b4</Key>"), "{t}");
+    // prefix `a_` (query `a%5F`) chỉ khớp `a_2`, không khớp `a%1`.
+    let r = req(
+        &client,
+        "GET",
+        &base,
+        "/rgx?list-type=2&prefix=a%5F",
+        b"",
+        &[],
+    );
+    assert_eq!(r.status, 200, "{}", text(&r));
+    let t = text(&r);
+    assert!(t.contains("<Key>a_2</Key>"), "{t}");
+    assert!(!t.contains("a%1"), "{t}");
+
+    // (b) Bật versioning: ghi đè cùng key 2 lần → List chỉ hiện latest.
+    let vxml = br#"<?xml version="1.0" encoding="UTF-8"?><VersioningConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Status>Enabled</Status></VersioningConfiguration>"#;
+    let r = req(&client, "PUT", &base, "/rgx?versioning", vxml, &[]);
+    assert_eq!(r.status, 200, "{}", text(&r));
+    let r = req(&client, "PUT", &base, "/rgx/vkey", b"one", &[]);
+    assert_eq!(r.status, 200);
+    let r = req(&client, "PUT", &base, "/rgx/vkey", b"twice!", &[]);
+    assert_eq!(r.status, 200);
+    let r = req(
+        &client,
+        "GET",
+        &base,
+        "/rgx?list-type=2&prefix=vkey",
+        b"",
+        &[],
+    );
+    assert_eq!(r.status, 200);
+    let t = text(&r);
+    assert_eq!(t.matches("<Key>vkey</Key>").count(), 1, "{t}");
+    assert!(t.contains("<Size>6</Size>"), "{t}"); // latest = "twice!"
+                                                  // DELETE → delete-marker → List ẩn key, ?versions vẫn thấy 3 bản ghi.
+    let r = req(&client, "DELETE", &base, "/rgx/vkey", b"", &[]);
+    assert!(r.status == 200 || r.status == 204, "{}", text(&r));
+    let r = req(
+        &client,
+        "GET",
+        &base,
+        "/rgx?list-type=2&prefix=vkey",
+        b"",
+        &[],
+    );
+    assert_eq!(r.status, 200);
+    assert!(!text(&r).contains("<Key>vkey</Key>"), "{}", text(&r));
+    let r = req(&client, "GET", &base, "/rgx?versions&prefix=vkey", b"", &[]);
+    assert_eq!(r.status, 200);
+    let t = text(&r);
+    assert!(t.contains("<DeleteMarker>"), "{t}");
+    assert_eq!(t.matches("<Key>vkey</Key>").count(), 3, "{t}");
+
+    // (c) Pagination kiểu PBS: 65 keys `.chunks/XXXX`, max-keys=25 → 3 trang,
+    // gom đủ 65 keys duy nhất, có thứ tự, trang cuối IsTruncated=false.
+    mkbucket(&client, &base, "chunks");
+    for i in 0..65 {
+        let k = format!(".chunks/{i:04}");
+        let r = req(&client, "PUT", &base, &format!("/chunks/{k}"), b"d", &[]);
+        assert_eq!(r.status, 200, "{k}");
+    }
+    let mut got: Vec<String> = Vec::new();
+    let mut token: Option<String> = None;
+    for page in 0..5 {
+        let q = match &token {
+            Some(tk) => {
+                format!("/chunks?list-type=2&prefix=.chunks%2F&max-keys=25&continuation-token={tk}")
+            }
+            None => "/chunks?list-type=2&prefix=.chunks%2F&max-keys=25".to_string(),
+        };
+        let r = req(&client, "GET", &base, &q, b"", &[]);
+        assert_eq!(r.status, 200, "page {page}: {}", text(&r));
+        let t = text(&r);
+        let mut n = 0;
+        for part in t.split("<Key>").skip(1) {
+            got.push(part.split("</Key>").next().unwrap().to_string());
+            n += 1;
+        }
+        let truncated = t.contains("<IsTruncated>true</IsTruncated>");
+        if truncated {
+            assert!(n > 0, "trang truncated rỗng: {t}");
+            token = Some(
+                t.split("<NextContinuationToken>")
+                    .nth(1)
+                    .unwrap()
+                    .split("</NextContinuationToken>")
+                    .next()
+                    .unwrap()
+                    .to_string(),
+            );
+        } else {
+            token = None;
+            break;
+        }
+    }
+    assert!(token.is_none(), "còn trang chưa đọc");
+    assert_eq!(got.len(), 65, "{got:?}");
+    let mut sorted = got.clone();
+    sorted.sort();
+    sorted.dedup();
+    assert_eq!(sorted.len(), 65, "trùng/thiếu key: {got:?}");
+    assert_eq!(got, sorted, "sai thứ tự key");
+}

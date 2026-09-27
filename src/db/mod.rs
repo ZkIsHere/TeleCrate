@@ -13,7 +13,7 @@ use chacha20poly1305::{AeadInPlace, ChaCha20Poly1305, Key, KeyInit, Nonce};
 use sea_orm::sea_query::{Expr, OnConflict};
 use sea_orm::{
     ActiveModelTrait, ColumnTrait, ConnectionTrait, EntityTrait, JoinType, PaginatorTrait,
-    QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set, Statement, TransactionTrait, Value,
+    QueryFilter, QueryOrder, QuerySelect, RelationTrait, Set, Statement, TransactionTrait,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1501,69 +1501,81 @@ pub async fn list_object_versions(
     version_id_marker: &str,
     limit: i64,
 ) -> Result<Vec<VersionListItem>, String> {
-    let esc = prefix
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_");
-    // rowid/ctid là intrinsic của backend (không phải schema) + LIKE..ESCAPE +
-    // so sánh tuple — giữ nguyên SQL text, chỉ chuyển sang chạy trên sea_conn.
+    use entities::objects::Column as O;
+    use entities::objects::Entity as Obj;
+    use sea_orm::Condition;
+    let conn = db.sea_conn();
+    // Không raw SQL: placeholder `?` trong raw text gây `syntax error at or
+    // near "AND"` trên Postgres (nơi `?` là toán tử JSON) → ?versions 500.
+    // Lọc prefix bằng range (xem `prefix_upper_bound`), marker bằng Condition.
     let tb = match db.backend() {
         DbBackend::Sqlite => "rowid",
         DbBackend::Postgres => "ctid",
     };
-    let sql = format!("SELECT key, version_id, is_delete_marker, size, etag, created_at FROM objects WHERE bucket = ? AND key LIKE ? || '%' ESCAPE '\\' AND (key > ? OR (key = ? AND version_id > ?)) ORDER BY key ASC, created_at DESC, {tb} DESC LIMIT ?");
-    let stmt = Statement::from_sql_and_values(
-        sea_backend(db),
-        sql,
-        [
-            Value::from(bucket.to_string()),
-            Value::from(esc),
-            Value::from(key_marker.to_string()),
-            Value::from(key_marker.to_string()),
-            Value::from(version_id_marker.to_string()),
-            Value::from(limit),
-        ],
+    let mut q = Obj::find().filter(O::Bucket.eq(bucket));
+    if !prefix.is_empty() {
+        let upper = prefix_upper_bound(prefix);
+        q = q
+            .filter(O::Key.gte(prefix))
+            .filter(O::Key.lt(upper.as_str()));
+    }
+    // Phân trang: key sau marker, hoặc cùng key nhưng version sau marker.
+    // Marker rỗng (trang đầu): `key > ""` đúng với mọi key (key không rỗng).
+    q = q.filter(
+        Condition::any().add(O::Key.gt(key_marker)).add(
+            Condition::all()
+                .add(O::Key.eq(key_marker))
+                .add(O::VersionId.gt(version_id_marker)),
+        ),
     );
-    let rows = db
-        .sea_conn()
-        .query_all(stmt)
+    let models = q
+        .order_by_asc(O::Key)
+        .order_by_desc(O::CreatedAt)
+        .order_by_desc(Expr::cust(tb))
+        .limit(limit.max(1) as u64)
+        .all(&conn)
         .await
         .map_err(|e| format!("query: {e}"))?;
 
     let mut result = Vec::new();
     let mut last_key: Option<String> = None;
 
-    for r in rows {
-        let key: String = r.try_get("", "key").map_err(|e| format!("row: {e}"))?;
-        let version_id: String = r
-            .try_get("", "version_id")
-            .map_err(|e| format!("row: {e}"))?;
-        let is_delete_marker: bool = r
-            .try_get::<i64>("", "is_delete_marker")
-            .map(|v| v != 0)
-            .map_err(|e| format!("row: {e}"))?;
-        let size: i64 = r.try_get("", "size").map_err(|e| format!("row: {e}"))?;
-        let etag: String = r.try_get("", "etag").map_err(|e| format!("row: {e}"))?;
-        let created_at: String = r
-            .try_get("", "created_at")
-            .map_err(|e| format!("row: {e}"))?;
+    for m in models {
+        let key = m.key.clone();
         let is_latest = !matches!(&last_key, Some(k) if k == &key);
         last_key = Some(key.clone());
         result.push(VersionListItem {
             key,
-            version_id,
+            version_id: m.version_id,
             is_latest,
-            is_delete_marker,
-            size,
-            etag,
-            created_at,
+            is_delete_marker: m.is_delete_marker != 0,
+            size: m.size,
+            etag: m.etag,
+            created_at: m.created_at,
         });
     }
 
     Ok(result)
 }
 
+/// Cận trên độc quyền cho lọc prefix bằng so sánh chuỗi (`key >= prefix AND
+/// key < upper`). Mọi key có prefix `P` đều thỏa `P <= key < P + U+10FFFF`
+/// (U+10FFFF là scalar lớn nhất), nên lọc range tương đương `LIKE 'P%'`
+/// mà không cần `LIKE..ESCAPE` hay placeholder `?` trong raw SQL — portable
+/// SQLite/Postgres (trên Postgres `?` là toán tử JSON, raw SQL `?` gây
+/// `syntax error at or near "AND"` → ListObjectsV2 500, PBS GC phase2 fail).
+fn prefix_upper_bound(prefix: &str) -> String {
+    format!("{prefix}\u{10FFFF}")
+}
+
 /// List keys phục vụ ListObjectsV2: lọc prefix, sắp xếp, cắt max-keys+1 để biết truncated.
+///
+/// Thực hiện hoàn toàn bằng SeaORM entities (không raw SQL): lặp lấy các bản
+/// ghi theo thứ tự `(key ASC, created_at DESC, rowid/ctid DESC)`, dedup trong
+/// Rust (bản ghi đầu mỗi key là version mới nhất), bỏ delete-marker. Đúng trên
+/// cả SQLite lẫn Postgres — raw SQL cũ dùng `MAX(rowid/ctid)` + placeholder
+/// `?` chỉ chạy trên SQLite (trên Postgres `?` là toán tử JSON → lỗi
+/// `syntax error at or near "AND"` → ListObjectsV2 500, PBS GC phase2 fail).
 pub async fn list_keys(
     db: &Db,
     bucket: &str,
@@ -1571,67 +1583,68 @@ pub async fn list_keys(
     start_after: &str,
     limit_plus_one: i64,
 ) -> Result<Vec<(String, ObjectVersion)>, String> {
-    let esc = prefix
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_");
-    // Subquery tương quan MAX(rowid/ctid) — intrinsic backend, giữ nguyên SQL text.
+    use entities::objects::Column as O;
+    use entities::objects::Entity as Obj;
+    let conn = db.sea_conn();
+    // Tiebreaker "bản ghi chèn sau" khi created_at trùng (độ phân giải 1s):
+    // rowid/ctid là intrinsic backend, ORDER BY trực tiếp hợp lệ cả hai bên.
     let tb = match db.backend() {
         DbBackend::Sqlite => "rowid",
         DbBackend::Postgres => "ctid",
     };
-    let sql = format!("SELECT key, version_id, is_delete_marker, size, etag, content_type, storage_state, created_at, user_metadata_json, system_metadata_json FROM objects o1 WHERE bucket = ? AND key LIKE ? || '%' ESCAPE '\\' AND key > ? AND {tb} = (SELECT MAX({tb}) FROM objects o2 WHERE o2.bucket = o1.bucket AND o2.key = o1.key) AND is_delete_marker = 0 ORDER BY key LIMIT ?");
-
-    let stmt = Statement::from_sql_and_values(
-        sea_backend(db),
-        sql,
-        [
-            Value::from(bucket.to_string()),
-            Value::from(esc),
-            Value::from(start_after.to_string()),
-            Value::from(limit_plus_one),
-        ],
-    );
-    let rows = db
-        .sea_conn()
-        .query_all(stmt)
-        .await
-        .map_err(|e| format!("query: {e}"))?;
-    let mut out = Vec::new();
-    for r in rows {
-        let key: String = r.try_get("", "key").map_err(|e| format!("rows: {e}"))?;
-        out.push((
-            key.clone(),
-            ObjectVersion {
-                version_id: r
-                    .try_get("", "version_id")
-                    .map_err(|e| format!("rows: {e}"))?,
-                key,
-                is_delete_marker: r
-                    .try_get::<i64>("", "is_delete_marker")
-                    .map(|v| v != 0)
-                    .map_err(|e| format!("rows: {e}"))?,
-                size: r.try_get("", "size").map_err(|e| format!("rows: {e}"))?,
-                etag: r.try_get("", "etag").map_err(|e| format!("rows: {e}"))?,
-                content_type: r
-                    .try_get("", "content_type")
-                    .map_err(|e| format!("rows: {e}"))?,
-                storage_state: r
-                    .try_get("", "storage_state")
-                    .map_err(|e| format!("rows: {e}"))?,
-                created_at: r
-                    .try_get("", "created_at")
-                    .map_err(|e| format!("rows: {e}"))?,
-                user_metadata_json: r
-                    .try_get("", "user_metadata_json")
-                    .map_err(|e| format!("rows: {e}"))?,
-                system_metadata_json: r
-                    .try_get("", "system_metadata_json")
-                    .map_err(|e| format!("rows: {e}"))?,
-            },
-        ));
+    let max_keys = limit_plus_one.max(2) - 1;
+    let upper = prefix_upper_bound(prefix);
+    let mut uniq: Vec<(String, ObjectVersion)> = Vec::new();
+    let mut cursor = start_after.to_string();
+    // Mỗi vòng lấy dư 4x số keys còn thiếu (cap 2000): bucket PBS chunk
+    // (1 version/key) chỉ cần đúng 1 vòng; bucket versioned nhiều versions/key
+    // cần thêm vòng. Cap 10 vòng để query luôn bounded.
+    for _ in 0..10 {
+        let need = (limit_plus_one as usize).saturating_sub(uniq.len());
+        if need == 0 {
+            break;
+        }
+        let fetch = ((need * 4 + 10).min(2000)) as u64;
+        let mut q = Obj::find()
+            .filter(O::Bucket.eq(bucket))
+            .filter(O::Key.gt(cursor.as_str()))
+            .order_by_asc(O::Key)
+            .order_by_desc(O::CreatedAt)
+            .order_by_desc(Expr::cust(tb))
+            .limit(fetch);
+        if !prefix.is_empty() {
+            q = q
+                .filter(O::Key.gte(prefix))
+                .filter(O::Key.lt(upper.as_str()));
+        }
+        let models = q.all(&conn).await.map_err(|e| format!("query: {e}"))?;
+        if models.is_empty() {
+            break;
+        }
+        let window_full = models.len() as u64 == fetch;
+        cursor = models.last().map(|m| m.key.clone()).unwrap_or_default();
+        let mut last_seen: Option<String> = None;
+        for m in models {
+            if last_seen.as_deref() == Some(m.key.as_str()) {
+                continue;
+            }
+            last_seen = Some(m.key.clone());
+            // Bản ghi đầu mỗi key (nhờ ORDER BY) là latest; ListObjectsV2 ẩn
+            // key có latest là delete-marker.
+            if m.is_delete_marker == 0 {
+                let key = m.key.clone();
+                uniq.push((key, object_version(m)));
+                if uniq.len() as i64 > max_keys {
+                    uniq.truncate(limit_plus_one as usize);
+                    return Ok(uniq);
+                }
+            }
+        }
+        if !window_full {
+            break;
+        }
     }
-    Ok(out)
+    Ok(uniq)
 }
 
 /// Lấy tất cả đường dẫn spool_path đang active (không NULL) trong bảng chunks và multipart_parts.

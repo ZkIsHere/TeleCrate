@@ -808,6 +808,14 @@ async fn list_object_versions_handler(
     {
         Ok(v) => v,
         Err(e) => {
+            tracing::error!(
+                request_id = %request_id,
+                resource = %resource,
+                bucket = %bucket,
+                prefix = %prefix,
+                db_error = %e,
+                "list_object_versions: query failed"
+            );
             return S3Error::new(
                 "InternalError",
                 e,
@@ -815,7 +823,7 @@ async fn list_object_versions_handler(
                 resource,
                 request_id,
             )
-            .into_response()
+            .into_response();
         }
     };
     let xml = telecrate::s3::list_object_versions_xml(
@@ -899,6 +907,16 @@ async fn list_objects_v2(
     {
         Ok(r) => r,
         Err(e) => {
+            // Log đủ ngữ cảnh để chẩn đoán từ journald (PBS chỉ hiện status
+            // 500, không hiện body XML). Không log secret — chỉ bucket/prefix.
+            tracing::error!(
+                request_id = %request_id,
+                resource = %resource,
+                bucket = %bucket,
+                prefix = %prefix,
+                db_error = %e,
+                "list_objects_v2: list_keys failed"
+            );
             return S3Error::new(
                 "InternalError",
                 e,
@@ -906,7 +924,7 @@ async fn list_objects_v2(
                 resource,
                 request_id,
             )
-            .into_response()
+            .into_response();
         }
     };
     // Gom delimiter → CommonPrefixes (giữ thứ tự key, dedup). Đơn giản hóa M2.2:
